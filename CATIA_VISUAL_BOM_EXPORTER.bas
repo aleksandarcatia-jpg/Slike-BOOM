@@ -20,9 +20,10 @@ Private Const IMAGE_CAPTURE_DELAY_SECONDS As Double = 0.35
 Private Const IMAGE_FIT_REPEAT_COUNT As Long = 2
 Private Const IMAGE_EXTRA_ZOOM_OUT_STEPS As Long = 0
 Private Const ENABLE_IMAGE_CROP As Boolean = True
-Private Const CROP_MARGIN_PERCENT As Double = 0.06
 Private Const AUTO_CROP_WHITE_BACKGROUND As Boolean = True
-Private Const CROP_EXTRA_PADDING_PERCENT As Double = 0.04
+Private Const WHITE_THRESHOLD As Long = 245
+Private Const CROP_PADDING_PERCENT As Double = 0.04
+Private Const FALLBACK_FIXED_CROP_PERCENT As Double = 0.08
 Private Const USE_CATIA_DEFINED_BOM_COLUMNS As Boolean = True
 Private Const BOM_COLUMNS As String = "Item|Part Number|Thumbnail|Keywords|QTY|Material|Dimenzija|Mass|Standard|Component Type|REV|Dim-MM|Description|Comments"
 Private Const THUMBNAIL_WIDTH As Long = 160
@@ -395,7 +396,7 @@ Private Sub ExportAllImages()
     ApplyIsoViewAndFit
 
     If CaptureCurrentViewer(gMainImagePath) Then
-        If ENABLE_IMAGE_CROP Then CropImageFile gMainImagePath
+        If ENABLE_IMAGE_CROP Then CropImageToContent gMainImagePath
         AddLog GetProductPartNumber(gRootProduct), "OK", "Main assembly image exported.", gMainImagePath
     Else
         AddLog GetProductPartNumber(gRootProduct), "ERROR", "Main assembly image export failed.", gMainImagePath
@@ -447,7 +448,7 @@ Private Sub ExportImageForBomRecord(ByVal rec As Object)
     ApplyIsoViewAndFit
 
     If CaptureCurrentViewer(imagePath) Then
-        If ENABLE_IMAGE_CROP Then CropImageFile imagePath
+        If ENABLE_IMAGE_CROP Then CropImageToContent imagePath
         imageFile = gFSO.GetFileName(imagePath)
         rec.Item("ImageFile") = imageFile
         rec.Item("ImagePath") = imagePath
@@ -552,28 +553,32 @@ WiaFailed:
     Err.Clear
 End Function
 
-Private Function CropImageFile(ByVal imagePath As String) As Boolean
+Private Function CropImageToContent(ByVal imagePath As String) As Boolean
     On Error Resume Next
-    CropImageFile = False
+    CropImageToContent = False
     If Not ENABLE_IMAGE_CROP Then
-        CropImageFile = True
+        CropImageToContent = True
         Exit Function
     End If
     If Not gFSO.FileExists(imagePath) Then Exit Function
 
     If AUTO_CROP_WHITE_BACKGROUND Then
         If AutoCropWhiteBackground(imagePath) Then
-            CropImageFile = True
+            CropImageToContent = True
             Exit Function
         End If
     End If
 
-    If FixedCropImageFile(imagePath, CROP_MARGIN_PERCENT) Then
-        CropImageFile = True
+    If FixedCropImageFile(imagePath, FALLBACK_FIXED_CROP_PERCENT) Then
+        CropImageToContent = True
     Else
         AddLog "", "WARNING", "Image crop failed; original image kept.", imagePath
     End If
     Err.Clear
+End Function
+
+Private Function CropImageFile(ByVal imagePath As String) As Boolean
+    CropImageFile = CropImageToContent(imagePath)
 End Function
 
 Private Function AutoCropWhiteBackground(ByVal imagePath As String) As Boolean
@@ -596,6 +601,7 @@ Private Function AutoCropWhiteBackground(ByVal imagePath As String) As Boolean
     Dim maxY As Long
     Dim padX As Long
     Dim padY As Long
+    Dim foundCount As Long
 
     Set img = CreateObject("WIA.ImageFile")
     img.LoadFile imagePath
@@ -613,9 +619,7 @@ Private Function AutoCropWhiteBackground(ByVal imagePath As String) As Boolean
         baseIndex = 0
     End If
 
-    scanStep = CLng(width / 420)
-    If scanStep < 2 Then scanStep = 2
-    If scanStep > 6 Then scanStep = 6
+    scanStep = 1
 
     minX = width
     minY = height
@@ -629,6 +633,7 @@ Private Function AutoCropWhiteBackground(ByVal imagePath As String) As Boolean
             pixel = pixels.Item(idx)
             If Err.Number = 0 Then
                 If PixelLooksLikeForeground(pixel) Then
+                    foundCount = foundCount + 1
                     If x < minX Then minX = x
                     If y < minY Then minY = y
                     If x > maxX Then maxX = x
@@ -639,11 +644,12 @@ Private Function AutoCropWhiteBackground(ByVal imagePath As String) As Boolean
         Next x
     Next y
 
+    If foundCount < 20 Then Exit Function
     If maxX <= minX Or maxY <= minY Then Exit Function
     If (maxX - minX) < width * 0.05 Or (maxY - minY) < height * 0.05 Then Exit Function
 
-    padX = CLng((maxX - minX + 1) * CROP_EXTRA_PADDING_PERCENT)
-    padY = CLng((maxY - minY + 1) * CROP_EXTRA_PADDING_PERCENT)
+    padX = CLng((maxX - minX + 1) * CROP_PADDING_PERCENT)
+    padY = CLng((maxY - minY + 1) * CROP_PADDING_PERCENT)
     If padX < 8 Then padX = 8
     If padY < 8 Then padY = 8
 
@@ -676,7 +682,7 @@ Private Function PixelLooksLikeForeground(ByVal pixelValue As Variant) As Boolea
     t = Int(p / 65536)
     r = CLng(t - (256 * Int(t / 256)))
 
-    PixelLooksLikeForeground = Not (r >= 246 And g >= 246 And b >= 246)
+    PixelLooksLikeForeground = (r < WHITE_THRESHOLD Or g < WHITE_THRESHOLD Or b < WHITE_THRESHOLD)
     Err.Clear
 End Function
 

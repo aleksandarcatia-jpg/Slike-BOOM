@@ -27,9 +27,10 @@ Const IMAGE_EXTRA_ZOOM_OUT_STEPS = 0
 Const IMAGE_WIDTH = 1600
 Const IMAGE_HEIGHT = 1200
 Const ENABLE_IMAGE_CROP = True
-Const CROP_MARGIN_PERCENT = 0.06
 Const AUTO_CROP_WHITE_BACKGROUND = True
-Const CROP_EXTRA_PADDING_PERCENT = 0.04
+Const WHITE_THRESHOLD = 245
+Const CROP_PADDING_PERCENT = 0.04
+Const FALLBACK_FIXED_CROP_PERCENT = 0.08
 Const USE_CATIA_DEFINED_BOM_COLUMNS = True
 Const BOM_COLUMNS = "Item|Part Number|Thumbnail|Keywords|QTY|Material|Dimenzija|Mass|Standard|Component Type|REV|Dim-MM|Description|Comments"
 Const THUMBNAIL_WIDTH = 160
@@ -468,7 +469,7 @@ Sub ExportAllImages()
         Dim mainStart
         mainStart = Timer
         If CaptureCurrentViewer(gMainImagePath, mainStart, IMAGE_EXPORT_TIMEOUT_SECONDS) Then
-            If ENABLE_IMAGE_CROP Then CropImageFile gMainImagePath
+            If ENABLE_IMAGE_CROP Then CropImageToContent gMainImagePath
             AddLog GetProductPartNumber(gRootProduct), "OK", "Main assembly image exported.", gMainImagePath
         Else
             AddLog GetProductPartNumber(gRootProduct), "ERROR", "Main assembly image export failed or timed out.", gMainImagePath
@@ -602,7 +603,7 @@ Function ExportImageForBomRecord(rec, previousVisibleProducts)
     End If
 
     If CaptureCurrentViewer(imagePath, itemStart, IMAGE_EXPORT_TIMEOUT_SECONDS) Then
-        If ENABLE_IMAGE_CROP Then CropImageFile imagePath
+        If ENABLE_IMAGE_CROP Then CropImageToContent imagePath
         imageFile = gFSO.GetFileName(imagePath)
         rec.Item("ImageFile") = imageFile
         rec.Item("ImagePath") = imagePath
@@ -723,28 +724,32 @@ Function ConvertImageWithWia(sourcePath, targetPath, formatId)
     Err.Clear
 End Function
 
-Function CropImageFile(imagePath)
+Function CropImageToContent(imagePath)
     On Error Resume Next
-    CropImageFile = False
+    CropImageToContent = False
     If Not ENABLE_IMAGE_CROP Then
-        CropImageFile = True
+        CropImageToContent = True
         Exit Function
     End If
     If Not gFSO.FileExists(imagePath) Then Exit Function
 
     If AUTO_CROP_WHITE_BACKGROUND Then
         If AutoCropWhiteBackground(imagePath) Then
-            CropImageFile = True
+            CropImageToContent = True
             Exit Function
         End If
     End If
 
-    If FixedCropImageFile(imagePath, CROP_MARGIN_PERCENT) Then
-        CropImageFile = True
+    If FixedCropImageFile(imagePath, FALLBACK_FIXED_CROP_PERCENT) Then
+        CropImageToContent = True
     Else
         AddLog "", "WARNING", "Image crop failed; original image kept.", imagePath
     End If
     Err.Clear
+End Function
+
+Function CropImageFile(imagePath)
+    CropImageFile = CropImageToContent(imagePath)
 End Function
 
 Function AutoCropWhiteBackground(imagePath)
@@ -767,6 +772,7 @@ Function AutoCropWhiteBackground(imagePath)
     Dim maxY
     Dim padX
     Dim padY
+    Dim foundCount
 
     Set img = CreateObject("WIA.ImageFile")
     img.LoadFile imagePath
@@ -784,14 +790,13 @@ Function AutoCropWhiteBackground(imagePath)
         baseIndex = 0
     End If
 
-    scanStep = CLng(width / 420)
-    If scanStep < 2 Then scanStep = 2
-    If scanStep > 6 Then scanStep = 6
+    scanStep = 1
 
     minX = width
     minY = height
     maxX = -1
     maxY = -1
+    foundCount = 0
 
     For y = 0 To height - 1 Step scanStep
         DoEvents
@@ -800,6 +805,7 @@ Function AutoCropWhiteBackground(imagePath)
             pixel = pixels.Item(idx)
             If Err.Number = 0 Then
                 If PixelLooksLikeForeground(pixel) Then
+                    foundCount = foundCount + 1
                     If x < minX Then minX = x
                     If y < minY Then minY = y
                     If x > maxX Then maxX = x
@@ -811,10 +817,11 @@ Function AutoCropWhiteBackground(imagePath)
     Next
 
     If maxX <= minX Or maxY <= minY Then Exit Function
+    If foundCount < 20 Then Exit Function
     If (maxX - minX) < width * 0.05 Or (maxY - minY) < height * 0.05 Then Exit Function
 
-    padX = CLng((maxX - minX + 1) * CROP_EXTRA_PADDING_PERCENT)
-    padY = CLng((maxY - minY + 1) * CROP_EXTRA_PADDING_PERCENT)
+    padX = CLng((maxX - minX + 1) * CROP_PADDING_PERCENT)
+    padY = CLng((maxY - minY + 1) * CROP_PADDING_PERCENT)
     If padX < 8 Then padX = 8
     If padY < 8 Then padY = 8
 
@@ -847,7 +854,7 @@ Function PixelLooksLikeForeground(pixelValue)
     t = Int(p / 65536)
     r = CLng(t - (256 * Int(t / 256)))
 
-    PixelLooksLikeForeground = Not (r >= 246 And g >= 246 And b >= 246)
+    PixelLooksLikeForeground = (r < WHITE_THRESHOLD Or g < WHITE_THRESHOLD Or b < WHITE_THRESHOLD)
     Err.Clear
 End Function
 

@@ -9,6 +9,12 @@ Option Explicit
 
 ' ---------------------- CONFIGURATION ---------------------------
 Private Const IMAGE_FORMAT As String = "png"
+Private Const FAST_SNIP_MODE As Boolean = True
+Private Const FAST_IMAGE_FORMAT As String = "jpg"
+Private Const FAST_ZOOM_IN_STEPS As Long = 2
+Private Const FAST_CAPTURE_DELAY_SECONDS As Double = 0.05
+Private Const FAST_CENTER_CROP_PERCENT As Double = 0.65
+Private Const MAX_SECONDS_PER_IMAGE As Double = 2
 Private Const EXPORT_PARTS As Boolean = True
 Private Const EXPORT_ASSEMBLIES As Boolean = True
 Private Const EXPORT_SELECTED_ONLY As Boolean = False
@@ -33,10 +39,11 @@ Private Const SKIP_EXISTING_IMAGES As Boolean = True
 Private Const START_INDEX As Long = 1
 Private Const END_INDEX As Long = 0
 Private Const EXPORT_IMAGES As Boolean = True
-Private Const MAX_ITEMS_TO_EXPORT As Long = 10
+Private Const MAX_ITEMS_TO_EXPORT As Long = 20
 Private Const SKIP_ASSEMBLIES As Boolean = True
-Private Const IMAGE_WIDTH As Long = 1600
-Private Const IMAGE_HEIGHT As Long = 1200
+Private Const IMAGE_EXPORT_TIMEOUT_SECONDS As Double = 10
+Private Const IMAGE_WIDTH As Long = 1000
+Private Const IMAGE_HEIGHT As Long = 750
 Private Const INSERT_IMAGES_IN_EXCEL As Boolean = True
 Private Const OUTPUT_TO_DESKTOP As Boolean = True
 
@@ -186,12 +193,21 @@ Private Sub PrepareOutputFolders(ByVal doc As Object, ByVal rootProduct As Objec
 
     gOutputFolder = JoinPath(baseFolder, rootName & "_VISUAL_BOM_EXPORT")
     gImageFolder = JoinPath(gOutputFolder, "IMAGES")
-    gMainImagePath = JoinPath(gOutputFolder, "MAIN_ASSEMBLY." & LCase$(IMAGE_FORMAT))
+    gMainImagePath = JoinPath(gOutputFolder, "MAIN_ASSEMBLY." & EffectiveImageFormat())
     gExcelPath = JoinPath(gOutputFolder, "VISUAL_BOM_EXPORT.xlsx")
 
     EnsureFolder gOutputFolder
     EnsureFolder gImageFolder
 End Sub
+
+Private Function EffectiveImageFormat() As String
+    If FAST_SNIP_MODE Then
+        EffectiveImageFormat = LCase$(FAST_IMAGE_FORMAT)
+    Else
+        EffectiveImageFormat = LCase$(IMAGE_FORMAT)
+    End If
+    If EffectiveImageFormat = "" Then EffectiveImageFormat = "jpg"
+End Function
 
 Private Function GetDocumentFolder(ByVal doc As Object) As String
     On Error Resume Next
@@ -393,13 +409,19 @@ Private Sub ExportAllImages()
 
     TrySetCatiaWindowSize IMAGE_WIDTH, IMAGE_HEIGHT
     SafeRestoreCatiaSession
-    ApplyIsoViewAndFit
+    ApplyImageCaptureView
 
-    If CaptureCurrentViewer(gMainImagePath) Then
-        If ENABLE_IMAGE_CROP Then CropImageToContent gMainImagePath
+    Dim mainStart As Double
+    mainStart = Timer
+    If CaptureCurrentViewer(gMainImagePath, mainStart, ImageTimeoutSeconds()) Then
+        If ENABLE_IMAGE_CROP And Not FAST_SNIP_MODE Then CropImageToContent gMainImagePath
         AddLog GetProductPartNumber(gRootProduct), "OK", "Main assembly image exported.", gMainImagePath
     Else
-        AddLog GetProductPartNumber(gRootProduct), "ERROR", "Main assembly image export failed.", gMainImagePath
+        If HasTimedOut(mainStart, ImageTimeoutSeconds()) Then
+            AddLog GetProductPartNumber(gRootProduct), "TIMEOUT", "Main assembly image export timed out.", gMainImagePath
+        Else
+            AddLog GetProductPartNumber(gRootProduct), "ERROR", "Main assembly image export failed.", gMainImagePath
+        End If
     End If
 
     Dim key As Variant
@@ -411,7 +433,7 @@ Private Sub ExportAllImages()
         Dim rec As Object
         Set rec = gBomItems.Item(CStr(key))
         ExportImageForBomRecord rec
-        If CStr(rec.Item("ExportStatus")) = "ERROR" Or CStr(rec.Item("ExportStatus")) = "NOT FOUND" Then SafeRestoreCatiaSession
+        If CStr(rec.Item("ExportStatus")) = "ERROR" Or CStr(rec.Item("ExportStatus")) = "NOT FOUND" Or CStr(rec.Item("ExportStatus")) = "TIMEOUT" Then SafeRestoreCatiaSession
         DoEvents
         End If
     Next key
@@ -426,9 +448,13 @@ Private Sub ExportImageForBomRecord(ByVal rec As Object)
     Dim pathProducts As Collection
     Dim imagePath As String
     Dim imageFile As String
+    Dim itemStart As Double
+    Dim itemTimeout As Double
 
     Set productRef = rec.Item("ProductRef")
     Set pathProducts = rec.Item("PathProducts")
+    itemStart = Timer
+    itemTimeout = ImageTimeoutSeconds()
 
     imageFile = BuildUniqueImageFileName(CStr(rec.Item("PartNumber")), CStr(rec.Item("Nomenclature")), CLng(rec.Item("No")))
     imagePath = JoinPath(gImageFolder, imageFile)
@@ -445,10 +471,28 @@ Private Sub ExportImageForBomRecord(ByVal rec As Object)
     HideAllComponents
     ShowProductPath pathProducts
     ShowProductSubtree productRef
-    ApplyIsoViewAndFit
+    If HasTimedOut(itemStart, itemTimeout) Then
+        rec.Item("ImageFile") = imageFile
+        rec.Item("ImagePath") = imagePath
+        rec.Item("ExportStatus") = "TIMEOUT"
+        rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Image export timeout during hide/show.")
+        AddLog CStr(rec.Item("PartNumber")), "TIMEOUT", "Image export timeout during hide/show.", imagePath
+        Exit Sub
+    End If
 
-    If CaptureCurrentViewer(imagePath) Then
-        If ENABLE_IMAGE_CROP Then CropImageToContent imagePath
+    ApplyImageCaptureView
+
+    If HasTimedOut(itemStart, itemTimeout) Then
+        rec.Item("ImageFile") = imageFile
+        rec.Item("ImagePath") = imagePath
+        rec.Item("ExportStatus") = "TIMEOUT"
+        rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Image export timeout before capture.")
+        AddLog CStr(rec.Item("PartNumber")), "TIMEOUT", "Image export timeout before capture.", imagePath
+        Exit Sub
+    End If
+
+    If CaptureCurrentViewer(imagePath, itemStart, itemTimeout) Then
+        If ENABLE_IMAGE_CROP And Not FAST_SNIP_MODE Then CropImageToContent imagePath
         imageFile = gFSO.GetFileName(imagePath)
         rec.Item("ImageFile") = imageFile
         rec.Item("ImagePath") = imagePath
@@ -457,9 +501,15 @@ Private Sub ExportImageForBomRecord(ByVal rec As Object)
     Else
         rec.Item("ImageFile") = imageFile
         rec.Item("ImagePath") = imagePath
-        rec.Item("ExportStatus") = "ERROR"
-        rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Image export failed.")
-        AddLog CStr(rec.Item("PartNumber")), "ERROR", "Image export failed.", imagePath
+        If HasTimedOut(itemStart, itemTimeout) Then
+            rec.Item("ExportStatus") = "TIMEOUT"
+            rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Image export timeout.")
+            AddLog CStr(rec.Item("PartNumber")), "TIMEOUT", "Image export timeout.", imagePath
+        Else
+            rec.Item("ExportStatus") = "ERROR"
+            rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Image export failed.")
+            AddLog CStr(rec.Item("PartNumber")), "ERROR", "Image export failed.", imagePath
+        End If
     End If
 
     Exit Sub
@@ -471,14 +521,22 @@ ExportError:
     Err.Clear
 End Sub
 
-Private Function CaptureCurrentViewer(ByRef targetPath As String) As Boolean
+Private Function CaptureCurrentViewer(ByRef targetPath As String, Optional ByVal startTime As Double = 0, Optional ByVal timeoutSeconds As Double = 0) As Boolean
     On Error GoTo CaptureFailed
+    If startTime <= 0 Then startTime = Timer
+    If timeoutSeconds <= 0 Then timeoutSeconds = ImageTimeoutSeconds()
+
+    If FAST_SNIP_MODE Then
+        CaptureCurrentViewer = CaptureFastSnip(targetPath, startTime, timeoutSeconds)
+        Exit Function
+    End If
 
     Dim viewer As Object
     Set viewer = CATIA.ActiveWindow.ActiveViewer
     viewer.Activate
     viewer.Update
     WaitSeconds IMAGE_CAPTURE_DELAY_SECONDS
+    If HasTimedOut(startTime, timeoutSeconds) Then Exit Function
 
     Dim ext As String
     ext = LCase$(gFSO.GetExtensionName(targetPath))
@@ -488,6 +546,7 @@ Private Function CaptureCurrentViewer(ByRef targetPath As String) As Boolean
         tempBmp = JoinPath(gOutputFolder, "~catia_capture_temp_" & Format(Now, "yyyymmdd_hhnnss") & "_" & CStr(Int(Rnd() * 100000)) & ".bmp")
         viewer.CaptureToFile CAT_CAPTURE_FORMAT_BMP, tempBmp
         WaitSeconds 0.1
+        If HasTimedOut(startTime, timeoutSeconds) Then Exit Function
 
         If gFSO.FileExists(tempBmp) Then
             If ConvertImageWithWia(tempBmp, targetPath, WIA_FORMAT_PNG) Then
@@ -500,6 +559,7 @@ Private Function CaptureCurrentViewer(ByRef targetPath As String) As Boolean
                 Dim jpgFallback As String
                 jpgFallback = Left$(targetPath, Len(targetPath) - Len(ext)) & "jpg"
                 viewer.CaptureToFile CAT_CAPTURE_FORMAT_JPEG, jpgFallback
+                If HasTimedOut(startTime, timeoutSeconds) Then Exit Function
                 If gFSO.FileExists(jpgFallback) Then
                     AddLog "", "WARNING", "PNG conversion through WIA failed; JPEG fallback created.", jpgFallback
                     CaptureCurrentViewer = True
@@ -518,11 +578,81 @@ Private Function CaptureCurrentViewer(ByRef targetPath As String) As Boolean
         viewer.CaptureToFile CAT_CAPTURE_FORMAT_BMP, targetPath
     End If
 
-    CaptureCurrentViewer = gFSO.FileExists(targetPath)
+    If Not HasTimedOut(startTime, timeoutSeconds) Then CaptureCurrentViewer = gFSO.FileExists(targetPath)
     Exit Function
 
 CaptureFailed:
     CaptureCurrentViewer = False
+    Err.Clear
+End Function
+
+Private Function CaptureFastSnip(ByRef targetPath As String, ByVal startTime As Double, ByVal timeoutSeconds As Double) As Boolean
+    On Error GoTo FastFailed
+    If HasTimedOut(startTime, timeoutSeconds) Then Exit Function
+
+    Dim viewer As Object
+    Dim fastPath As String
+    fastPath = ReplaceFileExtension(targetPath, EffectiveImageFormat())
+
+    Set viewer = CATIA.ActiveWindow.ActiveViewer
+    viewer.Activate
+    viewer.Update
+    WaitSeconds FAST_CAPTURE_DELAY_SECONDS
+    If HasTimedOut(startTime, timeoutSeconds) Then Exit Function
+
+    If gFSO.FileExists(fastPath) Then gFSO.DeleteFile fastPath, True
+    viewer.CaptureToFile CAT_CAPTURE_FORMAT_JPEG, fastPath
+    WaitSeconds FAST_CAPTURE_DELAY_SECONDS
+    If Not gFSO.FileExists(fastPath) Then Exit Function
+
+    If ENABLE_IMAGE_CROP And Not HasTimedOut(startTime, timeoutSeconds) Then
+        If Not CenterCropImageFile(fastPath, FAST_CENTER_CROP_PERCENT) Then
+            AddLog "", "WARNING", "Fast center crop failed; uncropped JPG kept.", fastPath
+        End If
+    End If
+
+    If HasTimedOut(startTime, timeoutSeconds) Then Exit Function
+
+    targetPath = fastPath
+    CaptureFastSnip = gFSO.FileExists(fastPath)
+    Exit Function
+
+FastFailed:
+    CaptureFastSnip = False
+    Err.Clear
+End Function
+
+Private Function CenterCropImageFile(ByVal imagePath As String, ByVal centerPercent As Double) As Boolean
+    On Error Resume Next
+    CenterCropImageFile = False
+
+    If centerPercent <= 0# Or centerPercent >= 1# Then
+        CenterCropImageFile = gFSO.FileExists(imagePath)
+        Exit Function
+    End If
+
+    Dim img As Object
+    Dim width As Long
+    Dim height As Long
+    Dim cropW As Long
+    Dim cropH As Long
+    Dim minX As Long
+    Dim minY As Long
+
+    Set img = CreateObject("WIA.ImageFile")
+    img.LoadFile imagePath
+    width = CLng(img.Width)
+    height = CLng(img.Height)
+    If width < 20 Or height < 20 Then Exit Function
+
+    cropW = CLng(width * centerPercent)
+    cropH = CLng(height * centerPercent)
+    If cropW < 20 Or cropH < 20 Then Exit Function
+
+    minX = CLng((width - cropW) / 2)
+    minY = CLng((height - cropH) / 2)
+
+    CenterCropImageFile = ApplyWiaCrop(imagePath, minX, minY, minX + cropW - 1, minY + cropH - 1)
     Err.Clear
 End Function
 
@@ -561,6 +691,10 @@ Private Function CropImageToContent(ByVal imagePath As String) As Boolean
         Exit Function
     End If
     If Not gFSO.FileExists(imagePath) Then Exit Function
+    If FAST_SNIP_MODE Then
+        CropImageToContent = CenterCropImageFile(imagePath, FAST_CENTER_CROP_PERCENT)
+        Exit Function
+    End If
 
     If AUTO_CROP_WHITE_BACKGROUND Then
         If AutoCropWhiteBackground(imagePath) Then
@@ -842,6 +976,82 @@ Private Sub SetVisibilityForCollection(ByVal products As Collection, ByVal showI
     sel.Clear
     CATIA.RefreshDisplay = True
     WaitSeconds 0.1
+    Err.Clear
+End Sub
+
+Private Sub ApplyImageCaptureView()
+    If FAST_SNIP_MODE Then
+        ApplyFastSnipView
+    Else
+        ApplyIsoViewAndFit
+    End If
+End Sub
+
+Private Sub ApplyFastSnipView()
+    On Error Resume Next
+
+    Dim viewer As Object
+    Set viewer = CATIA.ActiveWindow.ActiveViewer
+    viewer.Activate
+
+    If USE_NICE_IMAGE_VIEW Then
+        If USE_SHADED_WITH_EDGES Then
+            Err.Clear
+            viewer.RenderingMode = CAT_RENDER_SHADING_WITH_EDGES
+            If Err.Number <> 0 Then
+                Err.Clear
+                viewer.RenderingMode = CAT_RENDER_SHADING
+            End If
+        Else
+            Err.Clear
+            viewer.RenderingMode = CAT_RENDER_SHADING
+        End If
+
+        If USE_WHITE_BACKGROUND Then
+            Err.Clear
+            Dim bg(2) As Double
+            bg(0) = 1#
+            bg(1) = 1#
+            bg(2) = 1#
+            viewer.PutBackgroundColor bg
+            Err.Clear
+        End If
+    End If
+
+    Dim vp As Object
+    Set vp = viewer.Viewpoint3D
+
+    Dim sight(2) As Double
+    Dim up(2) As Double
+    sight(0) = 1#
+    sight(1) = -1#
+    sight(2) = 1#
+    up(0) = -0.4082482905
+    up(1) = 0.4082482905
+    up(2) = 0.8164965809
+
+    vp.PutSightDirection sight
+    vp.PutUpDirection up
+    If USE_PARALLEL_PROJECTION Then
+        Err.Clear
+        vp.ProjectionMode = CAT_PROJECTION_CYLINDRIC
+        Err.Clear
+    End If
+
+    viewer.Update
+    viewer.Reframe
+    viewer.Update
+    DoEvents
+
+    Dim i As Long
+    For i = 1 To FAST_ZOOM_IN_STEPS
+        viewer.ZoomIn
+        viewer.Update
+        DoEvents
+    Next i
+
+    viewer.Update
+    WaitSeconds FAST_CAPTURE_DELAY_SECONDS
     Err.Clear
 End Sub
 
@@ -1704,7 +1914,7 @@ Private Function BuildUniqueImageFileName(ByVal partNumber As String, ByVal nome
     Dim candidate As String
     Dim n As Long
 
-    ext = LCase$(IMAGE_FORMAT)
+    ext = EffectiveImageFormat()
     If ext = "" Then ext = "jpg"
 
     baseName = SafeFileName(Trim$(partNumber & "_" & nomenclature))
@@ -1791,6 +2001,17 @@ Private Function JoinPath(ByVal folderPath As String, ByVal childName As String)
     End If
 End Function
 
+Private Function ReplaceFileExtension(ByVal filePath As String, ByVal newExt As String) As String
+    Dim oldExt As String
+    oldExt = gFSO.GetExtensionName(filePath)
+    If Left$(newExt, 1) = "." Then newExt = Mid$(newExt, 2)
+    If oldExt = "" Then
+        ReplaceFileExtension = filePath & "." & newExt
+    Else
+        ReplaceFileExtension = Left$(filePath, Len(filePath) - Len(oldExt)) & newExt
+    End If
+End Function
+
 Private Sub WaitSeconds(ByVal secondsToWait As Double)
     Dim startTime As Single
     Dim currentTime As Single
@@ -1802,3 +2023,18 @@ Private Sub WaitSeconds(ByVal secondsToWait As Double)
         If currentTime < startTime Then currentTime = currentTime + 86400!
     Loop While (currentTime - startTime) < CSng(secondsToWait)
 End Sub
+
+Private Function HasTimedOut(ByVal startTime As Double, ByVal timeoutSeconds As Double) As Boolean
+    Dim currentTime As Double
+    currentTime = Timer
+    If currentTime < startTime Then currentTime = currentTime + 86400#
+    HasTimedOut = ((currentTime - startTime) >= timeoutSeconds)
+End Function
+
+Private Function ImageTimeoutSeconds() As Double
+    If FAST_SNIP_MODE Then
+        ImageTimeoutSeconds = MAX_SECONDS_PER_IMAGE
+    Else
+        ImageTimeoutSeconds = IMAGE_EXPORT_TIMEOUT_SECONDS
+    End If
+End Function

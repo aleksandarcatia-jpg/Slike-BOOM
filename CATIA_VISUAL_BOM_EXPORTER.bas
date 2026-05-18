@@ -11,9 +11,11 @@ Option Explicit
 Private Const IMAGE_FORMAT As String = "png"
 Private Const FAST_SNIP_MODE As Boolean = True
 Private Const FAST_IMAGE_FORMAT As String = "jpg"
-Private Const FAST_ZOOM_IN_STEPS As Long = 2
+Private Const FAST_ZOOM_IN_STEPS As Long = 1
 Private Const FAST_CAPTURE_DELAY_SECONDS As Double = 0.05
-Private Const FAST_CENTER_CROP_PERCENT As Double = 0.65
+' Veci FAST_CENTER_CROP_PERCENT znaci manje crop-a i vise prostora oko dela.
+' Manji FAST_CENTER_CROP_PERCENT znaci jaci crop i blizi prikaz dela.
+Private Const FAST_CENTER_CROP_PERCENT As Double = 0.8
 Private Const MAX_SECONDS_PER_IMAGE As Double = 2
 Private Const EXPORT_PARTS As Boolean = True
 Private Const EXPORT_ASSEMBLIES As Boolean = True

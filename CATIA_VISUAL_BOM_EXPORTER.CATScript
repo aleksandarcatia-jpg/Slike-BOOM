@@ -11,9 +11,11 @@ Language="VBSCRIPT"
 Const IMAGE_FORMAT = "png"
 Const FAST_SNIP_MODE = True
 Const FAST_IMAGE_FORMAT = "jpg"
-Const FAST_ZOOM_IN_STEPS = 2
+Const FAST_ZOOM_IN_STEPS = 1
 Const FAST_CAPTURE_DELAY_SECONDS = 0.05
-Const FAST_CENTER_CROP_PERCENT = 0.65
+' Veci FAST_CENTER_CROP_PERCENT znaci manje crop-a i vise prostora oko dela.
+' Manji FAST_CENTER_CROP_PERCENT znaci jaci crop i blizi prikaz dela.
+Const FAST_CENTER_CROP_PERCENT = 0.80
 Const MAX_SECONDS_PER_IMAGE = 2
 Const EXPORT_PARTS = True
 Const EXPORT_ASSEMBLIES = True

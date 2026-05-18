@@ -26,6 +26,18 @@ Const IMAGE_FIT_REPEAT_COUNT = 2
 Const IMAGE_EXTRA_ZOOM_OUT_STEPS = 0
 Const IMAGE_WIDTH = 1600
 Const IMAGE_HEIGHT = 1200
+Const ENABLE_IMAGE_CROP = True
+Const CROP_MARGIN_PERCENT = 0.06
+Const AUTO_CROP_WHITE_BACKGROUND = True
+Const CROP_EXTRA_PADDING_PERCENT = 0.04
+Const USE_CATIA_DEFINED_BOM_COLUMNS = True
+Const BOM_COLUMNS = "Item|Part Number|Thumbnail|Keywords|QTY|Material|Dimenzija|Mass|Standard|Component Type|REV|Dim-MM|Description|Comments"
+Const THUMBNAIL_WIDTH = 160
+Const THUMBNAIL_HEIGHT = 120
+Const SAVE_EVERY_N_ITEMS = 10
+Const SKIP_EXISTING_IMAGES = True
+Const START_INDEX = 1
+Const END_INDEX = 0
 Const INSERT_IMAGES_IN_EXCEL = True
 Const MAX_EXCEL_PREVIEW_IMAGES = 0
 Const OUTPUT_TO_DESKTOP = True
@@ -44,6 +56,8 @@ Const CAT_CAPTURE_FORMAT_JPEG = 2
 Const CAT_RENDER_SHADING = 0
 Const CAT_RENDER_SHADING_WITH_EDGES = 1
 Const CAT_PROJECTION_CYLINDRIC = 0
+Const CAT_FILE_TYPE_TXT = 0
+Const CAT_FILE_TYPE_HTML = 2
 
 ' Excel constants for late binding.
 Const XL_OPENXML_WORKBOOK = 51
@@ -82,6 +96,11 @@ Dim gNextBomRow
 Dim gNextLogRow
 Dim gExcelReady
 Dim gMainPreviewInserted
+Dim gBomHeaders
+Dim gThumbnailColumnIndex
+Dim gImagePathColumnIndex
+Dim gExportStatusColumnIndex
+Dim gCatiaBomColumnsSource
 
 Sub CATMain()
     CATIA_VISUAL_BOM_EXPORTER
@@ -100,10 +119,15 @@ Sub CATIA_VISUAL_BOM_EXPORTER()
     Set gWsSummary = Nothing
     Set gWsBom = Nothing
     Set gWsLog = Nothing
+    Set gBomHeaders = NewList()
     gNextBomRow = 2
     gNextLogRow = 2
     gExcelReady = False
     gMainPreviewInserted = False
+    gThumbnailColumnIndex = 0
+    gImagePathColumnIndex = 0
+    gExportStatusColumnIndex = 0
+    gCatiaBomColumnsSource = ""
     gTotalInstances = 0
     Randomize
 
@@ -137,7 +161,7 @@ Sub CATIA_VISUAL_BOM_EXPORTER()
     CATIA.StatusBar = "CATIA_VISUAL_BOM_EXPORTER: kreiram Excel odmah..."
     InitializeExcelReportImmediate
     If Not gExcelReady Then
-        RestoreWholeAssemblyView
+        SafeRestoreCatiaSession
         CATIA.StatusBar = ""
         MsgBox "Excel workbook nije kreiran. Proverite da li je Microsoft Excel instaliran i dostupan.", vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
         Exit Sub
@@ -150,7 +174,7 @@ Sub CATIA_VISUAL_BOM_EXPORTER()
     If gBomItems.Count = 0 Then
         AddLog GetProductPartNumber(gRootProduct), "WARNING", "Nije pronadjena nijedna BOM stavka za izvoz.", ""
         SaveExcelCheckpoint
-        RestoreWholeAssemblyView
+        SafeRestoreCatiaSession
         FinalizeExcelReportImmediate
         MsgBox "Nije pronadjena nijedna BOM stavka za izvoz. Proverite EXPORT_PARTS / EXPORT_ASSEMBLIES / EXPORT_SELECTED_ONLY konfiguraciju.", _
                vbExclamation, "CATIA_VISUAL_BOM_EXPORTER"
@@ -160,7 +184,7 @@ Sub CATIA_VISUAL_BOM_EXPORTER()
     CATIA.StatusBar = "CATIA_VISUAL_BOM_EXPORTER: eksportujem slike..."
     ExportAllImages
 
-    RestoreWholeAssemblyView
+    SafeRestoreCatiaSession
     FinalizeExcelReportImmediate
     CATIA.StatusBar = "CATIA_VISUAL_BOM_EXPORTER: gotovo."
 
@@ -179,12 +203,22 @@ Sub ListAdd(listObj, obj)
     Set listObj.Item(key) = obj
 End Sub
 
+Sub ListAddValue(listObj, valueText)
+    Dim key
+    key = CStr(listObj.Count + 1)
+    listObj.Item(key) = valueText
+End Sub
+
 Function ListCount(listObj)
     ListCount = listObj.Count
 End Function
 
 Function ListItem(listObj, indexNumber)
     Set ListItem = listObj.Item(CStr(indexNumber))
+End Function
+
+Function ListItemValue(listObj, indexNumber)
+    ListItemValue = listObj.Item(CStr(indexNumber))
 End Function
 
 Function IsActiveDocumentProduct(doc)
@@ -428,12 +462,13 @@ Sub ExportAllImages()
 
     If EXPORT_IMAGES Then
         TrySetCatiaWindowSize IMAGE_WIDTH, IMAGE_HEIGHT
-        RestoreWholeAssemblyView
+        SafeRestoreCatiaSession
         ApplyIsoViewAndFit
 
         Dim mainStart
         mainStart = Timer
         If CaptureCurrentViewer(gMainImagePath, mainStart, IMAGE_EXPORT_TIMEOUT_SECONDS) Then
+            If ENABLE_IMAGE_CROP Then CropImageFile gMainImagePath
             AddLog GetProductPartNumber(gRootProduct), "OK", "Main assembly image exported.", gMainImagePath
         Else
             AddLog GetProductPartNumber(gRootProduct), "ERROR", "Main assembly image export failed or timed out.", gMainImagePath
@@ -457,16 +492,24 @@ Sub ExportAllImages()
 
     For Each key In gBomItems.Keys
         itemIndex = itemIndex + 1
+        If Not ShouldProcessExportIndex(itemIndex) Then
+            DoEvents
+        Else
         CATIA.StatusBar = "CATIA_VISUAL_BOM_EXPORTER: slika " & CStr(itemIndex) & " / " & CStr(gBomItems.Count)
         Set rec = gBomItems.Item(CStr(key))
         Debug.Print "Processing: " & CStr(rec.Item("PartNumber"))
 
         rec.Item("ExportStatus") = "PENDING"
         WriteBomRecordImmediate rec, False
-        SaveExcelCheckpoint
+        If SAVE_EVERY_N_ITEMS <= 1 Or (itemIndex Mod SAVE_EVERY_N_ITEMS) = 0 Then SaveExcelCheckpoint
 
         If EXPORT_IMAGES Then
             Set previousVisibleProducts = ExportImageForBomRecord(rec, previousVisibleProducts)
+            If CStr(rec.Item("ExportStatus")) = "ERROR" Or CStr(rec.Item("ExportStatus")) = "NOT FOUND" Then
+                SafeRestoreCatiaSession
+                If EXPORT_IMAGES Then HideAllComponents
+                Set previousVisibleProducts = NewList()
+            End If
         Else
             rec.Item("ExportStatus") = "OK"
             rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "EXPORT_IMAGES=False; image export skipped.")
@@ -474,11 +517,13 @@ Sub ExportAllImages()
         End If
 
         WriteBomRecordImmediate rec, True
-        SaveExcelCheckpoint
+        If SAVE_EVERY_N_ITEMS <= 1 Or (itemIndex Mod SAVE_EVERY_N_ITEMS) = 0 Then SaveExcelCheckpoint
         DoEvents
+        End If
     Next
 
-    RestoreWholeAssemblyView
+    SaveExcelCheckpoint
+    SafeRestoreCatiaSession
 End Sub
 
 Function ExportImageForBomRecord(rec, previousVisibleProducts)
@@ -507,6 +552,16 @@ Function ExportImageForBomRecord(rec, previousVisibleProducts)
 
     imageFile = BuildUniqueImageFileName(CStr(rec.Item("PartNumber")), CStr(rec.Item("Nomenclature")), CLng(rec.Item("No")))
     imagePath = JoinPath(gImageFolder, imageFile)
+
+    If SKIP_EXISTING_IMAGES And gFSO.FileExists(imagePath) Then
+        rec.Item("ImageFile") = gFSO.GetFileName(imagePath)
+        rec.Item("ImagePath") = imagePath
+        rec.Item("ExportStatus") = "OK"
+        rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Existing image reused.")
+        AddLog CStr(rec.Item("PartNumber")), "OK", "Existing image reused.", imagePath
+        Set ExportImageForBomRecord = previousVisibleProducts
+        Exit Function
+    End If
 
     Set visibleProducts = BuildVisibleProductsForRecord(pathProducts, productRef)
 
@@ -547,6 +602,7 @@ Function ExportImageForBomRecord(rec, previousVisibleProducts)
     End If
 
     If CaptureCurrentViewer(imagePath, itemStart, IMAGE_EXPORT_TIMEOUT_SECONDS) Then
+        If ENABLE_IMAGE_CROP Then CropImageFile imagePath
         imageFile = gFSO.GetFileName(imagePath)
         rec.Item("ImageFile") = imageFile
         rec.Item("ImagePath") = imagePath
@@ -667,6 +723,196 @@ Function ConvertImageWithWia(sourcePath, targetPath, formatId)
     Err.Clear
 End Function
 
+Function CropImageFile(imagePath)
+    On Error Resume Next
+    CropImageFile = False
+    If Not ENABLE_IMAGE_CROP Then
+        CropImageFile = True
+        Exit Function
+    End If
+    If Not gFSO.FileExists(imagePath) Then Exit Function
+
+    If AUTO_CROP_WHITE_BACKGROUND Then
+        If AutoCropWhiteBackground(imagePath) Then
+            CropImageFile = True
+            Exit Function
+        End If
+    End If
+
+    If FixedCropImageFile(imagePath, CROP_MARGIN_PERCENT) Then
+        CropImageFile = True
+    Else
+        AddLog "", "WARNING", "Image crop failed; original image kept.", imagePath
+    End If
+    Err.Clear
+End Function
+
+Function AutoCropWhiteBackground(imagePath)
+    On Error Resume Next
+    AutoCropWhiteBackground = False
+
+    Dim img
+    Dim pixels
+    Dim width
+    Dim height
+    Dim scanStep
+    Dim baseIndex
+    Dim x
+    Dim y
+    Dim idx
+    Dim pixel
+    Dim minX
+    Dim minY
+    Dim maxX
+    Dim maxY
+    Dim padX
+    Dim padY
+
+    Set img = CreateObject("WIA.ImageFile")
+    img.LoadFile imagePath
+    width = CLng(img.Width)
+    height = CLng(img.Height)
+    If width < 20 Or height < 20 Then Exit Function
+
+    Set pixels = img.ARGBData
+    Err.Clear
+    pixel = pixels.Item(0)
+    If Err.Number <> 0 Then
+        Err.Clear
+        baseIndex = 1
+    Else
+        baseIndex = 0
+    End If
+
+    scanStep = CLng(width / 420)
+    If scanStep < 2 Then scanStep = 2
+    If scanStep > 6 Then scanStep = 6
+
+    minX = width
+    minY = height
+    maxX = -1
+    maxY = -1
+
+    For y = 0 To height - 1 Step scanStep
+        DoEvents
+        For x = 0 To width - 1 Step scanStep
+            idx = baseIndex + (y * width) + x
+            pixel = pixels.Item(idx)
+            If Err.Number = 0 Then
+                If PixelLooksLikeForeground(pixel) Then
+                    If x < minX Then minX = x
+                    If y < minY Then minY = y
+                    If x > maxX Then maxX = x
+                    If y > maxY Then maxY = y
+                End If
+            End If
+            Err.Clear
+        Next
+    Next
+
+    If maxX <= minX Or maxY <= minY Then Exit Function
+    If (maxX - minX) < width * 0.05 Or (maxY - minY) < height * 0.05 Then Exit Function
+
+    padX = CLng((maxX - minX + 1) * CROP_EXTRA_PADDING_PERCENT)
+    padY = CLng((maxY - minY + 1) * CROP_EXTRA_PADDING_PERCENT)
+    If padX < 8 Then padX = 8
+    If padY < 8 Then padY = 8
+
+    minX = minX - padX
+    minY = minY - padY
+    maxX = maxX + padX
+    maxY = maxY + padY
+    If minX < 0 Then minX = 0
+    If minY < 0 Then minY = 0
+    If maxX > width - 1 Then maxX = width - 1
+    If maxY > height - 1 Then maxY = height - 1
+
+    AutoCropWhiteBackground = ApplyWiaCrop(imagePath, minX, minY, maxX, maxY)
+    Err.Clear
+End Function
+
+Function PixelLooksLikeForeground(pixelValue)
+    On Error Resume Next
+    Dim p
+    Dim r
+    Dim g
+    Dim b
+    Dim t
+
+    p = CDbl(pixelValue)
+    If p < 0 Then p = p + 4294967296
+    b = CLng(p - (256 * Int(p / 256)))
+    t = Int(p / 256)
+    g = CLng(t - (256 * Int(t / 256)))
+    t = Int(p / 65536)
+    r = CLng(t - (256 * Int(t / 256)))
+
+    PixelLooksLikeForeground = Not (r >= 246 And g >= 246 And b >= 246)
+    Err.Clear
+End Function
+
+Function FixedCropImageFile(imagePath, marginPercent)
+    On Error Resume Next
+    FixedCropImageFile = False
+
+    Dim img
+    Dim width
+    Dim height
+    Dim dx
+    Dim dy
+    Set img = CreateObject("WIA.ImageFile")
+    img.LoadFile imagePath
+    width = CLng(img.Width)
+    height = CLng(img.Height)
+    If width < 20 Or height < 20 Then Exit Function
+    dx = CLng(width * CDbl(marginPercent))
+    dy = CLng(height * CDbl(marginPercent))
+    FixedCropImageFile = ApplyWiaCrop(imagePath, dx, dy, width - dx - 1, height - dy - 1)
+    Err.Clear
+End Function
+
+Function ApplyWiaCrop(imagePath, minX, minY, maxX, maxY)
+    On Error Resume Next
+    ApplyWiaCrop = False
+
+    Dim img
+    Dim proc
+    Dim cropped
+    Dim tmpPath
+    Dim width
+    Dim height
+
+    Set img = CreateObject("WIA.ImageFile")
+    img.LoadFile imagePath
+    width = CLng(img.Width)
+    height = CLng(img.Height)
+
+    If minX < 0 Then minX = 0
+    If minY < 0 Then minY = 0
+    If maxX > width - 1 Then maxX = width - 1
+    If maxY > height - 1 Then maxY = height - 1
+    If maxX <= minX Or maxY <= minY Then Exit Function
+
+    Set proc = CreateObject("WIA.ImageProcess")
+    proc.Filters.Add proc.FilterInfos("Crop").FilterID
+    proc.Filters(1).Properties("Left").Value = CLng(minX)
+    proc.Filters(1).Properties("Top").Value = CLng(minY)
+    proc.Filters(1).Properties("Right").Value = CLng(width - maxX - 1)
+    proc.Filters(1).Properties("Bottom").Value = CLng(height - maxY - 1)
+
+    Set cropped = proc.Apply(img)
+    tmpPath = JoinPath(gOutputFolder, "~crop_" & TimeStampFile() & "_" & CStr(Int(Rnd() * 100000)) & "." & gFSO.GetExtensionName(imagePath))
+    If gFSO.FileExists(tmpPath) Then gFSO.DeleteFile tmpPath, True
+    cropped.SaveFile tmpPath
+
+    If Err.Number = 0 And gFSO.FileExists(tmpPath) Then
+        gFSO.CopyFile tmpPath, imagePath, True
+        gFSO.DeleteFile tmpPath, True
+        ApplyWiaCrop = gFSO.FileExists(imagePath)
+    End If
+    Err.Clear
+End Function
+
 Function BuildVisibleProductsForRecord(pathProducts, productRoot)
     On Error Resume Next
 
@@ -759,6 +1005,24 @@ Sub RestoreWholeAssemblyView()
     SetVisibilityForList gAllProducts, True
     ApplyIsoViewAndFit
     gActiveDoc.Selection.Clear
+    Err.Clear
+End Sub
+
+Sub SafeRestoreCatiaSession()
+    On Error Resume Next
+    CATIA.RefreshDisplay = True
+    If Not (gActiveDoc Is Nothing) Then gActiveDoc.Selection.Clear
+    If Not (gAllProducts Is Nothing) Then SetVisibilityForList gAllProducts, True
+    If Not (gRootProduct Is Nothing) Then
+        gActiveDoc.Selection.Clear
+        gActiveDoc.Selection.Add gRootProduct
+        gActiveDoc.Selection.VisProperties.SetShow CAT_VIS_PROPERTY_SHOW
+        gActiveDoc.Selection.Clear
+    End If
+    CATIA.RefreshDisplay = True
+    ApplyIsoViewAndFit
+    If Not (gActiveDoc Is Nothing) Then gActiveDoc.Selection.Clear
+    CATIA.StatusBar = ""
     Err.Clear
 End Sub
 
@@ -926,6 +1190,352 @@ Sub TrySetCatiaWindowSize(widthPx, heightPx)
     Err.Clear
 End Sub
 
+Sub InitializeBomHeaders()
+    On Error Resume Next
+    Set gBomHeaders = NewList()
+    gCatiaBomColumnsSource = "fallback"
+
+    ' Primary path: CATIA Product.ExtractBOM uses the current Analyze > Bill of Material format.
+    ' Some V5 releases expose only the generated file, not the checked format list directly.
+    If USE_CATIA_DEFINED_BOM_COLUMNS Then
+        If TryLoadCatiaNativeBomHeaders() Then gCatiaBomColumnsSource = "CATIA ExtractBOM"
+    End If
+
+    If ListCount(gBomHeaders) = 0 Then LoadFallbackBomHeaders
+    EnsureBomUtilityColumns
+    Err.Clear
+End Sub
+
+Function TryLoadCatiaNativeBomHeaders()
+    On Error Resume Next
+    TryLoadCatiaNativeBomHeaders = False
+
+    Dim fileTypes
+    Dim fileExts
+    Dim i
+    Dim bomPath
+    fileTypes = Array(CAT_FILE_TYPE_TXT, 1, CAT_FILE_TYPE_HTML)
+    fileExts = Array("txt", "txt", "html")
+
+    For i = LBound(fileTypes) To UBound(fileTypes)
+        bomPath = JoinPath(gOutputFolder, "~CATIA_NATIVE_BOM_HEADERS." & fileExts(i))
+        If gFSO.FileExists(bomPath) Then gFSO.DeleteFile bomPath, True
+        Err.Clear
+        gRootProduct.ExtractBOM fileTypes(i), bomPath
+        If Err.Number = 0 And gFSO.FileExists(bomPath) Then
+            If LoadBomHeadersFromFile(bomPath) Then
+                TryLoadCatiaNativeBomHeaders = True
+                Exit Function
+            End If
+        End If
+        Err.Clear
+    Next
+End Function
+
+Function LoadBomHeadersFromFile(filePath)
+    On Error Resume Next
+    LoadBomHeadersFromFile = False
+
+    Dim txt
+    Dim ts
+    Set ts = gFSO.OpenTextFile(filePath, 1, False)
+    If Err.Number <> 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    txt = ts.ReadAll
+    ts.Close
+
+    If InStr(1, LCase(filePath), ".htm", vbTextCompare) > 0 Then
+        LoadBomHeadersFromFile = LoadHeadersFromHtmlText(txt)
+    Else
+        LoadBomHeadersFromFile = LoadHeadersFromDelimitedText(txt)
+    End If
+    Err.Clear
+End Function
+
+Function LoadHeadersFromDelimitedText(txt)
+    On Error Resume Next
+    LoadHeadersFromDelimitedText = False
+
+    Dim lines
+    Dim i
+    Dim line
+    Dim delimiter
+    Dim cells
+    Dim score
+    lines = Split(Replace(txt, vbCr, vbLf), vbLf)
+
+    For i = LBound(lines) To UBound(lines)
+        line = Trim(CStr(lines(i)))
+        If line <> "" Then
+            delimiter = DetectBomDelimiter(line)
+            If delimiter <> "" Then
+                cells = Split(line, delimiter)
+                score = CountUsefulCells(cells)
+                If score >= 2 And LooksLikeBomHeaderLine(line) Then
+                    AddHeaderArray cells
+                    LoadHeadersFromDelimitedText = (ListCount(gBomHeaders) > 0)
+                    Exit Function
+                End If
+            End If
+        End If
+    Next
+
+    For i = LBound(lines) To UBound(lines)
+        line = Trim(CStr(lines(i)))
+        delimiter = DetectBomDelimiter(line)
+        If delimiter <> "" Then
+            cells = Split(line, delimiter)
+            If CountUsefulCells(cells) >= 3 Then
+                AddHeaderArray cells
+                LoadHeadersFromDelimitedText = (ListCount(gBomHeaders) > 0)
+                Exit Function
+            End If
+        End If
+    Next
+    Err.Clear
+End Function
+
+Function LoadHeadersFromHtmlText(txt)
+    On Error Resume Next
+    LoadHeadersFromHtmlText = False
+
+    Dim reTr
+    Dim reCell
+    Dim rows
+    Dim row
+    Dim cells
+    Dim cell
+    Dim tmp
+    Set reTr = CreateObject("VBScript.RegExp")
+    reTr.Global = True
+    reTr.IgnoreCase = True
+    reTr.Pattern = "<tr[^>]*>([\s\S]*?)</tr>"
+
+    Set reCell = CreateObject("VBScript.RegExp")
+    reCell.Global = True
+    reCell.IgnoreCase = True
+    reCell.Pattern = "<t[hd][^>]*>([\s\S]*?)</t[hd]>"
+
+    Set rows = reTr.Execute(txt)
+    For Each row In rows
+        Set cells = reCell.Execute(row.SubMatches(0))
+        If cells.Count >= 2 Then
+            Set tmp = NewList()
+            For Each cell In cells
+                ListAddValue tmp, CleanHtmlText(cell.SubMatches(0))
+            Next
+            If LooksLikeHeaderList(tmp) Then
+                CopyHeaderList tmp
+                LoadHeadersFromHtmlText = (ListCount(gBomHeaders) > 0)
+                Exit Function
+            End If
+        End If
+    Next
+    Err.Clear
+End Function
+
+Function DetectBomDelimiter(line)
+    If InStr(line, vbTab) > 0 Then
+        DetectBomDelimiter = vbTab
+    ElseIf InStr(line, "|") > 0 Then
+        DetectBomDelimiter = "|"
+    ElseIf InStr(line, ";") > 0 Then
+        DetectBomDelimiter = ";"
+    ElseIf InStr(line, ",") > 0 Then
+        DetectBomDelimiter = ","
+    Else
+        DetectBomDelimiter = ""
+    End If
+End Function
+
+Function CountUsefulCells(cells)
+    Dim i
+    CountUsefulCells = 0
+    For i = LBound(cells) To UBound(cells)
+        If Trim(CStr(cells(i))) <> "" Then CountUsefulCells = CountUsefulCells + 1
+    Next
+End Function
+
+Function LooksLikeBomHeaderLine(line)
+    Dim l
+    l = LCase(line)
+    LooksLikeBomHeaderLine = (InStr(l, "part") > 0 Or InStr(l, "qty") > 0 Or InStr(l, "quantity") > 0 Or _
+                              InStr(l, "nomen") > 0 Or InStr(l, "material") > 0 Or InStr(l, "mass") > 0 Or _
+                              InStr(l, "item") > 0 Or InStr(l, "dimenz") > 0)
+End Function
+
+Function LooksLikeHeaderList(listObj)
+    Dim i
+    Dim joined
+    joined = ""
+    For i = 1 To ListCount(listObj)
+        joined = joined & " " & LCase(CStr(ListItemValue(listObj, i)))
+    Next
+    LooksLikeHeaderList = LooksLikeBomHeaderLine(joined)
+End Function
+
+Sub AddHeaderArray(cells)
+    Dim i
+    Dim h
+    Set gBomHeaders = NewList()
+    For i = LBound(cells) To UBound(cells)
+        h = CleanHeaderText(CStr(cells(i)))
+        If h <> "" Then AddUniqueHeader h
+    Next
+End Sub
+
+Sub CopyHeaderList(sourceList)
+    Dim i
+    Dim h
+    Set gBomHeaders = NewList()
+    For i = 1 To ListCount(sourceList)
+        h = CleanHeaderText(CStr(ListItemValue(sourceList, i)))
+        If h <> "" Then AddUniqueHeader h
+    Next
+End Sub
+
+Sub LoadFallbackBomHeaders()
+    Dim cells
+    cells = Split(BOM_COLUMNS, "|")
+    AddHeaderArray cells
+End Sub
+
+Sub AddUniqueHeader(headerText)
+    If FindHeaderIndex(headerText) = 0 Then ListAddValue gBomHeaders, headerText
+End Sub
+
+Function FindHeaderIndex(headerText)
+    Dim i
+    Dim target
+    target = NormalizeHeaderName(headerText)
+    FindHeaderIndex = 0
+    For i = 1 To ListCount(gBomHeaders)
+        If NormalizeHeaderName(CStr(ListItemValue(gBomHeaders, i))) = target Then
+            FindHeaderIndex = i
+            Exit Function
+        End If
+    Next
+End Function
+
+Sub EnsureBomUtilityColumns()
+    Dim insertAfter
+    insertAfter = FindHeaderIndex("Part Number")
+    If insertAfter = 0 Then insertAfter = FindHeaderIndex("Item")
+    If insertAfter = 0 Then insertAfter = 1
+
+    gThumbnailColumnIndex = FindHeaderIndex("Thumbnail")
+    If gThumbnailColumnIndex = 0 Then
+        InsertHeaderAt insertAfter + 1, "Thumbnail"
+        gThumbnailColumnIndex = FindHeaderIndex("Thumbnail")
+    End If
+
+    If FindHeaderIndex("Image Path") = 0 Then AddUniqueHeader "Image Path"
+    If FindHeaderIndex("Export Status") = 0 Then AddUniqueHeader "Export Status"
+    gImagePathColumnIndex = FindHeaderIndex("Image Path")
+    gExportStatusColumnIndex = FindHeaderIndex("Export Status")
+End Sub
+
+Sub InsertHeaderAt(position, headerText)
+    Dim newHeaders
+    Dim i
+    Set newHeaders = NewList()
+    If position < 1 Then position = 1
+    If position > ListCount(gBomHeaders) + 1 Then position = ListCount(gBomHeaders) + 1
+
+    For i = 1 To ListCount(gBomHeaders) + 1
+        If i = position Then ListAddValue newHeaders, headerText
+        If i <= ListCount(gBomHeaders) Then ListAddValue newHeaders, CStr(ListItemValue(gBomHeaders, i))
+    Next
+    Set gBomHeaders = newHeaders
+End Sub
+
+Function CleanHeaderText(valueText)
+    CleanHeaderText = Trim(Replace(Replace(CleanHtmlText(valueText), vbCr, " "), vbLf, " "))
+End Function
+
+Function CleanHtmlText(valueText)
+    On Error Resume Next
+    Dim re
+    Dim s
+    s = CStr(valueText)
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True
+    re.IgnoreCase = True
+    re.Pattern = "<[^>]+>"
+    s = re.Replace(s, "")
+    s = Replace(s, "&nbsp;", " ")
+    s = Replace(s, "&amp;", "&")
+    s = Replace(s, "&lt;", "<")
+    s = Replace(s, "&gt;", ">")
+    s = Replace(s, Chr(160), " ")
+    CleanHtmlText = Trim(s)
+    Err.Clear
+End Function
+
+Function NormalizeHeaderName(valueText)
+    Dim s
+    s = LCase(Trim(CStr(valueText)))
+    s = Replace(s, ".", "")
+    s = Replace(s, "_", "")
+    s = Replace(s, "-", "")
+    s = Replace(s, " ", "")
+    NormalizeHeaderName = s
+End Function
+
+Function GetBomCellValue(rec, headerText)
+    On Error Resume Next
+    Dim key
+    key = NormalizeHeaderName(headerText)
+
+    Select Case key
+        Case "item", "no", "number", "rbr"
+            GetBomCellValue = rec.Item("No")
+        Case "quantity", "qty", "qta", "qte"
+            GetBomCellValue = rec.Item("Quantity")
+        Case "partnumber", "partno", "pn"
+            GetBomCellValue = rec.Item("PartNumber")
+        Case "revision", "rev", "revizija"
+            GetBomCellValue = rec.Item("Revision")
+        Case "type", "componenttype"
+            GetBomCellValue = rec.Item("Type")
+        Case "nomenclature", "nomenklatura", "description", "opis"
+            GetBomCellValue = rec.Item("Nomenclature")
+        Case "material", "materijal"
+            GetBomCellValue = rec.Item("Material")
+        Case "dimension", "dimenzija", "dimmm", "dimensions"
+            GetBomCellValue = rec.Item("Dimension")
+        Case "mass", "masa"
+            GetBomCellValue = rec.Item("Mass")
+        Case "standard"
+            GetBomCellValue = rec.Item("Standard")
+        Case "parentassembly"
+            GetBomCellValue = rec.Item("ParentAssembly")
+        Case "treepath", "fulltreepath"
+            GetBomCellValue = rec.Item("TreePath")
+        Case "imagefile"
+            GetBomCellValue = rec.Item("ImageFile")
+        Case "imagepath"
+            GetBomCellValue = rec.Item("ImagePath")
+        Case "exportstatus"
+            GetBomCellValue = rec.Item("ExportStatus")
+        Case "note", "comments", "comment"
+            GetBomCellValue = rec.Item("Note")
+        Case "thumbnail"
+            GetBomCellValue = ""
+        Case Else
+            GetBomCellValue = GetPropertyValue(rec.Item("ProductRef"), Array(headerText))
+    End Select
+    Err.Clear
+End Function
+
+Function ShouldProcessExportIndex(itemIndex)
+    ShouldProcessExportIndex = True
+    If START_INDEX > 1 And itemIndex < START_INDEX Then ShouldProcessExportIndex = False
+    If END_INDEX > 0 And itemIndex > END_INDEX Then ShouldProcessExportIndex = False
+End Function
+
 Sub InitializeExcelReportImmediate()
     On Error Resume Next
 
@@ -960,6 +1570,7 @@ Sub InitializeExcelReportImmediate()
     gNextBomRow = 2
     gNextLogRow = 2
 
+    InitializeBomHeaders
     PrepareSummarySheetImmediate
     PrepareBomSheetImmediate
     PrepareLogSheetImmediate
@@ -1011,36 +1622,26 @@ Sub PrepareBomSheetImmediate()
     On Error Resume Next
     gWsBom.Cells.Clear
 
-    Dim headers
-    headers = Array("No.", "Quantity", "Part Number", "Revision", "Type", "Nomenclature", _
-                    "Material", "Dimension", "Mass", "Standard", "Parent Assembly", _
-                    "Tree Path", "Image File", "Preview Image", "Export Status", "Note")
-
     Dim c
-    For c = LBound(headers) To UBound(headers)
-        gWsBom.Cells(1, c + 1).Value = headers(c)
+    For c = 1 To ListCount(gBomHeaders)
+        gWsBom.Cells(1, c).Value = ListItemValue(gBomHeaders, c)
     Next
 
     gWsBom.Rows(1).Font.Bold = True
     gWsBom.Rows(1).Interior.Color = RGB(220, 230, 241)
     gWsBom.Rows(1).HorizontalAlignment = XL_CENTER
-    gWsBom.Columns("A").ColumnWidth = 7
-    gWsBom.Columns("B").ColumnWidth = 10
-    gWsBom.Columns("C").ColumnWidth = 28
-    gWsBom.Columns("D").ColumnWidth = 14
-    gWsBom.Columns("E").ColumnWidth = 12
-    gWsBom.Columns("F").ColumnWidth = 32
-    gWsBom.Columns("G").ColumnWidth = 20
-    gWsBom.Columns("H").ColumnWidth = 24
-    gWsBom.Columns("I").ColumnWidth = 16
-    gWsBom.Columns("J").ColumnWidth = 18
-    gWsBom.Columns("K").ColumnWidth = 28
-    gWsBom.Columns("L").ColumnWidth = 65
-    gWsBom.Columns("M").ColumnWidth = 32
-    gWsBom.Columns("N").ColumnWidth = 24
-    gWsBom.Columns("O").ColumnWidth = 16
-    gWsBom.Columns("P").ColumnWidth = 42
-    gWsBom.Range("A1:P1").AutoFilter
+    For c = 1 To ListCount(gBomHeaders)
+        If c = gThumbnailColumnIndex Then
+            gWsBom.Columns(c).ColumnWidth = 24
+        ElseIf c = gImagePathColumnIndex Then
+            gWsBom.Columns(c).ColumnWidth = 55
+        ElseIf c = gExportStatusColumnIndex Then
+            gWsBom.Columns(c).ColumnWidth = 18
+        Else
+            gWsBom.Columns(c).ColumnWidth = 22
+        End If
+    Next
+    gWsBom.Range(gWsBom.Cells(1, 1), gWsBom.Cells(1, ListCount(gBomHeaders))).AutoFilter
     gWsBom.Activate
     gWsBom.Range("A2").Select
     gExcelApp.ActiveWindow.FreezePanes = True
@@ -1083,7 +1684,8 @@ Sub UpdateSummarySheet()
     gWsSummary.Range("B9").Value = gExcelPath
     gWsSummary.Range("B10").Value = "EXPORT_IMAGES=" & CStr(EXPORT_IMAGES) & _
                                    "; MAX_ITEMS_TO_EXPORT=" & CStr(MAX_ITEMS_TO_EXPORT) & _
-                                   "; SKIP_ASSEMBLIES=" & CStr(SKIP_ASSEMBLIES)
+                                   "; SKIP_ASSEMBLIES=" & CStr(SKIP_ASSEMBLIES) & _
+                                   "; BOM_COLUMNS=" & gCatiaBomColumnsSource
 
     If EXPORT_IMAGES And INSERT_IMAGES_IN_EXCEL And Not gMainPreviewInserted And gFSO.FileExists(gMainImagePath) Then
         InsertPictureIntoRange gWsSummary, gMainImagePath, "A13:D30"
@@ -1105,37 +1707,30 @@ Sub WriteBomRecordImmediate(rec, includePicture)
         gNextBomRow = gNextBomRow + 1
     End If
 
-    gWsBom.Cells(rowIndex, 1).Value = rec.Item("No")
-    gWsBom.Cells(rowIndex, 2).Value = rec.Item("Quantity")
-    gWsBom.Cells(rowIndex, 3).Value = rec.Item("PartNumber")
-    gWsBom.Cells(rowIndex, 4).Value = rec.Item("Revision")
-    gWsBom.Cells(rowIndex, 5).Value = rec.Item("Type")
-    gWsBom.Cells(rowIndex, 6).Value = rec.Item("Nomenclature")
-    gWsBom.Cells(rowIndex, 7).Value = rec.Item("Material")
-    gWsBom.Cells(rowIndex, 8).Value = rec.Item("Dimension")
-    gWsBom.Cells(rowIndex, 9).Value = rec.Item("Mass")
-    gWsBom.Cells(rowIndex, 10).Value = rec.Item("Standard")
-    gWsBom.Cells(rowIndex, 11).Value = rec.Item("ParentAssembly")
-    gWsBom.Cells(rowIndex, 12).Value = rec.Item("TreePath")
-    gWsBom.Cells(rowIndex, 13).Value = rec.Item("ImageFile")
-    gWsBom.Cells(rowIndex, 15).Value = rec.Item("ExportStatus")
-    gWsBom.Cells(rowIndex, 16).Value = rec.Item("Note")
+    Dim c
+    Dim headerText
+    For c = 1 To ListCount(gBomHeaders)
+        headerText = CStr(ListItemValue(gBomHeaders, c))
+        If c <> gThumbnailColumnIndex Then
+            gWsBom.Cells(rowIndex, c).Value = GetBomCellValue(rec, headerText)
+        End If
+    Next
 
     If INSERT_IMAGES_IN_EXCEL Then
-        gWsBom.Rows(rowIndex).RowHeight = 95
+        gWsBom.Rows(rowIndex).RowHeight = CLng(THUMBNAIL_HEIGHT * 0.75) + 12
     Else
         gWsBom.Rows(rowIndex).RowHeight = 28
     End If
 
-    gWsBom.Range("A" & CStr(rowIndex) & ":P" & CStr(rowIndex)).WrapText = True
-    gWsBom.Range("A" & CStr(rowIndex) & ":P" & CStr(rowIndex)).VerticalAlignment = XL_TOP
-    gWsBom.Range("A" & CStr(rowIndex) & ":P" & CStr(rowIndex)).Borders.LineStyle = XL_CONTINUOUS
-    gWsBom.Range("A" & CStr(rowIndex) & ":P" & CStr(rowIndex)).Borders.Weight = XL_THIN
+    gWsBom.Range(gWsBom.Cells(rowIndex, 1), gWsBom.Cells(rowIndex, ListCount(gBomHeaders))).WrapText = True
+    gWsBom.Range(gWsBom.Cells(rowIndex, 1), gWsBom.Cells(rowIndex, ListCount(gBomHeaders))).VerticalAlignment = XL_TOP
+    gWsBom.Range(gWsBom.Cells(rowIndex, 1), gWsBom.Cells(rowIndex, ListCount(gBomHeaders))).Borders.LineStyle = XL_CONTINUOUS
+    gWsBom.Range(gWsBom.Cells(rowIndex, 1), gWsBom.Cells(rowIndex, ListCount(gBomHeaders))).Borders.Weight = XL_THIN
 
     If includePicture And INSERT_IMAGES_IN_EXCEL And CStr(rec.Item("ImagePath")) <> "" And gFSO.FileExists(CStr(rec.Item("ImagePath"))) Then
-        InsertPictureIntoCell gWsBom, CStr(rec.Item("ImagePath")), gWsBom.Cells(rowIndex, 14)
+        InsertPictureIntoCell gWsBom, CStr(rec.Item("ImagePath")), gWsBom.Cells(rowIndex, gThumbnailColumnIndex)
     ElseIf includePicture And CStr(rec.Item("ExportStatus")) = "ERROR" Then
-        gWsBom.Cells(rowIndex, 14).Value = "ERROR"
+        gWsBom.Cells(rowIndex, gThumbnailColumnIndex).Value = "ERROR"
     End If
 
     Err.Clear
@@ -1431,8 +2026,10 @@ Sub InsertPictureIntoCell(ws, imagePath, cell)
     Dim maxH
 
     margin = 4
-    maxW = cell.Width - (2 * margin)
-    maxH = cell.Height - (2 * margin)
+    maxW = THUMBNAIL_WIDTH
+    maxH = THUMBNAIL_HEIGHT
+    If maxW > cell.Width - (2 * margin) Then maxW = cell.Width - (2 * margin)
+    If maxH > cell.Height - (2 * margin) Then maxH = cell.Height - (2 * margin)
     If maxW < 10 Or maxH < 10 Then Exit Sub
 
     Set shp = ws.Shapes.AddPicture(imagePath, MSO_FALSE, MSO_TRUE, cell.Left + margin, cell.Top + margin, maxW, maxH)
@@ -1703,6 +2300,11 @@ Function BuildUniqueImageFileName(partNumber, nomenclature, itemNo)
     If Len(baseName) > 140 Then baseName = Left(baseName, 140)
 
     candidate = baseName & "." & ext
+    If SKIP_EXISTING_IMAGES And gFSO.FileExists(JoinPath(gImageFolder, candidate)) Then
+        BuildUniqueImageFileName = candidate
+        Exit Function
+    End If
+
     n = 1
     Do While gFSO.FileExists(JoinPath(gImageFolder, candidate))
         candidate = baseName & "_" & Pad3(n) & "." & ext

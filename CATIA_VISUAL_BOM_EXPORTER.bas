@@ -12,8 +12,15 @@ Private Const IMAGE_FORMAT As String = "png"
 Private Const EXPORT_PARTS As Boolean = True
 Private Const EXPORT_ASSEMBLIES As Boolean = True
 Private Const EXPORT_SELECTED_ONLY As Boolean = False
-Private Const IMAGE_WIDTH As Long = 1200
-Private Const IMAGE_HEIGHT As Long = 900
+Private Const USE_NICE_IMAGE_VIEW As Boolean = True
+Private Const USE_SHADED_WITH_EDGES As Boolean = True
+Private Const USE_WHITE_BACKGROUND As Boolean = True
+Private Const USE_PARALLEL_PROJECTION As Boolean = True
+Private Const IMAGE_CAPTURE_DELAY_SECONDS As Double = 0.35
+Private Const IMAGE_FIT_REPEAT_COUNT As Long = 2
+Private Const IMAGE_EXTRA_ZOOM_OUT_STEPS As Long = 0
+Private Const IMAGE_WIDTH As Long = 1600
+Private Const IMAGE_HEIGHT As Long = 1200
 Private Const INSERT_IMAGES_IN_EXCEL As Boolean = True
 Private Const OUTPUT_TO_DESKTOP As Boolean = True
 
@@ -26,6 +33,11 @@ Private Const CAT_VIS_PROPERTY_NO_SHOW As Long = 1
 Private Const CAT_CAPTURE_FORMAT_BMP As Long = 0
 Private Const CAT_CAPTURE_FORMAT_TIFF As Long = 1
 Private Const CAT_CAPTURE_FORMAT_JPEG As Long = 2
+
+' CATIA rendering/projection constants used late-bound from VBA.
+Private Const CAT_RENDER_SHADING As Long = 0
+Private Const CAT_RENDER_SHADING_WITH_EDGES As Long = 1
+Private Const CAT_PROJECTION_CYLINDRIC As Long = 0
 
 ' Excel constants for late binding.
 Private Const XL_OPENXML_WORKBOOK As Long = 51
@@ -409,7 +421,7 @@ Private Function CaptureCurrentViewer(ByRef targetPath As String) As Boolean
     Set viewer = CATIA.ActiveWindow.ActiveViewer
     viewer.Activate
     viewer.Update
-    WaitSeconds 0.25
+    WaitSeconds IMAGE_CAPTURE_DELAY_SECONDS
 
     Dim ext As String
     ext = LCase$(gFSO.GetExtensionName(targetPath))
@@ -570,6 +582,30 @@ Private Sub ApplyIsoViewAndFit()
     Set viewer = CATIA.ActiveWindow.ActiveViewer
     viewer.Activate
 
+    If USE_NICE_IMAGE_VIEW Then
+        If USE_SHADED_WITH_EDGES Then
+            Err.Clear
+            viewer.RenderingMode = CAT_RENDER_SHADING_WITH_EDGES
+            If Err.Number <> 0 Then
+                Err.Clear
+                viewer.RenderingMode = CAT_RENDER_SHADING
+            End If
+        Else
+            Err.Clear
+            viewer.RenderingMode = CAT_RENDER_SHADING
+        End If
+
+        If USE_WHITE_BACKGROUND Then
+            Err.Clear
+            Dim bg(2) As Double
+            bg(0) = 1#
+            bg(1) = 1#
+            bg(2) = 1#
+            viewer.PutBackgroundColor bg
+            Err.Clear
+        End If
+    End If
+
     Dim vp As Object
     Set vp = viewer.Viewpoint3D
 
@@ -584,12 +620,33 @@ Private Sub ApplyIsoViewAndFit()
 
     vp.PutSightDirection sight
     vp.PutUpDirection up
-    vp.ProjectionMode = 0
+    If USE_PARALLEL_PROJECTION Then
+        Err.Clear
+        vp.ProjectionMode = CAT_PROJECTION_CYLINDRIC
+        Err.Clear
+    End If
+
+    Dim i As Long
+    For i = 1 To IMAGE_FIT_REPEAT_COUNT
+        viewer.Update
+        viewer.Reframe
+        viewer.Update
+        DoEvents
+    Next i
+
+    viewer.ZoomOut
+
+    Dim zoomSteps As Long
+    zoomSteps = IMAGE_EXTRA_ZOOM_OUT_STEPS
+    If zoomSteps < 0 Then zoomSteps = 0
+    For i = 1 To zoomSteps
+        viewer.ZoomOut
+        viewer.Update
+        DoEvents
+    Next i
 
     viewer.Update
-    viewer.Reframe
-    viewer.Update
-    WaitSeconds 0.2
+    WaitSeconds IMAGE_CAPTURE_DELAY_SECONDS
     Err.Clear
 End Sub
 

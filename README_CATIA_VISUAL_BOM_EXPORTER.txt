@@ -1,63 +1,86 @@
-CATIA_VISUAL_BOM_EXPORTER - kratko uputstvo
+CATIA_VISUAL_BOM_EXPORTER - production visual BOM makro
 
-Fajl makroa:
-CATIA_VISUAL_BOM_EXPORTER.bas
+Cilj:
+CATIA CATProduct -> grupisani BOM Excel -> slike delova -> thumbnail slike direktno u Excelu.
 
-Direktno selektabilni CATIA script fajlovi:
-CATIA_VISUAL_BOM_EXPORTER.CATScript
+Fajlovi:
+- CATIA_VISUAL_BOM_EXPORTER.CATScript
+- CATIA_VISUAL_BOM_EXPORTER.bas
 
-Kako ubaciti u CATIA V5:
-Opcija A - ako zelite direktno da selektujete skriptu:
-1. Tools > Macro > Macros...
-2. Macro libraries... / Select...
-3. Izaberite Directory kao tip biblioteke.
-4. Pokazite na folder gde je fajl:
-   C:\Users\Aca Stojanovic\Documents\Codex\2026-05-18\napravi-odmah-funkcionalni-catia-v5-vba
-5. Izaberite CATIA_VISUAL_BOM_EXPORTER.CATScript.
-6. Run.
+Makro ne menja geometriju, ne snima CATProduct i ne zatvara CATIA.
 
-U aktuelnoj verziji Excel workbook se kreira odmah, BOM i LOG redovi se upisuju tokom rada, a fajl se snima posle svake obradjene stavke.
-
-Opcija B - ako koristite VBA library:
-1. Otvorite CATIA V5.
+Kako pokrenuti CATScript:
+1. Otvorite glavni CATProduct u CATIA V5.
 2. Tools > Macro > Macros...
-3. Izaberite ili napravite VBA library (.catvba).
-4. Otvorite VBA Editor.
-5. Insert > Module.
-6. Iskopirajte kompletan sadrzaj fajla CATIA_VISUAL_BOM_EXPORTER.bas u modul.
-7. Sacuvajte VBA library.
+3. Macro libraries... / Select...
+4. Izaberite Directory kao tip biblioteke.
+5. Pokazite na folder gde su fajlovi makroa.
+6. Izaberite CATIA_VISUAL_BOM_EXPORTER.CATScript.
+7. Run.
 
-Kako pokrenuti:
-1. Otvorite glavni CATProduct sklop.
-2. Aktivirajte prozor sklopa.
-3. Tools > Macro > Macros...
-4. Izaberite CATIA_VISUAL_BOM_EXPORTER.
-5. Run.
+Kako pokrenuti VBA verziju:
+1. Tools > Macro > Macros...
+2. Izaberite ili napravite VBA library (.catvba).
+3. Otvorite VBA Editor.
+4. Insert > Module.
+5. Iskopirajte kompletan sadrzaj CATIA_VISUAL_BOM_EXPORTER.bas.
+6. Pokrenite CATIA_VISUAL_BOM_EXPORTER.
 
-Izlaz:
-Makro pravi folder:
+Izlazni folder:
 <PartNumber>_VISUAL_BOM_EXPORT
 
-U njemu pravi:
+U njemu se prave:
 - VISUAL_BOM_EXPORT.xlsx
-- IMAGES folder
-- MAIN_ASSEMBLY.png
+- IMAGES
+- THUMBNAILS
+- DEBUG_PHASE_LOG.txt
+- MAIN_ASSEMBLY.jpg samo ako je EXPORT_MAIN_ASSEMBLY_IMAGE=True
+
+Podrazumevana podesavanja za prvu proveru:
+- TEST_MODE=True
+- TEST_MAX_ITEMS=10
+- EXPORT_MAIN_ASSEMBLY_IMAGE=False
+- HYBRID_PRODUCTION_MODE=True
+- INSERT_IMAGES_IN_EXCEL=True
+- CREATE_THUMBNAIL_FILES=True
+- INSERT_THUMBNAIL_FILE_IN_EXCEL=True
+- FAST_SNIP_MODE=True
+- FAST_IMAGE_FORMAT="jpg"
+- FAST_ZOOM_IN_STEPS=0
+- FAST_CENTER_CROP_PERCENT=0.90
+- RESUME_MODE=True
+- SKIP_EXISTING_IMAGES=True
+- START_INDEX=1
+- END_INDEX=0
+
+Za full export:
+1. U kodu podesite TEST_MODE=False.
+2. Ostavite MAX_ITEMS_TO_EXPORT=0.
+3. Po potrebi koristite START_INDEX / END_INDEX za batch rad, npr. 1-200, 201-400.
+
+Vazno za velike sklopove:
+- Makro grupise po Part Number-u.
+- Jedna BOM stavka dobija jednu sliku, bez slikanja svih instanci.
+- Quantity je broj pojavljivanja istog Part Number-a.
+- Ako Part Number ne postoji, koristi se TreePath fallback.
+- Excel se kreira odmah i snima checkpoint posle prve slike, posle prvih 10 slika i zatim periodicno.
+- Ako slika vec postoji u IMAGES i thumbnail u THUMBNAILS, makro ih koristi ponovo.
+- Ako postoji full slika bez thumbnail-a, makro pokusava da napravi thumbnail i nastavi.
+
+Excel:
+- Sheet SUMMARY: osnovni podaci, folder, debug log.
+- Sheet BOM: kolone iz CATIA Analyze > Bill of Material ako ExtractBOM uspe, plus Thumbnail, Image Path i Export Status.
+- Sheet EXPORT_LOG: No., Date/Time, Item Index, Part Number, Status, Phase, Message, Image Path, Thumbnail Path, ISO_VIEW.
+
+Debug:
+DEBUG_PHASE_LOG.txt belezi faze:
+START, EXCEL_CREATED, BOM_SCAN_START, BOM_SCAN_PROGRESS, BOM_SCAN_DONE,
+UNIQUE_ITEMS_COUNT, MAIN_ASSEMBLY_SKIPPED, IMAGE_EXPORT_START, ITEM_START,
+ITEM_VISIBLE_SET, ITEM_CAPTURE_START, ITEM_CAPTURE_DONE, THUMBNAIL_CREATED,
+EXCEL_THUMBNAIL_INSERTED, SAVE_CHECKPOINT, ITEM_ERROR, ITEM_TIMEOUT, FINISH.
 
 Napomene:
-- CATIA V5 Automation CaptureToFile uglavnom podrzava BMP/JPEG/TIFF, ne uvek PNG direktno. Makro zato hvata BMP pa konvertuje u PNG preko Windows WIA COM komponente.
-- Ako WIA nije dostupna na racunaru, makro pravi JPG fallback i upisuje WARNING u EXPORT_LOG.
-- Ako slike izlaze lose, pre pokretanja u CATIA podesite belu pozadinu i zeljeni render style u 3D vieweru. Makro koristi izometrijski Viewpoint3D, Reframe/Fit All i trenutni viewer.
-- Hide/show se radi preko Selection.VisProperties.SetShow. Na nekim CATIA V5 konfiguracijama instance, CGR/lightweight komponente ili unloaded reference ne reaguju potpuno pouzdano. Makro ne brise, ne snima i ne menja geometriju, a na kraju pokusava da vrati prikaz celog sklopa.
-- Ako zelite samo selektovane stavke, u kodu promenite:
-  Const EXPORT_SELECTED_ONLY = True
-- Za test bez slika podesite:
-  Const EXPORT_IMAGES = False
-- Za test samo prvih 10 stavki podeseno je:
-  Const MAX_ITEMS_TO_EXPORT = 10
-  Ako zelite sve stavke, stavite 0.
-- Za prvi test samo CATPart delova podeseno je:
-  Const SKIP_ASSEMBLIES = True
-  Ako zelite i podsklopove, stavite False.
-- Timeout po komponenti je:
-  Const IMAGE_EXPORT_TIMEOUT_SECONDS = 10
-  Napomena: ako se sam CATIA COM poziv potpuno blokira unutar CATIA, VBScript ne moze nasilno da ga prekine dok CATIA ne vrati kontrolu makrou.
+- CATIA CaptureToFile je COM poziv. Ako se sama CATIA potpuno blokira u tom pozivu, VBScript/VBA ne moze nasilno da ga prekine dok CATIA ne vrati kontrolu makrou.
+- Hide/show zavisi od CATIA V5 konfiguracije, loaded/unloaded komponenti i CGR/lightweight stanja. Makro koristi batch Selection.VisProperties.SetShow i na kraju poziva SafeRestoreCatiaSession.
+- Za stabilnije slike koristite belu pozadinu i shaded-with-edges prikaz u CATIA vieweru.
+- JPG je podrazumevan u FAST_SNIP_MODE jer je brzi i dovoljan za Excel thumbnail.

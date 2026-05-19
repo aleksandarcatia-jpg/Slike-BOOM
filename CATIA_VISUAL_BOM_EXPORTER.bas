@@ -19,7 +19,12 @@ Private Const FAST_CENTER_CROP_PERCENT As Double = 0.9
 Private Const AUTO_BEST_ISO_VIEW As Boolean = True
 Private Const ISO_VIEW_MODE As String = "AUTO_ROTATE"
 Private Const DEFAULT_ISO_VIEW_INDEX As Long = 1
-Private Const MAX_SECONDS_PER_IMAGE As Double = 2
+Private Const MAX_SECONDS_PER_IMAGE As Double = 5
+Private Const EXPORT_MAIN_ASSEMBLY_IMAGE As Boolean = False
+Private Const HYBRID_PRODUCTION_MODE As Boolean = True
+Private Const MAX_BOM_SCAN_SECONDS As Double = 300
+Private Const FIRST_IMAGE_TIMEOUT_SECONDS As Double = 120
+Private Const ITEM_TIMEOUT_SECONDS As Double = 5
 Private Const EXPORT_PARTS As Boolean = True
 Private Const EXPORT_ASSEMBLIES As Boolean = True
 Private Const EXPORT_SELECTED_ONLY As Boolean = False
@@ -37,11 +42,15 @@ Private Const CROP_PADDING_PERCENT As Double = 0.04
 Private Const FALLBACK_FIXED_CROP_PERCENT As Double = 0.08
 Private Const USE_CATIA_DEFINED_BOM_COLUMNS As Boolean = True
 Private Const BOM_COLUMNS As String = "Item|Part Number|Thumbnail|Keywords|QTY|Material|Dimenzija|Mass|Standard|Component Type|REV|Dim-MM|Description|Comments"
+Private Const CREATE_THUMBNAIL_FILES As Boolean = True
+Private Const INSERT_THUMBNAIL_FILE_IN_EXCEL As Boolean = True
 Private Const THUMBNAIL_WIDTH As Long = 160
 Private Const THUMBNAIL_HEIGHT As Long = 120
 Private Const EXCEL_IMAGE_BATCH_SIZE As Long = 100
 Private Const SAVE_AFTER_EACH_IMAGE_BATCH As Boolean = True
-Private Const SAVE_EVERY_N_ITEMS As Long = 100
+Private Const SAVE_EVERY_N_ITEMS As Long = 50
+Private Const SAVE_AFTER_FIRST_IMAGE As Boolean = True
+Private Const SAVE_AFTER_FIRST_10_IMAGES As Boolean = True
 Private Const SKIP_EXISTING_IMAGES As Boolean = True
 Private Const START_INDEX As Long = 1
 Private Const END_INDEX As Long = 0
@@ -53,6 +62,9 @@ Private Const IMAGE_EXPORT_TIMEOUT_SECONDS As Double = 10
 Private Const IMAGE_WIDTH As Long = 1000
 Private Const IMAGE_HEIGHT As Long = 750
 Private Const INSERT_IMAGES_IN_EXCEL As Boolean = True
+Private Const TEST_MODE As Boolean = True
+Private Const TEST_MAX_ITEMS As Long = 10
+Private Const VISIBILITY_BATCH_SIZE As Long = 200
 Private Const OUTPUT_TO_DESKTOP As Boolean = True
 
 ' CATIA VisProperties show constants.
@@ -79,6 +91,8 @@ Private Const XL_LEFT As Long = -4131
 Private Const XL_TOP As Long = -4160
 Private Const XL_CONTINUOUS As Long = 1
 Private Const XL_THIN As Long = 2
+Private Const XL_CALCULATION_AUTOMATIC As Long = -4105
+Private Const XL_CALCULATION_MANUAL As Long = -4135
 Private Const MSO_TRUE As Long = -1
 Private Const MSO_FALSE As Long = 0
 
@@ -95,16 +109,36 @@ Private gExportLog As Collection
 Private gTotalInstances As Long
 Private gOutputFolder As String
 Private gImageFolder As String
+Private gThumbnailFolder As String
 Private gMainImagePath As String
 Private gExcelPath As String
+Private gDebugLogPath As String
 Private gRootProduct As Object
 Private gActiveDoc As Object
+Private gExcelApp As Object
+Private gWorkbook As Object
+Private gWsSummary As Object
+Private gWsBom As Object
+Private gWsLog As Object
+Private gNextBomRow As Long
+Private gNextLogRow As Long
+Private gExcelReady As Boolean
+Private gMainPreviewInserted As Boolean
 Private gBomHeaders As Collection
 Private gThumbnailColumnIndex As Long
 Private gImagePathColumnIndex As Long
 Private gExportStatusColumnIndex As Long
 Private gCatiaBomColumnsSource As String
 Private gEffectiveStartIndex As Long
+Private gExcelImageInsertCount As Long
+Private gBomScanStart As Double
+Private gBomScanTimedOut As Boolean
+Private gAbortMessage As String
+Private gSuccessfulImageCount As Long
+Private gCurrentLogItemIndex As Long
+Private gCurrentLogPhase As String
+Private gCurrentLogThumbnailPath As String
+Private gCurrentLogIsoView As String
 
 Public Sub CATIA_VISUAL_BOM_EXPORTER()
     On Error GoTo FatalError
@@ -115,11 +149,29 @@ Public Sub CATIA_VISUAL_BOM_EXPORTER()
     Set gAllProducts = New Collection
     Set gExportLog = New Collection
     Set gBomHeaders = New Collection
+    Set gExcelApp = Nothing
+    Set gWorkbook = Nothing
+    Set gWsSummary = Nothing
+    Set gWsBom = Nothing
+    Set gWsLog = Nothing
+    gNextBomRow = 2
+    gNextLogRow = 2
+    gExcelReady = False
+    gMainPreviewInserted = False
     gThumbnailColumnIndex = 0
     gImagePathColumnIndex = 0
     gExportStatusColumnIndex = 0
     gCatiaBomColumnsSource = ""
     gEffectiveStartIndex = START_INDEX
+    gExcelImageInsertCount = 0
+    gBomScanStart = 0
+    gBomScanTimedOut = False
+    gAbortMessage = ""
+    gSuccessfulImageCount = 0
+    gCurrentLogItemIndex = 0
+    gCurrentLogPhase = ""
+    gCurrentLogThumbnailPath = ""
+    gCurrentLogIsoView = ""
     gTotalInstances = 0
     Randomize
 
@@ -137,25 +189,56 @@ Public Sub CATIA_VISUAL_BOM_EXPORTER()
 
     Set gRootProduct = gActiveDoc.Product
     PrepareOutputFolders gActiveDoc, gRootProduct
+    WriteDebugPhase "START", 0, GetProductPartNumber(gRootProduct), "Macro started."
+
     InitializeBomHeaders
-    gEffectiveStartIndex = DetermineResumeStartIndexFromExcelFile()
+    InitializeExcelReportImmediate
+    If Not gExcelReady Then
+        SafeRestoreCatiaSession
+        MsgBox "Excel workbook nije kreiran. Proverite da li je Microsoft Excel instaliran i dostupan.", vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
+        Exit Sub
+    End If
 
     CATIA.StatusBar = "CATIA_VISUAL_BOM_EXPORTER: citam Product Tree..."
+    WriteDebugPhase "BOM_SCAN_START", 0, GetProductPartNumber(gRootProduct), "Product tree scan started."
+    gBomScanStart = Timer
+    gBomScanTimedOut = False
     BuildBomFromProductTree gRootProduct
+    If gBomScanTimedOut Then
+        gAbortMessage = "BOM scan traje duze od " & CStr(MAX_BOM_SCAN_SECONDS) & " sekundi. Export je prekinut pre slika."
+        WriteDebugPhase "ITEM_TIMEOUT", 0, "", gAbortMessage
+        SafeRestoreCatiaSession
+        FinalizeExcelReportImmediate
+        MsgBox gAbortMessage & vbCrLf & vbCrLf & "Detalji su u DEBUG_PHASE_LOG.txt.", vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
+        Exit Sub
+    End If
+    WriteDebugPhase "BOM_SCAN_DONE", 0, GetProductPartNumber(gRootProduct), "Product tree scan finished."
+    WriteDebugPhase "UNIQUE_ITEMS_COUNT", gBomItems.Count, "", "Unique BOM items: " & CStr(gBomItems.Count) & "; total exported instances: " & CStr(gTotalInstances)
+    UpdateSummarySheet
 
     If gBomItems.Count = 0 Then
+        AddLog GetProductPartNumber(gRootProduct), "WARNING", "Nije pronadjena nijedna BOM stavka za izvoz.", ""
+        SaveExcelCheckpoint
+        SafeRestoreCatiaSession
+        FinalizeExcelReportImmediate
         MsgBox "Nije pronadjena nijedna BOM stavka za izvoz. Proverite EXPORT_PARTS / EXPORT_ASSEMBLIES / EXPORT_SELECTED_ONLY konfiguraciju.", _
                vbExclamation, "CATIA_VISUAL_BOM_EXPORTER"
         Exit Sub
     End If
 
     CATIA.StatusBar = "CATIA_VISUAL_BOM_EXPORTER: eksportujem slike..."
+    WriteDebugPhase "IMAGE_EXPORT_START", 0, "", "Image export started."
     ExportAllImages
-
-    CATIA.StatusBar = "CATIA_VISUAL_BOM_EXPORTER: pravim Excel izvestaj..."
-    CreateExcelReport
+    If gAbortMessage <> "" Then
+        SafeRestoreCatiaSession
+        FinalizeExcelReportImmediate
+        MsgBox gAbortMessage & vbCrLf & vbCrLf & "Detalji su u DEBUG_PHASE_LOG.txt.", vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
+        Exit Sub
+    End If
 
     SafeRestoreCatiaSession
+    FinalizeExcelReportImmediate
+    WriteDebugPhase "FINISH", 0, "", "Macro finished."
     CATIA.StatusBar = "CATIA_VISUAL_BOM_EXPORTER: gotovo."
 
     MsgBox "Visual BOM export je zavrsen." & vbCrLf & vbCrLf & _
@@ -165,9 +248,15 @@ Public Sub CATIA_VISUAL_BOM_EXPORTER()
 
 FatalError:
     On Error Resume Next
+    Dim fatalNumber As Long
+    Dim fatalDescription As String
+    fatalNumber = Err.Number
+    fatalDescription = Err.Description
     SafeRestoreCatiaSession
+    FinalizeExcelReportImmediate
+    WriteDebugPhase "ITEM_ERROR", 0, "", "Fatal error: " & CStr(fatalNumber) & " - " & fatalDescription
     MsgBox "Makro je zaustavljen zbog greske:" & vbCrLf & _
-           Err.Number & " - " & Err.Description, vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
+           fatalNumber & " - " & fatalDescription, vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
 End Sub
 
 Private Function IsActiveDocumentProduct(ByVal doc As Object) As Boolean
@@ -204,11 +293,14 @@ Private Sub PrepareOutputFolders(ByVal doc As Object, ByVal rootProduct As Objec
 
     gOutputFolder = JoinPath(baseFolder, rootName & "_VISUAL_BOM_EXPORT")
     gImageFolder = JoinPath(gOutputFolder, "IMAGES")
+    gThumbnailFolder = JoinPath(gOutputFolder, "THUMBNAILS")
     gMainImagePath = JoinPath(gOutputFolder, "MAIN_ASSEMBLY." & EffectiveImageFormat())
     gExcelPath = JoinPath(gOutputFolder, "VISUAL_BOM_EXPORT.xlsx")
+    gDebugLogPath = JoinPath(gOutputFolder, "DEBUG_PHASE_LOG.txt")
 
     EnsureFolder gOutputFolder
     EnsureFolder gImageFolder
+    EnsureFolder gThumbnailFolder
 End Sub
 
 Private Function EffectiveImageFormat() As String
@@ -250,16 +342,34 @@ Private Sub TraverseProductChildren(ByVal parentProduct As Object, _
                                     ByVal selectedProducts As Collection, _
                                     ByVal parentWasSelected As Boolean)
     On Error GoTo TraverseError
+    If gBomScanTimedOut Then Exit Sub
+    If gBomScanStart > 0 And HasTimedOut(gBomScanStart, MAX_BOM_SCAN_SECONDS) Then
+        gBomScanTimedOut = True
+        WriteDebugPhase "BOM_SCAN_PROGRESS", gAllProducts.Count, "", "BOM scan timeout reached."
+        Exit Sub
+    End If
 
     Dim children As Object
     Set children = parentProduct.Products
 
     Dim i As Long
     For i = 1 To children.Count
+        DoEvents
+        If gBomScanTimedOut Then Exit For
+        If gBomScanStart > 0 And HasTimedOut(gBomScanStart, MAX_BOM_SCAN_SECONDS) Then
+            gBomScanTimedOut = True
+            WriteDebugPhase "BOM_SCAN_PROGRESS", gAllProducts.Count, "", "BOM scan timeout reached."
+            Exit For
+        End If
+
         Dim child As Object
         Set child = children.Item(i)
 
         gAllProducts.Add child
+        If (gAllProducts.Count Mod 500) = 0 Then
+            CATIA.StatusBar = "BOM scan " & CStr(gAllProducts.Count) & " instances / " & CStr(gBomItems.Count) & " unique"
+            WriteDebugPhase "BOM_SCAN_PROGRESS", gAllProducts.Count, "", "Unique items: " & CStr(gBomItems.Count)
+        End If
 
         Dim childPartNumber As String
         Dim childLabel As String
@@ -280,7 +390,7 @@ Private Sub TraverseProductChildren(ByVal parentProduct As Object, _
             AddOrUpdateBomItem child, parentAssemblyName, childTreePath, childPathProducts
         End If
 
-        If HasChildren(child) Then
+        If HasChildren(child) And Not gBomScanTimedOut Then
             TraverseProductChildren child, childLabel, childTreePath, childPathProducts, selectedProducts, childSelected
         End If
     Next i
@@ -359,7 +469,7 @@ Private Sub AddOrUpdateBomItem(ByVal prod As Object, _
     End If
 
     If Not gBomItems.Exists(key) Then
-        If MAX_ITEMS_TO_EXPORT > 0 And gBomItems.Count >= MAX_ITEMS_TO_EXPORT Then Exit Sub
+        If EffectiveMaxItemsToExport() > 0 And gBomItems.Count >= EffectiveMaxItemsToExport() Then Exit Sub
     End If
 
     If gBomItems.Exists(key) Then
@@ -397,7 +507,10 @@ Private Sub AddOrUpdateBomItem(ByVal prod As Object, _
         rec.Add "TreePath", treePath
         rec.Add "ImageFile", ""
         rec.Add "ImagePath", ""
+        rec.Add "ThumbnailFile", ""
+        rec.Add "ThumbnailPath", ""
         rec.Add "ExportStatus", "PENDING"
+        rec.Add "IsoView", ""
         rec.Add "Note", IIf(pn = "", "Part Number missing; exported as separate instance.", "")
         rec.Add "Key", key
         rec.Add "PathProducts", pathProducts
@@ -411,53 +524,147 @@ AddError:
     Err.Clear
 End Sub
 
+Private Function EffectiveMaxItemsToExport() As Long
+    If TEST_MODE Then
+        EffectiveMaxItemsToExport = TEST_MAX_ITEMS
+    Else
+        EffectiveMaxItemsToExport = MAX_ITEMS_TO_EXPORT
+    End If
+End Function
+
+Private Function ReachedEffectiveBomLimit() As Boolean
+    If EffectiveMaxItemsToExport() > 0 Then
+        ReachedEffectiveBomLimit = (gBomItems.Count >= EffectiveMaxItemsToExport())
+    End If
+End Function
+
 Private Sub ExportAllImages()
     On Error Resume Next
-    If Not EXPORT_IMAGES Then
-        AddLog GetProductPartNumber(gRootProduct), "WARNING", "EXPORT_IMAGES=False; image export skipped.", ""
-        Exit Sub
-    End If
 
-    TrySetCatiaWindowSize IMAGE_WIDTH, IMAGE_HEIGHT
-    SafeRestoreCatiaSession
-    ApplyImageCaptureView Nothing
+    If EXPORT_IMAGES Then
+        TrySetCatiaWindowSize IMAGE_WIDTH, IMAGE_HEIGHT
+        If EXPORT_MAIN_ASSEMBLY_IMAGE Then
+            SafeRestoreCatiaSession
+            ApplyImageCaptureView Nothing
 
-    Dim mainStart As Double
-    mainStart = Timer
-    If CaptureCurrentViewer(gMainImagePath, mainStart, ImageTimeoutSeconds()) Then
-        If ENABLE_IMAGE_CROP And Not FAST_SNIP_MODE Then CropImageToContent gMainImagePath
-        AddLog GetProductPartNumber(gRootProduct), "OK", "Main assembly image exported.", gMainImagePath
-    Else
-        If HasTimedOut(mainStart, ImageTimeoutSeconds()) Then
-            AddLog GetProductPartNumber(gRootProduct), "TIMEOUT", "Main assembly image export timed out.", gMainImagePath
+            Dim mainStart As Double
+            mainStart = Timer
+            SetLogContext 0, "MAIN_ASSEMBLY_CAPTURE", "", ""
+            If CaptureCurrentViewer(gMainImagePath, mainStart, ImageTimeoutSeconds()) Then
+                If ENABLE_IMAGE_CROP And Not FAST_SNIP_MODE Then CropImageToContent gMainImagePath
+                AddLog GetProductPartNumber(gRootProduct), "OK", "Main assembly image exported.", gMainImagePath
+            Else
+                If HasTimedOut(mainStart, ImageTimeoutSeconds()) Then
+                    AddLog GetProductPartNumber(gRootProduct), "WARNING", "Main assembly image export timed out; item export continues.", gMainImagePath
+                Else
+                    AddLog GetProductPartNumber(gRootProduct), "WARNING", "Main assembly image export failed; item export continues.", gMainImagePath
+                End If
+            End If
         Else
-            AddLog GetProductPartNumber(gRootProduct), "ERROR", "Main assembly image export failed.", gMainImagePath
+            WriteDebugPhase "MAIN_ASSEMBLY_SKIPPED", 0, GetProductPartNumber(gRootProduct), "EXPORT_MAIN_ASSEMBLY_IMAGE=False"
+            SetLogContext 0, "MAIN_ASSEMBLY_SKIPPED", "", ""
+            AddLog GetProductPartNumber(gRootProduct), "WARNING", "Main assembly image skipped by configuration.", ""
         End If
+    Else
+        WriteDebugPhase "MAIN_ASSEMBLY_SKIPPED", 0, GetProductPartNumber(gRootProduct), "EXPORT_IMAGES=False"
+        AddLog GetProductPartNumber(gRootProduct), "WARNING", "EXPORT_IMAGES=False; image export skipped.", ""
+    End If
+    ClearLogContext
+
+    UpdateSummarySheet
+    SaveExcelCheckpoint
+    If EXPORT_IMAGES Then
+        SafeRestoreCatiaSession
+        HideAllComponents
     End If
 
     Dim key As Variant
     Dim itemIndex As Long
+    Dim previousVisibleProducts As Collection
+    Set previousVisibleProducts = New Collection
     itemIndex = 0
+    Dim firstImageStart As Double
+    firstImageStart = Timer
+
     For Each key In gBomItems.Keys
         itemIndex = itemIndex + 1
         If ShouldProcessExportIndex(itemIndex) Then
         Dim rec As Object
         Set rec = gBomItems.Item(CStr(key))
         CATIA.StatusBar = "Image " & CStr(itemIndex) & " / " & CStr(gBomItems.Count) & " - " & CStr(rec.Item("PartNumber"))
-        ExportImageForBomRecord rec
-        If CStr(rec.Item("ExportStatus")) = "ERROR" Or CStr(rec.Item("ExportStatus")) = "NOT FOUND" Or CStr(rec.Item("ExportStatus")) = "TIMEOUT" Then SafeRestoreCatiaSession
+        WriteDebugPhase "ITEM_START", itemIndex, CStr(rec.Item("PartNumber")), "Quantity=" & CStr(rec.Item("Quantity"))
+        SetLogContext itemIndex, "ITEM_START", CStr(rec.Item("ThumbnailPath")), CStr(rec.Item("IsoView"))
+
+        rec.Item("ExportStatus") = "PENDING"
+        WriteBomRecordImmediate rec, False
+
+        If EXPORT_IMAGES Then
+        Set previousVisibleProducts = ExportImageForBomRecord(rec, previousVisibleProducts)
+        If CStr(rec.Item("ExportStatus")) = "ERROR" Or CStr(rec.Item("ExportStatus")) = "NOT FOUND" Or CStr(rec.Item("ExportStatus")) = "TIMEOUT" Then
+            SafeRestoreCatiaSession
+            If EXPORT_IMAGES Then HideAllComponents
+            Set previousVisibleProducts = New Collection
+        End If
+        Else
+            rec.Item("ExportStatus") = "OK"
+            rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "EXPORT_IMAGES=False; image export skipped.")
+            AddLog CStr(rec.Item("PartNumber")), "WARNING", "EXPORT_IMAGES=False; image export skipped.", ""
+        End If
+
+        WriteBomRecordImmediate rec, True
+        MaybeCountSuccessfulImageAndSave itemIndex, rec
+        If SAVE_EVERY_N_ITEMS <= 1 Or (itemIndex Mod SAVE_EVERY_N_ITEMS) = 0 Then
+            SaveExcelCheckpoint
+            WriteDebugPhase "SAVE_CHECKPOINT", itemIndex, CStr(rec.Item("PartNumber")), "Periodic save."
+        End If
+
+        If gSuccessfulImageCount = 0 And FIRST_IMAGE_TIMEOUT_SECONDS > 0 And HasTimedOut(firstImageStart, FIRST_IMAGE_TIMEOUT_SECONDS) Then
+            gAbortMessage = "Prva slika nije napravljena u roku od " & CStr(FIRST_IMAGE_TIMEOUT_SECONDS) & " sekundi. Export je prekinut."
+            WriteDebugPhase "ITEM_TIMEOUT", itemIndex, CStr(rec.Item("PartNumber")), gAbortMessage
+            Exit For
+        End If
+
+        ClearLogContext
         DoEvents
         End If
     Next key
 
+    SaveExcelCheckpoint
     SafeRestoreCatiaSession
 End Sub
 
-Private Sub ExportImageForBomRecord(ByVal rec As Object)
+Private Function IsSuccessfulImageRecord(ByVal rec As Object) As Boolean
+    Dim statusText As String
+    statusText = UCase$(CStr(rec.Item("ExportStatus")))
+    IsSuccessfulImageRecord = (statusText = "OK" Or statusText = "EXISTING_REUSED")
+End Function
+
+Private Sub MaybeCountSuccessfulImageAndSave(ByVal itemIndex As Long, ByVal rec As Object)
+    On Error Resume Next
+    If Not IsSuccessfulImageRecord(rec) Then Exit Sub
+    If CStr(rec.Item("ThumbnailPath")) = "" Or Not gFSO.FileExists(CStr(rec.Item("ThumbnailPath"))) Then Exit Sub
+    If CStr(rec.Item("SuccessCounted")) = "1" Then Exit Sub
+
+    rec.Item("SuccessCounted") = "1"
+    gSuccessfulImageCount = gSuccessfulImageCount + 1
+
+    If gSuccessfulImageCount = 1 And SAVE_AFTER_FIRST_IMAGE Then
+        SaveExcelCheckpoint
+        WriteDebugPhase "SAVE_CHECKPOINT", itemIndex, CStr(rec.Item("PartNumber")), "Saved after first successful image."
+    ElseIf gSuccessfulImageCount = 10 And SAVE_AFTER_FIRST_10_IMAGES Then
+        SaveExcelCheckpoint
+        WriteDebugPhase "SAVE_CHECKPOINT", itemIndex, CStr(rec.Item("PartNumber")), "Saved after first 10 successful images."
+    End If
+    Err.Clear
+End Sub
+
+Private Function ExportImageForBomRecord(ByVal rec As Object, ByVal previousVisibleProducts As Collection) As Collection
     On Error GoTo ExportError
+    Set ExportImageForBomRecord = previousVisibleProducts
 
     Dim productRef As Object
     Dim pathProducts As Collection
+    Dim visibleProducts As Collection
     Dim imagePath As String
     Dim imageFile As String
     Dim itemStart As Double
@@ -475,26 +682,55 @@ Private Sub ExportImageForBomRecord(ByVal rec As Object)
     If SKIP_EXISTING_IMAGES And gFSO.FileExists(imagePath) Then
         rec.Item("ImageFile") = gFSO.GetFileName(imagePath)
         rec.Item("ImagePath") = imagePath
-        rec.Item("ExportStatus") = "OK"
-        rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Existing image reused.")
-        AddLog CStr(rec.Item("PartNumber")), "OK", "Existing image reused.", imagePath
-        Exit Sub
+        If EnsureThumbnailForRecord(rec) Then
+            rec.Item("ExportStatus") = "EXISTING_REUSED"
+            rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Existing image and thumbnail reused.")
+            SetLogContext gCurrentLogItemIndex, "ITEM_CAPTURE_DONE", CStr(rec.Item("ThumbnailPath")), CStr(rec.Item("IsoView"))
+            AddLog CStr(rec.Item("PartNumber")), "EXISTING_REUSED", "Existing image reused.", imagePath
+            WriteDebugPhase "ITEM_CAPTURE_DONE", gCurrentLogItemIndex, CStr(rec.Item("PartNumber")), "Existing image reused."
+        Else
+            rec.Item("ExportStatus") = "ERROR"
+            rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Existing image found but thumbnail failed.")
+            SetLogContext gCurrentLogItemIndex, "ITEM_ERROR", "", CStr(rec.Item("IsoView"))
+            AddLog CStr(rec.Item("PartNumber")), "ERROR", "Existing image found but thumbnail failed.", imagePath
+        End If
+        Exit Function
     End If
 
-    HideAllComponents
-    ShowProductPath pathProducts
-    ShowProductSubtree productRef
+    Set visibleProducts = BuildVisibleProductsForRecord(pathProducts, productRef)
+    If HasTimedOut(itemStart, itemTimeout) Then
+        rec.Item("ImageFile") = imageFile
+        rec.Item("ImagePath") = imagePath
+        rec.Item("ExportStatus") = "TIMEOUT"
+        rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Image export timeout before hide/show.")
+        SetLogContext gCurrentLogItemIndex, "ITEM_TIMEOUT", CStr(rec.Item("ThumbnailPath")), CStr(rec.Item("IsoView"))
+        AddLog CStr(rec.Item("PartNumber")), "TIMEOUT", "Image export timeout before hide/show.", imagePath
+        Exit Function
+    End If
+
+    CATIA.RefreshDisplay = False
+    SetLogContext gCurrentLogItemIndex, "ITEM_VISIBLE_SET", CStr(rec.Item("ThumbnailPath")), CStr(rec.Item("IsoView"))
+    WriteDebugPhase "ITEM_VISIBLE_SET", gCurrentLogItemIndex, CStr(rec.Item("PartNumber")), "Setting visibility."
+    If previousVisibleProducts.Count > 0 Then SetVisibilityForCollectionNoWait previousVisibleProducts, False
+    SetVisibilityForCollectionNoWait visibleProducts, True
+    CATIA.RefreshDisplay = True
+
     If HasTimedOut(itemStart, itemTimeout) Then
         rec.Item("ImageFile") = imageFile
         rec.Item("ImagePath") = imagePath
         rec.Item("ExportStatus") = "TIMEOUT"
         rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Image export timeout during hide/show.")
+        SetLogContext gCurrentLogItemIndex, "ITEM_TIMEOUT", CStr(rec.Item("ThumbnailPath")), CStr(rec.Item("IsoView"))
         AddLog CStr(rec.Item("PartNumber")), "TIMEOUT", "Image export timeout during hide/show.", imagePath
-        Exit Sub
+        Set ExportImageForBomRecord = visibleProducts
+        Exit Function
     End If
 
     isoViewIndex = SelectIsoViewForRecord(rec)
+    rec.Item("IsoView") = CStr(isoViewIndex)
     rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "ISO_VIEW=" & CStr(isoViewIndex))
+    SetLogContext gCurrentLogItemIndex, "ITEM_CAPTURE_START", CStr(rec.Item("ThumbnailPath")), CStr(isoViewIndex)
+    WriteDebugPhase "ITEM_CAPTURE_START", gCurrentLogItemIndex, CStr(rec.Item("PartNumber")), "ISO_VIEW=" & CStr(isoViewIndex)
     ApplyImageCaptureView rec
 
     If HasTimedOut(itemStart, itemTimeout) Then
@@ -502,8 +738,10 @@ Private Sub ExportImageForBomRecord(ByVal rec As Object)
         rec.Item("ImagePath") = imagePath
         rec.Item("ExportStatus") = "TIMEOUT"
         rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Image export timeout before capture.")
+        SetLogContext gCurrentLogItemIndex, "ITEM_TIMEOUT", CStr(rec.Item("ThumbnailPath")), CStr(rec.Item("IsoView"))
         AddLog CStr(rec.Item("PartNumber")), "TIMEOUT", "Image export timeout before capture.", imagePath
-        Exit Sub
+        Set ExportImageForBomRecord = visibleProducts
+        Exit Function
     End If
 
     If CaptureCurrentViewer(imagePath, itemStart, itemTimeout) Then
@@ -511,30 +749,41 @@ Private Sub ExportImageForBomRecord(ByVal rec As Object)
         imageFile = gFSO.GetFileName(imagePath)
         rec.Item("ImageFile") = imageFile
         rec.Item("ImagePath") = imagePath
-        rec.Item("ExportStatus") = "OK"
-        AddLog CStr(rec.Item("PartNumber")), "OK", "Image exported. ISO_VIEW=" & CStr(isoViewIndex), imagePath
+        If EnsureThumbnailForRecord(rec) Then
+            rec.Item("ExportStatus") = "OK"
+        Else
+            rec.Item("ExportStatus") = "ERROR"
+            rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Thumbnail creation failed.")
+        End If
+        SetLogContext gCurrentLogItemIndex, "ITEM_CAPTURE_DONE", CStr(rec.Item("ThumbnailPath")), CStr(isoViewIndex)
+        AddLog CStr(rec.Item("PartNumber")), CStr(rec.Item("ExportStatus")), "Image exported. ISO_VIEW=" & CStr(isoViewIndex), imagePath
+        WriteDebugPhase "ITEM_CAPTURE_DONE", gCurrentLogItemIndex, CStr(rec.Item("PartNumber")), "Image=" & imagePath & "; Thumbnail=" & CStr(rec.Item("ThumbnailPath"))
     Else
         rec.Item("ImageFile") = imageFile
         rec.Item("ImagePath") = imagePath
         If HasTimedOut(itemStart, itemTimeout) Then
             rec.Item("ExportStatus") = "TIMEOUT"
             rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Image export timeout.")
+            SetLogContext gCurrentLogItemIndex, "ITEM_TIMEOUT", CStr(rec.Item("ThumbnailPath")), CStr(rec.Item("IsoView"))
             AddLog CStr(rec.Item("PartNumber")), "TIMEOUT", "Image export timeout.", imagePath
         Else
             rec.Item("ExportStatus") = "ERROR"
             rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Image export failed.")
+            SetLogContext gCurrentLogItemIndex, "ITEM_ERROR", CStr(rec.Item("ThumbnailPath")), CStr(rec.Item("IsoView"))
             AddLog CStr(rec.Item("PartNumber")), "ERROR", "Image export failed.", imagePath
         End If
     End If
 
-    Exit Sub
+    Set ExportImageForBomRecord = visibleProducts
+    Exit Function
 
 ExportError:
     rec.Item("ExportStatus") = "ERROR"
     rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Image export error: " & Err.Description)
+    SetLogContext gCurrentLogItemIndex, "ITEM_ERROR", CStr(rec.Item("ThumbnailPath")), CStr(rec.Item("IsoView"))
     AddLog CStr(rec.Item("PartNumber")), "ERROR", "Image export error: " & Err.Description, ""
     Err.Clear
-End Sub
+End Function
 
 Private Function CaptureCurrentViewer(ByRef targetPath As String, Optional ByVal startTime As Double = 0, Optional ByVal timeoutSeconds As Double = 0) As Boolean
     On Error GoTo CaptureFailed
@@ -730,6 +979,95 @@ Private Function CropImageFile(ByVal imagePath As String) As Boolean
     CropImageFile = CropImageToContent(imagePath)
 End Function
 
+Private Function ThumbnailPathForImage(ByVal imagePath As String) As String
+    Dim baseName As String
+    baseName = gFSO.GetBaseName(imagePath)
+    If baseName = "" Then baseName = "thumbnail_" & Format$(Now, "yyyymmdd_hhnnss")
+    ThumbnailPathForImage = JoinPath(gThumbnailFolder, baseName & ".jpg")
+End Function
+
+Private Function EnsureThumbnailForRecord(ByVal rec As Object) As Boolean
+    On Error Resume Next
+    Dim imagePath As String
+    Dim thumbPath As String
+
+    imagePath = CStr(rec.Item("ImagePath"))
+    If imagePath = "" Then Exit Function
+    If Not gFSO.FileExists(imagePath) Then Exit Function
+
+    If Not CREATE_THUMBNAIL_FILES Then
+        rec.Item("ThumbnailFile") = gFSO.GetFileName(imagePath)
+        rec.Item("ThumbnailPath") = imagePath
+        EnsureThumbnailForRecord = True
+        Exit Function
+    End If
+
+    thumbPath = ThumbnailPathForImage(imagePath)
+    If gFSO.FileExists(thumbPath) Then
+        rec.Item("ThumbnailFile") = gFSO.GetFileName(thumbPath)
+        rec.Item("ThumbnailPath") = thumbPath
+        EnsureThumbnailForRecord = True
+        Exit Function
+    End If
+
+    If CreateThumbnailFile(imagePath, thumbPath, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT) Then
+        rec.Item("ThumbnailFile") = gFSO.GetFileName(thumbPath)
+        rec.Item("ThumbnailPath") = thumbPath
+        SetLogContext gCurrentLogItemIndex, "THUMBNAIL_CREATED", thumbPath, CStr(rec.Item("IsoView"))
+        AddLog CStr(rec.Item("PartNumber")), "OK", "Thumbnail created.", imagePath
+        WriteDebugPhase "THUMBNAIL_CREATED", gCurrentLogItemIndex, CStr(rec.Item("PartNumber")), thumbPath
+        EnsureThumbnailForRecord = True
+    Else
+        AddLog CStr(rec.Item("PartNumber")), "ERROR", "Thumbnail creation failed.", imagePath
+        WriteDebugPhase "ITEM_ERROR", gCurrentLogItemIndex, CStr(rec.Item("PartNumber")), "Thumbnail creation failed: " & imagePath
+    End If
+    Err.Clear
+End Function
+
+Private Function CreateThumbnailFile(ByVal sourcePath As String, ByVal thumbPath As String, ByVal maxWidth As Long, ByVal maxHeight As Long) As Boolean
+    On Error Resume Next
+
+    Dim img As Object
+    Dim proc As Object
+    Dim thumb As Object
+    Dim tmpPath As String
+
+    Set img = CreateObject("WIA.ImageFile")
+    img.LoadFile sourcePath
+
+    Set proc = CreateObject("WIA.ImageProcess")
+    proc.Filters.Add proc.FilterInfos("Scale").FilterID
+    proc.Filters(1).Properties("MaximumWidth").Value = CLng(maxWidth)
+    proc.Filters(1).Properties("MaximumHeight").Value = CLng(maxHeight)
+    proc.Filters(1).Properties("PreserveAspectRatio").Value = True
+    Err.Clear
+
+    Set thumb = proc.Apply(img)
+    tmpPath = JoinPath(gThumbnailFolder, "~thumb_" & Format$(Now, "yyyymmdd_hhnnss") & "_" & CStr(Int(Rnd() * 100000)) & ".jpg")
+    If gFSO.FileExists(tmpPath) Then gFSO.DeleteFile tmpPath, True
+    thumb.SaveFile tmpPath
+
+    If Err.Number = 0 And gFSO.FileExists(tmpPath) Then
+        If gFSO.FileExists(thumbPath) Then gFSO.DeleteFile thumbPath, True
+        gFSO.MoveFile tmpPath, thumbPath
+        CreateThumbnailFile = gFSO.FileExists(thumbPath)
+    End If
+    Err.Clear
+End Function
+
+Private Function PreviewImagePathForRecord(ByVal rec As Object) As String
+    On Error Resume Next
+    If INSERT_THUMBNAIL_FILE_IN_EXCEL Then
+        PreviewImagePathForRecord = CStr(rec.Item("ThumbnailPath"))
+        If PreviewImagePathForRecord <> "" And gFSO.FileExists(PreviewImagePathForRecord) Then Exit Function
+    End If
+    PreviewImagePathForRecord = CStr(rec.Item("ImagePath"))
+    If PreviewImagePathForRecord <> "" Then
+        If Not gFSO.FileExists(PreviewImagePathForRecord) Then PreviewImagePathForRecord = ""
+    End If
+    Err.Clear
+End Function
+
 Private Function AutoCropWhiteBackground(ByVal imagePath As String) As Boolean
     On Error Resume Next
     AutoCropWhiteBackground = False
@@ -901,6 +1239,51 @@ Private Sub HideAllComponents()
     SetVisibilityForCollection gAllProducts, False
 End Sub
 
+Private Function BuildVisibleProductsForRecord(ByVal pathProducts As Collection, ByVal productRoot As Object) As Collection
+    On Error Resume Next
+    Dim result As Collection
+    Set result = New Collection
+
+    Dim i As Long
+    Dim oneProduct As Object
+    For i = 1 To pathProducts.Count
+        Set oneProduct = pathProducts.Item(i)
+        If Not (oneProduct Is gRootProduct) Then AddUniqueProduct result, oneProduct
+    Next i
+
+    CollectSubtreeProductsUnique productRoot, result
+    Set BuildVisibleProductsForRecord = result
+    Err.Clear
+End Function
+
+Private Sub CollectSubtreeProductsUnique(ByVal productRoot As Object, ByVal result As Collection)
+    On Error Resume Next
+    If Not (productRoot Is gRootProduct) Then AddUniqueProduct result, productRoot
+
+    Dim children As Object
+    Set children = productRoot.Products
+    If Err.Number <> 0 Or children Is Nothing Then
+        Err.Clear
+        Exit Sub
+    End If
+
+    Dim i As Long
+    For i = 1 To children.Count
+        CollectSubtreeProductsUnique children.Item(i), result
+    Next i
+    Err.Clear
+End Sub
+
+Private Sub AddUniqueProduct(ByVal listObj As Collection, ByVal productObj As Object)
+    On Error Resume Next
+    Dim i As Long
+    For i = 1 To listObj.Count
+        If listObj.Item(i) Is productObj Then Exit Sub
+    Next i
+    listObj.Add productObj
+    Err.Clear
+End Sub
+
 Private Sub ShowProductPath(ByVal pathProducts As Collection)
     SetVisibilityForCollection pathProducts, True
 End Sub
@@ -970,7 +1353,7 @@ Private Sub SetVisibilityForCollection(ByVal products As Collection, ByVal showI
     Dim i As Long
     For i = 1 To products.Count
         sel.Add products.Item(i)
-        If (i Mod 200) = 0 Then
+        If (i Mod VISIBILITY_BATCH_SIZE) = 0 Then
             If showIt Then
                 sel.VisProperties.SetShow CAT_VIS_PROPERTY_SHOW
             Else
@@ -991,6 +1374,51 @@ Private Sub SetVisibilityForCollection(ByVal products As Collection, ByVal showI
     sel.Clear
     CATIA.RefreshDisplay = True
     WaitSeconds 0.1
+    Err.Clear
+End Sub
+
+Private Sub SetVisibilityForCollectionNoWait(ByVal products As Collection, ByVal showIt As Boolean)
+    On Error Resume Next
+
+    Dim sel As Object
+    Set sel = gActiveDoc.Selection
+    sel.Clear
+
+    Dim i As Long
+    For i = 1 To products.Count
+        sel.Add products.Item(i)
+        If Err.Number <> 0 Then
+            AddLog "", "WARNING", "Hide/show selection add failed: " & Err.Description, ""
+            Err.Clear
+        End If
+        If (i Mod VISIBILITY_BATCH_SIZE) = 0 Then
+            If showIt Then
+                sel.VisProperties.SetShow CAT_VIS_PROPERTY_SHOW
+            Else
+                sel.VisProperties.SetShow CAT_VIS_PROPERTY_NO_SHOW
+            End If
+            If Err.Number <> 0 Then
+                AddLog "", "WARNING", "Hide/show batch failed: " & Err.Description, ""
+                Err.Clear
+            End If
+            sel.Clear
+            DoEvents
+        End If
+    Next i
+
+    If sel.Count2 > 0 Then
+        If showIt Then
+            sel.VisProperties.SetShow CAT_VIS_PROPERTY_SHOW
+        Else
+            sel.VisProperties.SetShow CAT_VIS_PROPERTY_NO_SHOW
+        End If
+        If Err.Number <> 0 Then
+            AddLog "", "WARNING", "Hide/show failed: " & Err.Description, ""
+            Err.Clear
+        End If
+    End If
+
+    sel.Clear
     Err.Clear
 End Sub
 
@@ -1667,9 +2095,27 @@ Private Function DetermineResumeStartIndex(ByVal ws As Object) As Long
             DetermineResumeStartIndex = MaxLong(START_INDEX, rowIndex - 1)
             Exit Function
         End If
+        If INSERT_IMAGES_IN_EXCEL And gThumbnailColumnIndex > 0 Then
+            If (statusText = "OK" Or statusText = "EXISTING_REUSED") And Not CellHasPicture(ws, rowIndex, gThumbnailColumnIndex) Then
+                DetermineResumeStartIndex = MaxLong(START_INDEX, rowIndex - 1)
+                Exit Function
+            End If
+        End If
     Next rowIndex
 
     DetermineResumeStartIndex = MaxLong(START_INDEX, lastRow)
+    Err.Clear
+End Function
+
+Private Function CellHasPicture(ByVal ws As Object, ByVal rowIndex As Long, ByVal colIndex As Long) As Boolean
+    On Error Resume Next
+    Dim shp As Object
+    For Each shp In ws.Shapes
+        If shp.TopLeftCell.Row = rowIndex And shp.TopLeftCell.Column = colIndex Then
+            CellHasPicture = True
+            Exit Function
+        End If
+    Next shp
     Err.Clear
 End Function
 
@@ -1700,6 +2146,317 @@ Private Function MaxLong(ByVal a As Long, ByVal b As Long) As Long
         MaxLong = b
     End If
 End Function
+
+Private Sub InitializeExcelReportImmediate()
+    On Error Resume Next
+
+    gExcelReady = False
+    Set gExcelApp = CreateObject("Excel.Application")
+    If Err.Number <> 0 Or gExcelApp Is Nothing Then
+        AddLog "", "ERROR", "Microsoft Excel nije dostupan preko COM automation: " & Err.Description, ""
+        Err.Clear
+        Exit Sub
+    End If
+
+    gExcelApp.Visible = True
+    gExcelApp.DisplayAlerts = False
+    gExcelApp.ScreenUpdating = False
+    gExcelApp.EnableEvents = False
+    gExcelApp.Calculation = XL_CALCULATION_MANUAL
+
+    If RESUME_MODE And gFSO.FileExists(gExcelPath) Then
+        Err.Clear
+        Set gWorkbook = gExcelApp.Workbooks.Open(gExcelPath)
+        If Err.Number = 0 And Not gWorkbook Is Nothing Then
+            Do While gWorkbook.Worksheets.Count < 3
+                gWorkbook.Worksheets.Add
+                DoEvents
+            Loop
+
+            Set gWsSummary = GetWorksheetByName(gWorkbook, "SUMMARY", 1)
+            Set gWsBom = GetWorksheetByName(gWorkbook, "BOM", 2)
+            Set gWsLog = GetWorksheetByName(gWorkbook, "EXPORT_LOG", 3)
+
+            If Trim$(CStr(gWsBom.Cells(1, 1).Value)) = "" Then
+                PrepareSummarySheetImmediate
+                PrepareBomSheetImmediate
+                PrepareLogSheetImmediate
+                gNextBomRow = 2
+                gNextLogRow = 2
+            Else
+                gEffectiveStartIndex = DetermineResumeStartIndex(gWsBom)
+                gNextBomRow = DetermineResumeNextBomRow(gWsBom, gEffectiveStartIndex)
+                gNextLogRow = LastUsedRow(gWsLog) + 1
+                If gNextLogRow < 2 Then gNextLogRow = 2
+                gMainPreviewInserted = True
+            End If
+
+            gExcelReady = True
+            UpdateSummarySheet
+            SaveExcelCheckpoint
+            WriteDebugPhase "EXCEL_CREATED", 0, "", "Existing Excel workbook opened for resume."
+            Exit Sub
+        End If
+        Err.Clear
+    End If
+
+    Set gWorkbook = gExcelApp.Workbooks.Add
+    Do While gWorkbook.Worksheets.Count < 3
+        gWorkbook.Worksheets.Add
+        DoEvents
+    Loop
+
+    Set gWsSummary = gWorkbook.Worksheets(1)
+    Set gWsBom = gWorkbook.Worksheets(2)
+    Set gWsLog = gWorkbook.Worksheets(3)
+
+    gWsSummary.Name = "SUMMARY"
+    gWsBom.Name = "BOM"
+    gWsLog.Name = "EXPORT_LOG"
+
+    gNextBomRow = 2
+    gNextLogRow = 2
+
+    PrepareSummarySheetImmediate
+    PrepareBomSheetImmediate
+    PrepareLogSheetImmediate
+    gExcelReady = True
+    UpdateSummarySheet
+
+    If gFSO.FileExists(gExcelPath) Then gFSO.DeleteFile gExcelPath, True
+    Err.Clear
+    gWorkbook.SaveAs gExcelPath, XL_OPENXML_WORKBOOK
+    If Err.Number <> 0 Then
+        Err.Clear
+        gExcelPath = JoinPath(gOutputFolder, "VISUAL_BOM_EXPORT_" & Format$(Now, "yyyymmdd_hhnnss") & ".xlsx")
+        gWorkbook.SaveAs gExcelPath, XL_OPENXML_WORKBOOK
+    End If
+
+    If Err.Number = 0 Then
+        gExcelReady = True
+        WriteDebugPhase "EXCEL_CREATED", 0, "", gExcelPath
+    Else
+        gExcelReady = False
+        Err.Clear
+    End If
+End Sub
+
+Private Sub PrepareSummarySheetImmediate()
+    On Error Resume Next
+    gWsSummary.Cells.Clear
+    gWsSummary.Range("A1").Value = "CATIA VISUAL BOM EXPORTER"
+    gWsSummary.Range("A1:B1").Merge
+    gWsSummary.Range("A1").Font.Bold = True
+    gWsSummary.Range("A1").Font.Size = 16
+    gWsSummary.Range("A3").Value = "Main Assembly Part Number"
+    gWsSummary.Range("A4").Value = "Main Assembly Nomenclature"
+    gWsSummary.Range("A5").Value = "Export Date/Time"
+    gWsSummary.Range("A6").Value = "Distinct BOM Items"
+    gWsSummary.Range("A7").Value = "Total Instances"
+    gWsSummary.Range("A8").Value = "Output Folder"
+    gWsSummary.Range("A9").Value = "Excel File"
+    gWsSummary.Range("A10").Value = "Mode"
+    gWsSummary.Range("A11").Value = "Debug Log"
+    gWsSummary.Range("A13").Value = "Main Assembly Preview"
+    gWsSummary.Range("A3:A13").Font.Bold = True
+    gWsSummary.Columns("A").ColumnWidth = 28
+    gWsSummary.Columns("B").ColumnWidth = 95
+    gWsSummary.Rows("14:31").RowHeight = 22
+    ApplyUsedRangeBorders gWsSummary
+    Err.Clear
+End Sub
+
+Private Sub PrepareBomSheetImmediate()
+    On Error Resume Next
+    gWsBom.Cells.Clear
+
+    Dim c As Long
+    For c = 1 To gBomHeaders.Count
+        gWsBom.Cells(1, c).Value = gBomHeaders.Item(c)
+    Next c
+
+    gWsBom.Rows(1).Font.Bold = True
+    gWsBom.Rows(1).Interior.Color = RGB(220, 230, 241)
+    gWsBom.Rows(1).HorizontalAlignment = XL_CENTER
+    For c = 1 To gBomHeaders.Count
+        If c = gThumbnailColumnIndex Then
+            gWsBom.Columns(c).ColumnWidth = 24
+        ElseIf c = gImagePathColumnIndex Then
+            gWsBom.Columns(c).ColumnWidth = 55
+        ElseIf c = gExportStatusColumnIndex Then
+            gWsBom.Columns(c).ColumnWidth = 18
+        Else
+            gWsBom.Columns(c).ColumnWidth = 22
+        End If
+    Next c
+    gWsBom.Range(gWsBom.Cells(1, 1), gWsBom.Cells(1, gBomHeaders.Count)).AutoFilter
+    gWsBom.Activate
+    gWsBom.Range("A2").Select
+    ActiveWindowFreezePanesSafe
+    ApplyUsedRangeBorders gWsBom
+    Err.Clear
+End Sub
+
+Private Sub PrepareLogSheetImmediate()
+    On Error Resume Next
+    gWsLog.Cells.Clear
+    gWsLog.Cells(1, 1).Value = "No."
+    gWsLog.Cells(1, 2).Value = "Date/Time"
+    gWsLog.Cells(1, 3).Value = "Item Index"
+    gWsLog.Cells(1, 4).Value = "Part Number"
+    gWsLog.Cells(1, 5).Value = "Status"
+    gWsLog.Cells(1, 6).Value = "Phase"
+    gWsLog.Cells(1, 7).Value = "Message"
+    gWsLog.Cells(1, 8).Value = "Image Path"
+    gWsLog.Cells(1, 9).Value = "Thumbnail Path"
+    gWsLog.Cells(1, 10).Value = "ISO_VIEW"
+    gWsLog.Rows(1).Font.Bold = True
+    gWsLog.Rows(1).Interior.Color = RGB(220, 230, 241)
+    gWsLog.Columns("A").ColumnWidth = 8
+    gWsLog.Columns("B").ColumnWidth = 22
+    gWsLog.Columns("C").ColumnWidth = 12
+    gWsLog.Columns("D").ColumnWidth = 28
+    gWsLog.Columns("E").ColumnWidth = 16
+    gWsLog.Columns("F").ColumnWidth = 24
+    gWsLog.Columns("G").ColumnWidth = 70
+    gWsLog.Columns("H").ColumnWidth = 90
+    gWsLog.Columns("I").ColumnWidth = 90
+    gWsLog.Columns("J").ColumnWidth = 12
+    gWsLog.Range("A1:J1").AutoFilter
+    ApplyUsedRangeBorders gWsLog
+    Err.Clear
+End Sub
+
+Private Sub UpdateSummarySheet()
+    On Error Resume Next
+    If Not gExcelReady Then Exit Sub
+
+    gWsSummary.Range("B3").Value = GetProductPartNumber(gRootProduct)
+    gWsSummary.Range("B4").Value = GetProductNomenclature(gRootProduct)
+    gWsSummary.Range("B5").Value = Now
+    gWsSummary.Range("B6").Value = gBomItems.Count
+    gWsSummary.Range("B7").Value = gTotalInstances
+    gWsSummary.Range("B8").Value = gOutputFolder
+    gWsSummary.Range("B9").Value = gExcelPath
+    gWsSummary.Range("B10").Value = "TEST_MODE=" & CStr(TEST_MODE) & _
+                                   "; TEST_MAX_ITEMS=" & CStr(TEST_MAX_ITEMS) & _
+                                   "; HYBRID_PRODUCTION_MODE=" & CStr(HYBRID_PRODUCTION_MODE) & _
+                                   "; EXPORT_IMAGES=" & CStr(EXPORT_IMAGES) & _
+                                   "; START_INDEX=" & CStr(START_INDEX) & _
+                                   "; END_INDEX=" & CStr(END_INDEX) & _
+                                   "; BOM_COLUMNS=" & gCatiaBomColumnsSource
+    gWsSummary.Range("B11").Value = gDebugLogPath
+
+    If EXPORT_MAIN_ASSEMBLY_IMAGE And EXPORT_IMAGES And INSERT_IMAGES_IN_EXCEL And Not gMainPreviewInserted And gFSO.FileExists(gMainImagePath) Then
+        InsertPictureIntoRange gWsSummary, gMainImagePath, "A14:D31"
+        gMainPreviewInserted = True
+    End If
+    ApplyUsedRangeBorders gWsSummary
+    Err.Clear
+End Sub
+
+Private Sub WriteBomRecordImmediate(ByVal rec As Object, ByVal includePicture As Boolean)
+    On Error Resume Next
+    If Not gExcelReady Then Exit Sub
+
+    Dim rowIndex As Long
+    rowIndex = CLng(rec.Item("ExcelRow"))
+    If rowIndex <= 0 Then
+        rowIndex = gNextBomRow
+        rec.Item("ExcelRow") = rowIndex
+        gNextBomRow = gNextBomRow + 1
+    End If
+
+    Dim c As Long
+    Dim headerText As String
+    For c = 1 To gBomHeaders.Count
+        headerText = CStr(gBomHeaders.Item(c))
+        If c <> gThumbnailColumnIndex Then
+            gWsBom.Cells(rowIndex, c).Value = GetBomCellValue(rec, headerText)
+        End If
+    Next c
+
+    If INSERT_IMAGES_IN_EXCEL Then
+        gWsBom.Rows(rowIndex).RowHeight = CLng(THUMBNAIL_HEIGHT * 0.75) + 12
+    Else
+        gWsBom.Rows(rowIndex).RowHeight = 28
+    End If
+
+    gWsBom.Range(gWsBom.Cells(rowIndex, 1), gWsBom.Cells(rowIndex, gBomHeaders.Count)).WrapText = True
+    gWsBom.Range(gWsBom.Cells(rowIndex, 1), gWsBom.Cells(rowIndex, gBomHeaders.Count)).VerticalAlignment = XL_TOP
+    gWsBom.Range(gWsBom.Cells(rowIndex, 1), gWsBom.Cells(rowIndex, gBomHeaders.Count)).Borders.LineStyle = XL_CONTINUOUS
+    gWsBom.Range(gWsBom.Cells(rowIndex, 1), gWsBom.Cells(rowIndex, gBomHeaders.Count)).Borders.Weight = XL_THIN
+
+    Dim previewPath As String
+    previewPath = PreviewImagePathForRecord(rec)
+    If includePicture And INSERT_IMAGES_IN_EXCEL And previewPath <> "" And gFSO.FileExists(previewPath) Then
+        gExcelImageInsertCount = gExcelImageInsertCount + 1
+        If Not InsertPictureIntoCell(gWsBom, previewPath, gWsBom.Cells(rowIndex, gThumbnailColumnIndex)) Then
+            rec.Item("ExportStatus") = "ERROR"
+            rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Excel image insert failed.")
+            If gExportStatusColumnIndex > 0 Then gWsBom.Cells(rowIndex, gExportStatusColumnIndex).Value = rec.Item("ExportStatus")
+            SetLogContext gCurrentLogItemIndex, "ITEM_ERROR", previewPath, CStr(rec.Item("IsoView"))
+            AddLog CStr(rec.Item("PartNumber")), "ERROR", "Excel image insert failed.", CStr(rec.Item("ImagePath"))
+        Else
+            SetLogContext gCurrentLogItemIndex, "EXCEL_THUMBNAIL_INSERTED", previewPath, CStr(rec.Item("IsoView"))
+            AddLog CStr(rec.Item("PartNumber")), "OK", "Excel thumbnail inserted.", CStr(rec.Item("ImagePath"))
+            WriteDebugPhase "EXCEL_THUMBNAIL_INSERTED", gCurrentLogItemIndex, CStr(rec.Item("PartNumber")), previewPath
+        End If
+        If SAVE_AFTER_EACH_IMAGE_BATCH And EXCEL_IMAGE_BATCH_SIZE > 0 Then
+            If (gExcelImageInsertCount Mod EXCEL_IMAGE_BATCH_SIZE) = 0 Then SaveExcelCheckpoint
+        End If
+    ElseIf includePicture And CStr(rec.Item("ExportStatus")) = "ERROR" Then
+        gWsBom.Cells(rowIndex, gThumbnailColumnIndex).Value = "ERROR"
+    End If
+
+    Err.Clear
+End Sub
+
+Private Sub WriteLogRecordImmediate(ByVal rec As Object)
+    On Error Resume Next
+    If Not gExcelReady Then Exit Sub
+
+    gWsLog.Cells(gNextLogRow, 1).Value = gNextLogRow - 1
+    gWsLog.Cells(gNextLogRow, 2).Value = rec.Item("DateTime")
+    gWsLog.Cells(gNextLogRow, 3).Value = rec.Item("ItemIndex")
+    gWsLog.Cells(gNextLogRow, 4).Value = rec.Item("PartNumber")
+    gWsLog.Cells(gNextLogRow, 5).Value = rec.Item("Status")
+    gWsLog.Cells(gNextLogRow, 6).Value = rec.Item("Phase")
+    gWsLog.Cells(gNextLogRow, 7).Value = rec.Item("Message")
+    gWsLog.Cells(gNextLogRow, 8).Value = rec.Item("ImagePath")
+    gWsLog.Cells(gNextLogRow, 9).Value = rec.Item("ThumbnailPath")
+    gWsLog.Cells(gNextLogRow, 10).Value = rec.Item("IsoView")
+    gWsLog.Range("A" & CStr(gNextLogRow) & ":J" & CStr(gNextLogRow)).Borders.LineStyle = XL_CONTINUOUS
+    gWsLog.Range("A" & CStr(gNextLogRow) & ":J" & CStr(gNextLogRow)).Borders.Weight = XL_THIN
+    gNextLogRow = gNextLogRow + 1
+    Err.Clear
+End Sub
+
+Private Sub SaveExcelCheckpoint()
+    On Error Resume Next
+    If Not gExcelReady Then Exit Sub
+    gWorkbook.Save
+    DoEvents
+    If Err.Number <> 0 Then
+        Debug.Print "Excel save warning: " & Err.Description
+        Err.Clear
+    Else
+        WriteDebugPhase "SAVE_CHECKPOINT", gCurrentLogItemIndex, "", "Excel saved."
+    End If
+End Sub
+
+Private Sub FinalizeExcelReportImmediate()
+    On Error Resume Next
+    If Not gExcelReady Then Exit Sub
+    UpdateSummarySheet
+    SaveExcelCheckpoint
+    gExcelApp.Calculation = XL_CALCULATION_AUTOMATIC
+    gExcelApp.EnableEvents = True
+    gExcelApp.ScreenUpdating = True
+    gExcelApp.DisplayAlerts = True
+    gExcelApp.Visible = True
+    Err.Clear
+End Sub
 
 Private Sub CreateExcelReport()
     On Error GoTo ExcelFatal
@@ -1843,9 +2600,11 @@ Private Sub FillBomSheet(ByVal ws As Object, ByVal wb As Object, ByVal resumeWor
 
         ws.Rows(rowIndex).RowHeight = IIf(INSERT_IMAGES_IN_EXCEL, CLng(THUMBNAIL_HEIGHT * 0.75) + 12, 28)
 
-        If INSERT_IMAGES_IN_EXCEL And CStr(rec.Item("ImagePath")) <> "" And gFSO.FileExists(CStr(rec.Item("ImagePath"))) Then
+        Dim previewPath As String
+        previewPath = PreviewImagePathForRecord(rec)
+        If INSERT_IMAGES_IN_EXCEL And previewPath <> "" And gFSO.FileExists(previewPath) Then
             imageInsertCount = imageInsertCount + 1
-            If Not InsertPictureIntoCell(ws, CStr(rec.Item("ImagePath")), ws.Cells(rowIndex, gThumbnailColumnIndex)) Then
+            If Not InsertPictureIntoCell(ws, previewPath, ws.Cells(rowIndex, gThumbnailColumnIndex)) Then
                 rec.Item("ExportStatus") = "ERROR"
                 rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Excel image insert failed.")
                 If gExportStatusColumnIndex > 0 Then ws.Cells(rowIndex, gExportStatusColumnIndex).Value = rec.Item("ExportStatus")
@@ -1888,10 +2647,14 @@ Private Sub FillLogSheet(ByVal ws As Object, ByVal resumeWorkbook As Boolean)
         ws.Cells.Clear
         ws.Cells(1, 1).Value = "No."
         ws.Cells(1, 2).Value = "Date/Time"
-        ws.Cells(1, 3).Value = "Part Number"
-        ws.Cells(1, 4).Value = "Status"
-        ws.Cells(1, 5).Value = "Message"
-        ws.Cells(1, 6).Value = "Image Path"
+        ws.Cells(1, 3).Value = "Item Index"
+        ws.Cells(1, 4).Value = "Part Number"
+        ws.Cells(1, 5).Value = "Status"
+        ws.Cells(1, 6).Value = "Phase"
+        ws.Cells(1, 7).Value = "Message"
+        ws.Cells(1, 8).Value = "Image Path"
+        ws.Cells(1, 9).Value = "Thumbnail Path"
+        ws.Cells(1, 10).Value = "ISO_VIEW"
         startRow = 2
         startNo = 1
     End If
@@ -1902,22 +2665,30 @@ Private Sub FillLogSheet(ByVal ws As Object, ByVal resumeWorkbook As Boolean)
         Set rec = gExportLog.Item(i)
         ws.Cells(startRow + i - 1, 1).Value = startNo + i - 1
         ws.Cells(startRow + i - 1, 2).Value = rec.Item("DateTime")
-        ws.Cells(startRow + i - 1, 3).Value = rec.Item("PartNumber")
-        ws.Cells(startRow + i - 1, 4).Value = rec.Item("Status")
-        ws.Cells(startRow + i - 1, 5).Value = rec.Item("Message")
-        ws.Cells(startRow + i - 1, 6).Value = rec.Item("ImagePath")
+        ws.Cells(startRow + i - 1, 3).Value = rec.Item("ItemIndex")
+        ws.Cells(startRow + i - 1, 4).Value = rec.Item("PartNumber")
+        ws.Cells(startRow + i - 1, 5).Value = rec.Item("Status")
+        ws.Cells(startRow + i - 1, 6).Value = rec.Item("Phase")
+        ws.Cells(startRow + i - 1, 7).Value = rec.Item("Message")
+        ws.Cells(startRow + i - 1, 8).Value = rec.Item("ImagePath")
+        ws.Cells(startRow + i - 1, 9).Value = rec.Item("ThumbnailPath")
+        ws.Cells(startRow + i - 1, 10).Value = rec.Item("IsoView")
     Next i
 
     ws.Rows(1).Font.Bold = True
     ws.Rows(1).Interior.Color = RGB(220, 230, 241)
     ws.Columns("A").ColumnWidth = 8
     ws.Columns("B").ColumnWidth = 22
-    ws.Columns("C").ColumnWidth = 28
-    ws.Columns("D").ColumnWidth = 14
-    ws.Columns("E").ColumnWidth = 70
-    ws.Columns("F").ColumnWidth = 90
-    ws.Range("A1:F1").AutoFilter
-    ws.Columns("A:F").VerticalAlignment = XL_TOP
+    ws.Columns("C").ColumnWidth = 12
+    ws.Columns("D").ColumnWidth = 28
+    ws.Columns("E").ColumnWidth = 16
+    ws.Columns("F").ColumnWidth = 24
+    ws.Columns("G").ColumnWidth = 70
+    ws.Columns("H").ColumnWidth = 90
+    ws.Columns("I").ColumnWidth = 90
+    ws.Columns("J").ColumnWidth = 12
+    ws.Range("A1:J1").AutoFilter
+    ws.Columns("A:J").VerticalAlignment = XL_TOP
     ApplyUsedRangeBorders ws
 End Sub
 
@@ -2031,11 +2802,17 @@ Private Sub AddLog(ByVal partNumber As String, ByVal statusText As String, ByVal
     Dim rec As Object
     Set rec = CreateObject("Scripting.Dictionary")
     rec.Add "DateTime", Now
+    rec.Add "ItemIndex", CLng(gCurrentLogItemIndex)
     rec.Add "PartNumber", partNumber
     rec.Add "Status", statusText
+    rec.Add "Phase", gCurrentLogPhase
     rec.Add "Message", messageText
     rec.Add "ImagePath", imagePath
+    rec.Add "ThumbnailPath", gCurrentLogThumbnailPath
+    rec.Add "IsoView", gCurrentLogIsoView
     gExportLog.Add rec
+    WriteLogRecordImmediate rec
+    WriteDebugPhase FirstNonEmpty(gCurrentLogPhase, "LOG"), CLng(gCurrentLogItemIndex), partNumber, statusText & " - " & messageText
 End Sub
 
 Private Function GetProductPartNumber(ByVal prod As Object) As String
@@ -2298,6 +3075,35 @@ Private Sub EnsureFolder(ByVal folderPath As String)
     If Not gFSO.FolderExists(folderPath) Then gFSO.CreateFolder folderPath
 End Sub
 
+Private Sub WriteDebugPhase(ByVal phaseText As String, ByVal itemIndex As Long, ByVal partNumber As String, ByVal messageText As String)
+    On Error Resume Next
+    If gDebugLogPath = "" Then Exit Sub
+
+    Dim ts As Object
+    Set ts = gFSO.OpenTextFile(gDebugLogPath, 8, True)
+    ts.WriteLine CStr(Now) & vbTab & phaseText & vbTab & _
+                 "Item=" & CStr(itemIndex) & vbTab & _
+                 "PartNumber=" & partNumber & vbTab & _
+                 messageText
+    ts.Close
+    Debug.Print phaseText & " | " & CStr(itemIndex) & " | " & partNumber & " | " & messageText
+    Err.Clear
+End Sub
+
+Private Sub SetLogContext(ByVal itemIndex As Long, ByVal phaseText As String, ByVal thumbnailPath As String, ByVal isoViewText As String)
+    gCurrentLogItemIndex = itemIndex
+    gCurrentLogPhase = phaseText
+    gCurrentLogThumbnailPath = thumbnailPath
+    gCurrentLogIsoView = isoViewText
+End Sub
+
+Private Sub ClearLogContext()
+    gCurrentLogItemIndex = 0
+    gCurrentLogPhase = ""
+    gCurrentLogThumbnailPath = ""
+    gCurrentLogIsoView = ""
+End Sub
+
 Private Function JoinPath(ByVal folderPath As String, ByVal childName As String) As String
     If Right$(folderPath, 1) = "\" Then
         JoinPath = folderPath & childName
@@ -2337,7 +3143,9 @@ Private Function HasTimedOut(ByVal startTime As Double, ByVal timeoutSeconds As 
 End Function
 
 Private Function ImageTimeoutSeconds() As Double
-    If FAST_SNIP_MODE Then
+    If ITEM_TIMEOUT_SECONDS > 0 Then
+        ImageTimeoutSeconds = ITEM_TIMEOUT_SECONDS
+    ElseIf FAST_SNIP_MODE Then
         ImageTimeoutSeconds = MAX_SECONDS_PER_IMAGE
     Else
         ImageTimeoutSeconds = IMAGE_EXPORT_TIMEOUT_SECONDS

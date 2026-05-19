@@ -39,12 +39,15 @@ Private Const USE_CATIA_DEFINED_BOM_COLUMNS As Boolean = True
 Private Const BOM_COLUMNS As String = "Item|Part Number|Thumbnail|Keywords|QTY|Material|Dimenzija|Mass|Standard|Component Type|REV|Dim-MM|Description|Comments"
 Private Const THUMBNAIL_WIDTH As Long = 160
 Private Const THUMBNAIL_HEIGHT As Long = 120
-Private Const SAVE_EVERY_N_ITEMS As Long = 10
+Private Const EXCEL_IMAGE_BATCH_SIZE As Long = 100
+Private Const SAVE_AFTER_EACH_IMAGE_BATCH As Boolean = True
+Private Const SAVE_EVERY_N_ITEMS As Long = 100
 Private Const SKIP_EXISTING_IMAGES As Boolean = True
 Private Const START_INDEX As Long = 1
 Private Const END_INDEX As Long = 0
+Private Const RESUME_MODE As Boolean = True
 Private Const EXPORT_IMAGES As Boolean = True
-Private Const MAX_ITEMS_TO_EXPORT As Long = 20
+Private Const MAX_ITEMS_TO_EXPORT As Long = 0
 Private Const SKIP_ASSEMBLIES As Boolean = True
 Private Const IMAGE_EXPORT_TIMEOUT_SECONDS As Double = 10
 Private Const IMAGE_WIDTH As Long = 1000
@@ -101,6 +104,7 @@ Private gThumbnailColumnIndex As Long
 Private gImagePathColumnIndex As Long
 Private gExportStatusColumnIndex As Long
 Private gCatiaBomColumnsSource As String
+Private gEffectiveStartIndex As Long
 
 Public Sub CATIA_VISUAL_BOM_EXPORTER()
     On Error GoTo FatalError
@@ -115,6 +119,7 @@ Public Sub CATIA_VISUAL_BOM_EXPORTER()
     gImagePathColumnIndex = 0
     gExportStatusColumnIndex = 0
     gCatiaBomColumnsSource = ""
+    gEffectiveStartIndex = START_INDEX
     gTotalInstances = 0
     Randomize
 
@@ -133,6 +138,7 @@ Public Sub CATIA_VISUAL_BOM_EXPORTER()
     Set gRootProduct = gActiveDoc.Product
     PrepareOutputFolders gActiveDoc, gRootProduct
     InitializeBomHeaders
+    gEffectiveStartIndex = DetermineResumeStartIndexFromExcelFile()
 
     CATIA.StatusBar = "CATIA_VISUAL_BOM_EXPORTER: citam Product Tree..."
     BuildBomFromProductTree gRootProduct
@@ -437,6 +443,7 @@ Private Sub ExportAllImages()
         If ShouldProcessExportIndex(itemIndex) Then
         Dim rec As Object
         Set rec = gBomItems.Item(CStr(key))
+        CATIA.StatusBar = "Image " & CStr(itemIndex) & " / " & CStr(gBomItems.Count) & " - " & CStr(rec.Item("PartNumber"))
         ExportImageForBomRecord rec
         If CStr(rec.Item("ExportStatus")) = "ERROR" Or CStr(rec.Item("ExportStatus")) = "NOT FOUND" Or CStr(rec.Item("ExportStatus")) = "TIMEOUT" Then SafeRestoreCatiaSession
         DoEvents
@@ -1581,8 +1588,117 @@ End Function
 
 Private Function ShouldProcessExportIndex(ByVal itemIndex As Long) As Boolean
     ShouldProcessExportIndex = True
-    If START_INDEX > 1 And itemIndex < START_INDEX Then ShouldProcessExportIndex = False
+    If gEffectiveStartIndex < 1 Then gEffectiveStartIndex = START_INDEX
+    If gEffectiveStartIndex > 1 And itemIndex < gEffectiveStartIndex Then ShouldProcessExportIndex = False
     If END_INDEX > 0 And itemIndex > END_INDEX Then ShouldProcessExportIndex = False
+End Function
+
+Private Function DetermineResumeStartIndexFromExcelFile() As Long
+    On Error Resume Next
+    DetermineResumeStartIndexFromExcelFile = START_INDEX
+    If Not RESUME_MODE Then Exit Function
+    If Not gFSO.FileExists(gExcelPath) Then Exit Function
+
+    Dim xl As Object
+    Dim wb As Object
+    Dim ws As Object
+    Set xl = CreateObject("Excel.Application")
+    If xl Is Nothing Then Exit Function
+
+    xl.Visible = False
+    xl.DisplayAlerts = False
+    Set wb = xl.Workbooks.Open(gExcelPath)
+    If Err.Number <> 0 Or wb Is Nothing Then
+        Err.Clear
+        xl.Quit
+        Exit Function
+    End If
+
+    Set ws = GetWorksheetByName(wb, "BOM", 2)
+    DetermineResumeStartIndexFromExcelFile = DetermineResumeStartIndex(ws)
+
+    wb.Close False
+    xl.Quit
+    Err.Clear
+End Function
+
+Private Function GetWorksheetByName(ByVal workbookObj As Object, ByVal sheetName As String, ByVal fallbackIndex As Long) As Object
+    On Error Resume Next
+    Set GetWorksheetByName = workbookObj.Worksheets(sheetName)
+    If Err.Number <> 0 Or GetWorksheetByName Is Nothing Then
+        Err.Clear
+        Set GetWorksheetByName = workbookObj.Worksheets(fallbackIndex)
+    End If
+    Err.Clear
+End Function
+
+Private Function LastUsedRow(ByVal ws As Object) As Long
+    On Error Resume Next
+    LastUsedRow = CLng(ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1)
+    If Err.Number <> 0 Or LastUsedRow < 1 Then
+        LastUsedRow = 1
+        Err.Clear
+    End If
+End Function
+
+Private Function DetermineResumeStartIndex(ByVal ws As Object) As Long
+    On Error Resume Next
+    Dim lastRow As Long
+    Dim statusCol As Long
+    Dim rowIndex As Long
+    Dim statusText As String
+
+    DetermineResumeStartIndex = START_INDEX
+    If Not RESUME_MODE Then Exit Function
+
+    lastRow = LastUsedRow(ws)
+    If lastRow < 2 Then Exit Function
+
+    statusCol = gExportStatusColumnIndex
+    If statusCol <= 0 Then statusCol = FindHeaderIndex("Export Status")
+    If statusCol <= 0 Then
+        DetermineResumeStartIndex = MaxLong(START_INDEX, lastRow)
+        Exit Function
+    End If
+
+    For rowIndex = 2 To lastRow
+        statusText = UCase$(Trim$(CStr(ws.Cells(rowIndex, statusCol).Value)))
+        If statusText = "" Or statusText = "PENDING" Then
+            DetermineResumeStartIndex = MaxLong(START_INDEX, rowIndex - 1)
+            Exit Function
+        End If
+    Next rowIndex
+
+    DetermineResumeStartIndex = MaxLong(START_INDEX, lastRow)
+    Err.Clear
+End Function
+
+Private Function DetermineResumeNextBomRow(ByVal ws As Object, ByVal resumeStartIndex As Long) As Long
+    On Error Resume Next
+    Dim lastRow As Long
+    Dim lastDataCount As Long
+    lastRow = LastUsedRow(ws)
+    If lastRow < 2 Then
+        DetermineResumeNextBomRow = 2
+        Exit Function
+    End If
+
+    lastDataCount = lastRow - 1
+    If CLng(resumeStartIndex) <= lastDataCount Then
+        DetermineResumeNextBomRow = CLng(resumeStartIndex) + 1
+    Else
+        DetermineResumeNextBomRow = lastRow + 1
+    End If
+    If DetermineResumeNextBomRow < 2 Then DetermineResumeNextBomRow = 2
+    Err.Clear
+End Function
+
+Private Function MaxLong(ByVal a As Long, ByVal b As Long) As Long
+    If a > b Then
+        MaxLong = a
+    Else
+        MaxLong = b
+    End If
 End Function
 
 Private Sub CreateExcelReport()
@@ -1593,6 +1709,7 @@ Private Sub CreateExcelReport()
     Dim wsSummary As Object
     Dim wsBom As Object
     Dim wsLog As Object
+    Dim resumeWorkbook As Boolean
 
     Set xl = CreateObject("Excel.Application")
     If xl Is Nothing Then
@@ -1603,26 +1720,45 @@ Private Sub CreateExcelReport()
     xl.Visible = False
     xl.DisplayAlerts = False
 
-    Set wb = xl.Workbooks.Add
-    Do While wb.Worksheets.Count < 3
-        wb.Worksheets.Add After:=wb.Worksheets(wb.Worksheets.Count)
-    Loop
+    If RESUME_MODE And gFSO.FileExists(gExcelPath) Then
+        On Error Resume Next
+        Set wb = xl.Workbooks.Open(gExcelPath)
+        If Err.Number = 0 And Not wb Is Nothing Then resumeWorkbook = True
+        Err.Clear
+        On Error GoTo ExcelFatal
+    End If
 
-    Set wsSummary = wb.Worksheets(1)
-    Set wsBom = wb.Worksheets(2)
-    Set wsLog = wb.Worksheets(3)
+    If wb Is Nothing Then
+        Set wb = xl.Workbooks.Add
+        Do While wb.Worksheets.Count < 3
+            wb.Worksheets.Add After:=wb.Worksheets(wb.Worksheets.Count)
+        Loop
+    Else
+        Do While wb.Worksheets.Count < 3
+            wb.Worksheets.Add After:=wb.Worksheets(wb.Worksheets.Count)
+        Loop
+    End If
+
+    Set wsSummary = GetWorksheetByName(wb, "SUMMARY", 1)
+    Set wsBom = GetWorksheetByName(wb, "BOM", 2)
+    Set wsLog = GetWorksheetByName(wb, "EXPORT_LOG", 3)
 
     wsSummary.Name = "SUMMARY"
     wsBom.Name = "BOM"
     wsLog.Name = "EXPORT_LOG"
 
+    If Not resumeWorkbook Then
+        xl.DisplayAlerts = False
+        If gFSO.FileExists(gExcelPath) Then gFSO.DeleteFile gExcelPath, True
+        wb.SaveAs gExcelPath, XL_OPENXML_WORKBOOK
+    End If
+
     FillSummarySheet wsSummary
-    FillBomSheet wsBom
-    FillLogSheet wsLog
+    FillBomSheet wsBom, wb, resumeWorkbook
+    FillLogSheet wsLog, resumeWorkbook
 
     xl.DisplayAlerts = False
-    If gFSO.FileExists(gExcelPath) Then gFSO.DeleteFile gExcelPath, True
-    wb.SaveAs gExcelPath, XL_OPENXML_WORKBOOK
+    wb.Save
     xl.Visible = True
     xl.DisplayAlerts = True
     Exit Sub
@@ -1671,23 +1807,35 @@ Private Sub FillSummarySheet(ByVal ws As Object)
     ApplyUsedRangeBorders ws
 End Sub
 
-Private Sub FillBomSheet(ByVal ws As Object)
+Private Sub FillBomSheet(ByVal ws As Object, ByVal wb As Object, ByVal resumeWorkbook As Boolean)
     On Error Resume Next
 
-    ws.Cells.Clear
-
     Dim c As Long
-    For c = 1 To gBomHeaders.Count
-        ws.Cells(1, c).Value = gBomHeaders.Item(c)
-    Next c
-
     Dim rowIndex As Long
-    rowIndex = 2
-
     Dim key As Variant
+    Dim rec As Object
+    Dim itemIndex As Long
+    Dim imageInsertCount As Long
+
+    If Not resumeWorkbook Or Trim$(CStr(ws.Cells(1, 1).Value)) = "" Then
+        ws.Cells.Clear
+        For c = 1 To gBomHeaders.Count
+            ws.Cells(1, c).Value = gBomHeaders.Item(c)
+        Next c
+        rowIndex = 2
+    Else
+        gEffectiveStartIndex = MaxLong(gEffectiveStartIndex, DetermineResumeStartIndex(ws))
+        rowIndex = DetermineResumeNextBomRow(ws, gEffectiveStartIndex)
+    End If
+
+    If rowIndex < 2 Then rowIndex = 2
     For Each key In gBomItems.Keys
-        Dim rec As Object
+        itemIndex = itemIndex + 1
+        If Not ShouldProcessExportIndex(itemIndex) Then
+            DoEvents
+        Else
         Set rec = gBomItems.Item(CStr(key))
+        CATIA.StatusBar = "Image " & CStr(itemIndex) & " / " & CStr(gBomItems.Count) & " - " & CStr(rec.Item("PartNumber"))
 
         For c = 1 To gBomHeaders.Count
             If c <> gThumbnailColumnIndex Then ws.Cells(rowIndex, c).Value = GetBomCellValue(rec, CStr(gBomHeaders.Item(c)))
@@ -1696,36 +1844,68 @@ Private Sub FillBomSheet(ByVal ws As Object)
         ws.Rows(rowIndex).RowHeight = IIf(INSERT_IMAGES_IN_EXCEL, CLng(THUMBNAIL_HEIGHT * 0.75) + 12, 28)
 
         If INSERT_IMAGES_IN_EXCEL And CStr(rec.Item("ImagePath")) <> "" And gFSO.FileExists(CStr(rec.Item("ImagePath"))) Then
-            InsertPictureIntoCell ws, CStr(rec.Item("ImagePath")), ws.Cells(rowIndex, gThumbnailColumnIndex)
+            imageInsertCount = imageInsertCount + 1
+            If Not InsertPictureIntoCell(ws, CStr(rec.Item("ImagePath")), ws.Cells(rowIndex, gThumbnailColumnIndex)) Then
+                rec.Item("ExportStatus") = "ERROR"
+                rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Excel image insert failed.")
+                If gExportStatusColumnIndex > 0 Then ws.Cells(rowIndex, gExportStatusColumnIndex).Value = rec.Item("ExportStatus")
+                AddLog CStr(rec.Item("PartNumber")), "ERROR", "Excel image insert failed.", CStr(rec.Item("ImagePath"))
+            End If
+            If SAVE_AFTER_EACH_IMAGE_BATCH And EXCEL_IMAGE_BATCH_SIZE > 0 Then
+                If (imageInsertCount Mod EXCEL_IMAGE_BATCH_SIZE) = 0 Then
+                    wb.Save
+                    If Err.Number <> 0 Then
+                        AddLog "", "WARNING", "Excel batch save failed: " & Err.Description, gExcelPath
+                        Err.Clear
+                    End If
+                    DoEvents
+                End If
+            End If
         End If
 
         rowIndex = rowIndex + 1
+        End If
     Next key
 
     FormatBomSheet ws, rowIndex - 1
+    wb.Save
+    If Err.Number <> 0 Then
+        AddLog "", "WARNING", "Excel final save failed: " & Err.Description, gExcelPath
+        Err.Clear
+    End If
 End Sub
 
-Private Sub FillLogSheet(ByVal ws As Object)
+Private Sub FillLogSheet(ByVal ws As Object, ByVal resumeWorkbook As Boolean)
     On Error Resume Next
 
-    ws.Cells.Clear
-    ws.Cells(1, 1).Value = "No."
-    ws.Cells(1, 2).Value = "Date/Time"
-    ws.Cells(1, 3).Value = "Part Number"
-    ws.Cells(1, 4).Value = "Status"
-    ws.Cells(1, 5).Value = "Message"
-    ws.Cells(1, 6).Value = "Image Path"
+    Dim startRow As Long
+    Dim startNo As Long
+    If resumeWorkbook And Trim$(CStr(ws.Cells(1, 1).Value)) <> "" Then
+        startRow = LastUsedRow(ws) + 1
+        If startRow < 2 Then startRow = 2
+        startNo = startRow - 1
+    Else
+        ws.Cells.Clear
+        ws.Cells(1, 1).Value = "No."
+        ws.Cells(1, 2).Value = "Date/Time"
+        ws.Cells(1, 3).Value = "Part Number"
+        ws.Cells(1, 4).Value = "Status"
+        ws.Cells(1, 5).Value = "Message"
+        ws.Cells(1, 6).Value = "Image Path"
+        startRow = 2
+        startNo = 1
+    End If
 
     Dim i As Long
     For i = 1 To gExportLog.Count
         Dim rec As Object
         Set rec = gExportLog.Item(i)
-        ws.Cells(i + 1, 1).Value = i
-        ws.Cells(i + 1, 2).Value = rec.Item("DateTime")
-        ws.Cells(i + 1, 3).Value = rec.Item("PartNumber")
-        ws.Cells(i + 1, 4).Value = rec.Item("Status")
-        ws.Cells(i + 1, 5).Value = rec.Item("Message")
-        ws.Cells(i + 1, 6).Value = rec.Item("ImagePath")
+        ws.Cells(startRow + i - 1, 1).Value = startNo + i - 1
+        ws.Cells(startRow + i - 1, 2).Value = rec.Item("DateTime")
+        ws.Cells(startRow + i - 1, 3).Value = rec.Item("PartNumber")
+        ws.Cells(startRow + i - 1, 4).Value = rec.Item("Status")
+        ws.Cells(startRow + i - 1, 5).Value = rec.Item("Message")
+        ws.Cells(startRow + i - 1, 6).Value = rec.Item("ImagePath")
     Next i
 
     ws.Rows(1).Font.Bold = True
@@ -1783,8 +1963,9 @@ Private Sub ActiveWindowFreezePanesSafe()
     End If
 End Sub
 
-Private Sub InsertPictureIntoCell(ByVal ws As Object, ByVal imagePath As String, ByVal cell As Object)
+Private Function InsertPictureIntoCell(ByVal ws As Object, ByVal imagePath As String, ByVal cell As Object) As Boolean
     On Error GoTo InsertFailed
+    InsertPictureIntoCell = False
 
     Dim shp As Object
     Dim margin As Double
@@ -1796,7 +1977,7 @@ Private Sub InsertPictureIntoCell(ByVal ws As Object, ByVal imagePath As String,
     maxH = THUMBNAIL_HEIGHT
     If maxW > cell.Width - (2 * margin) Then maxW = cell.Width - (2 * margin)
     If maxH > cell.Height - (2 * margin) Then maxH = cell.Height - (2 * margin)
-    If maxW < 10 Or maxH < 10 Then Exit Sub
+    If maxW < 10 Or maxH < 10 Then Exit Function
 
     Set shp = ws.Shapes.AddPicture(imagePath, MSO_FALSE, MSO_TRUE, cell.Left + margin, cell.Top + margin, maxW, maxH)
     shp.LockAspectRatio = MSO_TRUE
@@ -1809,12 +1990,13 @@ Private Sub InsertPictureIntoCell(ByVal ws As Object, ByVal imagePath As String,
 
     shp.Left = cell.Left + (cell.Width - shp.Width) / 2
     shp.Top = cell.Top + (cell.Height - shp.Height) / 2
-    Exit Sub
+    InsertPictureIntoCell = True
+    Exit Function
 
 InsertFailed:
     AddLog "", "WARNING", "Excel nije uspeo da ubaci sliku: " & imagePath & " | " & Err.Description, imagePath
     Err.Clear
-End Sub
+End Function
 
 Private Sub InsertPictureIntoRange(ByVal ws As Object, ByVal imagePath As String, ByVal rangeAddress As String)
     On Error GoTo InsertFailed

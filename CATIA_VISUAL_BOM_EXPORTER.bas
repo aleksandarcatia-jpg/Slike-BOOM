@@ -22,6 +22,11 @@ Private Const DEFAULT_ISO_VIEW_INDEX As Long = 1
 Private Const MAX_SECONDS_PER_IMAGE As Double = 5
 Private Const EXPORT_MAIN_ASSEMBLY_IMAGE As Boolean = False
 Private Const HYBRID_PRODUCTION_MODE As Boolean = True
+Private Const HYBRID_IMAGE_MODE As Boolean = True
+Private Const PREFER_STANDALONE_PART_CAPTURE As Boolean = True
+Private Const FALLBACK_TO_ASSEMBLY_HIDE_SHOW As Boolean = True
+Private Const CLOSE_STANDALONE_DOCUMENT_AFTER_CAPTURE As Boolean = True
+Private Const NEVER_SAVE_CATIA_DOCUMENTS As Boolean = True
 Private Const MAX_BOM_SCAN_SECONDS As Double = 0
 Private Const FIRST_IMAGE_TIMEOUT_SECONDS As Double = 120
 Private Const ITEM_TIMEOUT_SECONDS As Double = 5
@@ -108,6 +113,8 @@ Private Const WIA_FORMAT_BMP As String = "{B96B3CAB-0728-11D3-9D7B-0000F81EF32E}
 Private gFSO As Object
 Private gShell As Object
 Private gBomItems As Object
+Private gProductIndex As Object
+Private gImageCaptureCache As Object
 Private gAllProducts As Collection
 Private gExportLog As Collection
 Private gTotalInstances As Long
@@ -138,6 +145,7 @@ Private gExcelImageInsertCount As Long
 Private gBomScanStart As Double
 Private gBomScanTimedOut As Boolean
 Private gTestScanLimitReached As Boolean
+Private gAssemblyHideInitialized As Boolean
 Private gAbortMessage As String
 Private gSuccessfulImageCount As Long
 Private gCurrentLogItemIndex As Long
@@ -151,6 +159,8 @@ Public Sub CATIA_VISUAL_BOM_EXPORTER()
     Set gFSO = CreateObject("Scripting.FileSystemObject")
     Set gShell = CreateObject("WScript.Shell")
     Set gBomItems = CreateObject("Scripting.Dictionary")
+    Set gProductIndex = CreateObject("Scripting.Dictionary")
+    Set gImageCaptureCache = CreateObject("Scripting.Dictionary")
     Set gAllProducts = New Collection
     Set gExportLog = New Collection
     Set gBomHeaders = New Collection
@@ -172,6 +182,7 @@ Public Sub CATIA_VISUAL_BOM_EXPORTER()
     gBomScanStart = 0
     gBomScanTimedOut = False
     gTestScanLimitReached = False
+    gAssemblyHideInitialized = False
     gAbortMessage = ""
     gSuccessfulImageCount = 0
     gCurrentLogItemIndex = 0
@@ -321,6 +332,20 @@ Private Function GetDocumentFolder(ByVal doc As Object) As String
         Err.Clear
         GetDocumentFolder = ""
     End If
+End Function
+
+Private Function GetDocumentFullName(ByVal doc As Object) As String
+    On Error Resume Next
+    GetDocumentFullName = CStr(doc.FullName)
+    If Err.Number <> 0 Or GetDocumentFullName = "" Then
+        Err.Clear
+        If CStr(doc.Path) <> "" Then GetDocumentFullName = JoinPath(CStr(doc.Path), CStr(doc.Name))
+    End If
+    Err.Clear
+End Function
+
+Private Function SamePath(ByVal pathA As String, ByVal pathB As String) As Boolean
+    SamePath = (UCase$(Trim$(pathA)) = UCase$(Trim$(pathB)) And Trim$(pathA) <> "")
 End Function
 
 Private Sub BuildBomFromProductTree(ByVal rootProduct As Object)
@@ -502,6 +527,7 @@ Private Sub AddOrUpdateBomItem(ByVal prod As Object, _
     If gBomItems.Exists(key) Then
         Set rec = gBomItems.Item(key)
         rec.Item("Quantity") = CLng(rec.Item("Quantity")) + 1
+        EnsureRecordSourceInfo rec, prod
 
         If InStr(1, rec.Item("ParentAssembly"), parentAssemblyName, vbTextCompare) = 0 Then
             If rec.Item("ParentAssembly") <> "" And parentAssemblyName <> "" Then
@@ -532,6 +558,8 @@ Private Sub AddOrUpdateBomItem(ByVal prod As Object, _
         rec.Add "Standard", GetPropertyValue(prod, "Standard")
         rec.Add "ParentAssembly", parentAssemblyName
         rec.Add "TreePath", treePath
+        rec.Add "SourceFilePath", GetProductSourceFilePath(prod)
+        rec.Add "ComponentType", GetProductBomType(prod)
         rec.Add "ImageFile", ""
         rec.Add "ImagePath", ""
         rec.Add "ThumbnailFile", ""
@@ -544,12 +572,73 @@ Private Sub AddOrUpdateBomItem(ByVal prod As Object, _
         rec.Add "ProductRef", prod
         gBomItems.Add key, rec
     End If
+    AddRecordToProductIndex rec
     Exit Sub
 
 AddError:
     AddLog pn, "WARNING", "BOM stavka nije dodata: " & Err.Description, ""
     Err.Clear
 End Sub
+
+Private Sub EnsureRecordSourceInfo(ByVal rec As Object, ByVal prod As Object)
+    On Error Resume Next
+    Dim sourcePath As String
+    sourcePath = GetProductSourceFilePath(prod)
+
+    If Not rec.Exists("SourceFilePath") Then
+        rec.Add "SourceFilePath", sourcePath
+    ElseIf CStr(rec.Item("SourceFilePath")) = "" And sourcePath <> "" Then
+        rec.Item("SourceFilePath") = sourcePath
+    End If
+
+    If Not rec.Exists("ComponentType") Then
+        rec.Add "ComponentType", GetProductBomType(prod)
+    ElseIf CStr(rec.Item("ComponentType")) = "" Then
+        rec.Item("ComponentType") = GetProductBomType(prod)
+    End If
+    Err.Clear
+End Sub
+
+Private Sub AddRecordToProductIndex(ByVal rec As Object)
+    On Error Resume Next
+    Dim indexKey As String
+    indexKey = ImageCacheKeyForRecord(rec)
+    If indexKey = "" Then Exit Sub
+    If Not gProductIndex.Exists(indexKey) Then Set gProductIndex.Item(indexKey) = rec
+    Err.Clear
+End Sub
+
+Private Sub RefreshRecordFromProductIndex(ByVal rec As Object)
+    On Error Resume Next
+    Dim indexKey As String
+    Dim indexedRec As Object
+    indexKey = ImageCacheKeyForRecord(rec)
+    If indexKey = "" Then Exit Sub
+    If Not gProductIndex.Exists(indexKey) Then Exit Sub
+
+    Set indexedRec = gProductIndex.Item(indexKey)
+    If indexedRec Is Nothing Then Exit Sub
+    If SafeRecValue(rec, "SourceFilePath") = "" And SafeRecValue(indexedRec, "SourceFilePath") <> "" Then rec.Item("SourceFilePath") = SafeRecValue(indexedRec, "SourceFilePath")
+    If rec.Exists("ProductRef") Then
+        If rec.Item("ProductRef") Is Nothing Then Set rec.Item("ProductRef") = indexedRec.Item("ProductRef")
+    End If
+    If rec.Exists("PathProducts") Then
+        If rec.Item("PathProducts") Is Nothing Then Set rec.Item("PathProducts") = indexedRec.Item("PathProducts")
+    End If
+    Err.Clear
+End Sub
+
+Private Function ImageCacheKeyForRecord(ByVal rec As Object) As String
+    On Error Resume Next
+    Dim pn As String
+    pn = UCase$(Trim$(SafeRecValue(rec, "PartNumber")))
+    If pn <> "" Then
+        ImageCacheKeyForRecord = "PN|" & pn
+    Else
+        ImageCacheKeyForRecord = UCase$(Trim$(SafeRecValue(rec, "Key")))
+    End If
+    Err.Clear
+End Function
 
 Private Function EffectiveMaxItemsToExport() As Long
     If TEST_MODE Then
@@ -602,7 +691,10 @@ Private Sub ExportAllImages()
     SaveExcelCheckpoint
     If EXPORT_IMAGES Then
         SafeRestoreCatiaSession
-        HideAllComponents
+        If ShouldPrehideAssemblyForImageExport() Then
+            HideAllComponents
+            gAssemblyHideInitialized = True
+        End If
     End If
 
     Dim key As Variant
@@ -629,7 +721,7 @@ Private Sub ExportAllImages()
         Set previousVisibleProducts = ExportImageForBomRecord(rec, previousVisibleProducts)
         If CStr(rec.Item("ExportStatus")) = "ERROR" Or CStr(rec.Item("ExportStatus")) = "NOT FOUND" Or CStr(rec.Item("ExportStatus")) = "TIMEOUT" Then
             SafeRestoreCatiaSession
-            If EXPORT_IMAGES Then HideAllComponents
+            If EXPORT_IMAGES And ShouldPrehideAssemblyForImageExport() Then HideAllComponents
             Set previousVisibleProducts = New Collection
         End If
         Else
@@ -645,7 +737,7 @@ Private Sub ExportAllImages()
             WriteDebugPhase "SAVE_CHECKPOINT", itemIndex, CStr(rec.Item("PartNumber")), "Periodic save."
         End If
 
-        If CStr(rec.Item("ExportStatus")) <> "SKIPPED_FASTENER" And gSuccessfulImageCount = 0 And FIRST_IMAGE_TIMEOUT_SECONDS > 0 And HasTimedOut(firstImageStart, FIRST_IMAGE_TIMEOUT_SECONDS) Then
+        If Not IsImageSkippedStatus(CStr(rec.Item("ExportStatus"))) And gSuccessfulImageCount = 0 And FIRST_IMAGE_TIMEOUT_SECONDS > 0 And HasTimedOut(firstImageStart, FIRST_IMAGE_TIMEOUT_SECONDS) Then
             gAbortMessage = "Prva slika nije napravljena u roku od " & CStr(FIRST_IMAGE_TIMEOUT_SECONDS) & " sekundi. Export je prekinut."
             WriteDebugPhase "ITEM_TIMEOUT", itemIndex, CStr(rec.Item("PartNumber")), gAbortMessage
             Exit For
@@ -660,10 +752,21 @@ Private Sub ExportAllImages()
     SafeRestoreCatiaSession
 End Sub
 
+Private Function ShouldPrehideAssemblyForImageExport() As Boolean
+    ShouldPrehideAssemblyForImageExport = True
+    If HYBRID_IMAGE_MODE And PREFER_STANDALONE_PART_CAPTURE Then ShouldPrehideAssemblyForImageExport = False
+End Function
+
 Private Function IsSuccessfulImageRecord(ByVal rec As Object) As Boolean
     Dim statusText As String
     statusText = UCase$(CStr(rec.Item("ExportStatus")))
     IsSuccessfulImageRecord = (statusText = "OK" Or statusText = "EXISTING_REUSED")
+End Function
+
+Private Function IsImageSkippedStatus(ByVal statusText As String) As Boolean
+    Dim s As String
+    s = UCase$(Trim$(statusText))
+    IsImageSkippedStatus = (s = "SKIPPED_FASTENER" Or s = "SKIPPED_IMAGE_ONLY")
 End Function
 
 Private Sub MaybeCountSuccessfulImageAndSave(ByVal itemIndex As Long, ByVal rec As Object)
@@ -698,20 +801,21 @@ Private Function ExportImageForBomRecord(ByVal rec As Object, ByVal previousVisi
     Dim itemTimeout As Double
     Dim isoViewIndex As Long
 
-    Set productRef = rec.Item("ProductRef")
-    Set pathProducts = rec.Item("PathProducts")
     itemStart = Timer
     itemTimeout = ImageTimeoutSeconds()
+    RefreshRecordFromProductIndex rec
+    Set productRef = rec.Item("ProductRef")
+    Set pathProducts = rec.Item("PathProducts")
 
     If SKIP_FASTENER_IMAGES And IsFastenerItem(rec) Then
         rec.Item("ImageFile") = ""
         rec.Item("ImagePath") = ""
         rec.Item("ThumbnailFile") = ""
         rec.Item("ThumbnailPath") = ""
-        rec.Item("ExportStatus") = "SKIPPED_FASTENER"
+        rec.Item("ExportStatus") = "SKIPPED_IMAGE_ONLY"
         rec.Item("Note") = "Image skipped for standard fastener"
         SetLogContext gCurrentLogItemIndex, "ITEM_SKIPPED_FASTENER", "", CStr(rec.Item("IsoView"))
-        AddLog CStr(rec.Item("PartNumber")), "SKIPPED_FASTENER", "Image skipped for standard fastener.", ""
+        AddLog CStr(rec.Item("PartNumber")), "SKIPPED_IMAGE_ONLY", "Image skipped for standard fastener.", ""
         WriteDebugPhase "ITEM_SKIPPED_FASTENER", gCurrentLogItemIndex, CStr(rec.Item("PartNumber")), CStr(rec.Item("Nomenclature"))
         Set ExportImageForBomRecord = previousVisibleProducts
         Exit Function
@@ -720,12 +824,19 @@ Private Function ExportImageForBomRecord(ByVal rec As Object, ByVal previousVisi
     imageFile = BuildUniqueImageFileName(CStr(rec.Item("PartNumber")), CStr(rec.Item("Nomenclature")), CLng(rec.Item("No")))
     imagePath = JoinPath(gImageFolder, imageFile)
 
+    If ReuseCachedImageForRecord(rec) Then
+        AddLog CStr(rec.Item("PartNumber")), "EXISTING_REUSED", "Image reused from current macro run cache.", CStr(rec.Item("ImagePath"))
+        WriteDebugPhase "ITEM_CAPTURE_DONE", gCurrentLogItemIndex, CStr(rec.Item("PartNumber")), "Image reused from cache."
+        Exit Function
+    End If
+
     If SKIP_EXISTING_IMAGES And gFSO.FileExists(imagePath) Then
         rec.Item("ImageFile") = gFSO.GetFileName(imagePath)
         rec.Item("ImagePath") = imagePath
         If EnsureThumbnailForRecord(rec) Then
             rec.Item("ExportStatus") = "EXISTING_REUSED"
             rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Existing image and thumbnail reused.")
+            CacheImageForRecord rec
             SetLogContext gCurrentLogItemIndex, "ITEM_CAPTURE_DONE", CStr(rec.Item("ThumbnailPath")), CStr(rec.Item("IsoView"))
             AddLog CStr(rec.Item("PartNumber")), "EXISTING_REUSED", "Existing image reused.", imagePath
             WriteDebugPhase "ITEM_CAPTURE_DONE", gCurrentLogItemIndex, CStr(rec.Item("PartNumber")), "Existing image reused."
@@ -737,6 +848,37 @@ Private Function ExportImageForBomRecord(ByVal rec As Object, ByVal previousVisi
         End If
         Exit Function
     End If
+
+    If HYBRID_IMAGE_MODE And PREFER_STANDALONE_PART_CAPTURE Then
+        Dim standaloneMessage As String
+        If TryCaptureStandaloneForRecord(rec, imagePath, itemStart, itemTimeout, standaloneMessage) Then
+            Set ExportImageForBomRecord = previousVisibleProducts
+            Exit Function
+        End If
+
+        rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Standalone capture failed: " & standaloneMessage)
+        SetLogContext gCurrentLogItemIndex, "ITEM_ERROR", CStr(rec.Item("ThumbnailPath")), CStr(rec.Item("IsoView"))
+        AddLog CStr(rec.Item("PartNumber")), "WARNING", "Standalone capture failed; fallback=" & CStr(FALLBACK_TO_ASSEMBLY_HIDE_SHOW) & ". " & standaloneMessage, imagePath
+        WriteDebugPhase "ITEM_ERROR", gCurrentLogItemIndex, CStr(rec.Item("PartNumber")), "Standalone capture failed; fallback=" & CStr(FALLBACK_TO_ASSEMBLY_HIDE_SHOW) & ". " & standaloneMessage
+
+        If Not FALLBACK_TO_ASSEMBLY_HIDE_SHOW Then
+            rec.Item("ImageFile") = imageFile
+            rec.Item("ImagePath") = imagePath
+            If HasTimedOut(itemStart, itemTimeout) Then
+                rec.Item("ExportStatus") = "TIMEOUT"
+                SetLogContext gCurrentLogItemIndex, "ITEM_TIMEOUT", CStr(rec.Item("ThumbnailPath")), CStr(rec.Item("IsoView"))
+            Else
+                rec.Item("ExportStatus") = "ERROR"
+                SetLogContext gCurrentLogItemIndex, "ITEM_ERROR", CStr(rec.Item("ThumbnailPath")), CStr(rec.Item("IsoView"))
+            End If
+            AddLog CStr(rec.Item("PartNumber")), CStr(rec.Item("ExportStatus")), "Standalone capture failed and assembly fallback is disabled. " & standaloneMessage, imagePath
+            Set ExportImageForBomRecord = previousVisibleProducts
+            Exit Function
+        End If
+    End If
+
+    ActivateMainProductDocument
+    EnsureAssemblyHideInitializedForFallback
 
     Set visibleProducts = BuildVisibleProductsForRecord(pathProducts, productRef)
     If HasTimedOut(itemStart, itemTimeout) Then
@@ -792,6 +934,7 @@ Private Function ExportImageForBomRecord(ByVal rec As Object, ByVal previousVisi
         rec.Item("ImagePath") = imagePath
         If EnsureThumbnailForRecord(rec) Then
             rec.Item("ExportStatus") = "OK"
+            CacheImageForRecord rec
         Else
             rec.Item("ExportStatus") = "ERROR"
             rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Thumbnail creation failed.")
@@ -823,6 +966,221 @@ ExportError:
     rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Image export error: " & Err.Description)
     SetLogContext gCurrentLogItemIndex, "ITEM_ERROR", CStr(rec.Item("ThumbnailPath")), CStr(rec.Item("IsoView"))
     AddLog CStr(rec.Item("PartNumber")), "ERROR", "Image export error: " & Err.Description, ""
+    Err.Clear
+End Function
+
+Private Function TryCaptureStandaloneForRecord(ByVal rec As Object, _
+                                               ByVal imagePath As String, _
+                                               ByVal itemStart As Double, _
+                                               ByVal itemTimeout As Double, _
+                                               ByRef failureMessage As String) As Boolean
+    On Error GoTo StandaloneError
+    TryCaptureStandaloneForRecord = False
+    failureMessage = ""
+
+    Dim sourcePath As String
+    sourcePath = SafeRecValue(rec, "SourceFilePath")
+    If sourcePath = "" Then
+        failureMessage = "Source file path is not available."
+        Exit Function
+    End If
+    If Not IsSupportedCatiaSourceFile(sourcePath) Then
+        failureMessage = "Source file is not CATPart/CATProduct: " & sourcePath
+        Exit Function
+    End If
+    If Not gFSO.FileExists(sourcePath) Then
+        failureMessage = "Source file does not exist: " & sourcePath
+        Exit Function
+    End If
+    If SamePath(sourcePath, GetDocumentFullName(gActiveDoc)) Then
+        failureMessage = "Source file is the active main CATProduct."
+        Exit Function
+    End If
+    If HasTimedOut(itemStart, itemTimeout) Then
+        failureMessage = "Timeout before standalone open."
+        Exit Function
+    End If
+
+    Dim standaloneDoc As Object
+    Dim openedByMacro As Boolean
+    If Not OpenStandaloneDocument(sourcePath, standaloneDoc, openedByMacro, failureMessage) Then Exit Function
+
+    Dim isoViewIndex As Long
+    isoViewIndex = SelectIsoViewForRecord(rec)
+    rec.Item("IsoView") = CStr(isoViewIndex)
+    rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "ISO_VIEW=" & CStr(isoViewIndex))
+    rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "HYBRID_STANDALONE_CAPTURE")
+
+    SetLogContext gCurrentLogItemIndex, "ITEM_CAPTURE_START", CStr(rec.Item("ThumbnailPath")), CStr(isoViewIndex)
+    WriteDebugPhase "ITEM_CAPTURE_START", gCurrentLogItemIndex, CStr(rec.Item("PartNumber")), "Standalone source=" & sourcePath & "; ISO_VIEW=" & CStr(isoViewIndex)
+    CATIA.StatusBar = "Standalone image " & CStr(gCurrentLogItemIndex) & " / " & CStr(gBomItems.Count) & " - " & CStr(rec.Item("PartNumber"))
+
+    ApplyImageCaptureView rec
+    If HasTimedOut(itemStart, itemTimeout) Then
+        failureMessage = "Timeout before standalone capture."
+        CloseStandaloneDocumentIfNeeded standaloneDoc, openedByMacro
+        ActivateMainProductDocument
+        Exit Function
+    End If
+
+    If CaptureCurrentViewer(imagePath, itemStart, itemTimeout) Then
+        If ENABLE_IMAGE_CROP And Not FAST_SNIP_MODE Then CropImageToContent imagePath
+        rec.Item("ImageFile") = gFSO.GetFileName(imagePath)
+        rec.Item("ImagePath") = imagePath
+        If EnsureThumbnailForRecord(rec) Then
+            rec.Item("ExportStatus") = "OK"
+            CacheImageForRecord rec
+        Else
+            rec.Item("ExportStatus") = "ERROR"
+            rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Thumbnail creation failed.")
+        End If
+        SetLogContext gCurrentLogItemIndex, "ITEM_CAPTURE_DONE", CStr(rec.Item("ThumbnailPath")), CStr(isoViewIndex)
+        AddLog CStr(rec.Item("PartNumber")), CStr(rec.Item("ExportStatus")), "Standalone image exported. ISO_VIEW=" & CStr(isoViewIndex), imagePath
+        WriteDebugPhase "ITEM_CAPTURE_DONE", gCurrentLogItemIndex, CStr(rec.Item("PartNumber")), "Standalone image=" & imagePath & "; Thumbnail=" & CStr(rec.Item("ThumbnailPath"))
+        TryCaptureStandaloneForRecord = True
+    Else
+        If HasTimedOut(itemStart, itemTimeout) Then
+            failureMessage = "Standalone capture timeout."
+        Else
+            failureMessage = "Standalone CaptureToFile failed."
+        End If
+    End If
+
+    CloseStandaloneDocumentIfNeeded standaloneDoc, openedByMacro
+    ActivateMainProductDocument
+    Exit Function
+
+StandaloneError:
+    failureMessage = Err.Description
+    On Error Resume Next
+    CloseStandaloneDocumentIfNeeded standaloneDoc, openedByMacro
+    ActivateMainProductDocument
+    Err.Clear
+End Function
+
+Private Function OpenStandaloneDocument(ByVal sourcePath As String, _
+                                        ByRef standaloneDoc As Object, _
+                                        ByRef openedByMacro As Boolean, _
+                                        ByRef failureMessage As String) As Boolean
+    On Error GoTo OpenFailed
+    Set standaloneDoc = Nothing
+    openedByMacro = False
+    failureMessage = ""
+
+    If FindOpenDocumentByFullName(sourcePath, standaloneDoc) Then
+        standaloneDoc.Activate
+        OpenStandaloneDocument = True
+        Exit Function
+    End If
+
+    Dim oldAlerts As Variant
+    Err.Clear
+    oldAlerts = CATIA.DisplayFileAlerts
+    Err.Clear
+    CATIA.DisplayFileAlerts = False
+    Set standaloneDoc = CATIA.Documents.Open(sourcePath)
+    CATIA.DisplayFileAlerts = oldAlerts
+    openedByMacro = True
+    standaloneDoc.Activate
+    OpenStandaloneDocument = Not standaloneDoc Is Nothing
+    Exit Function
+
+OpenFailed:
+    On Error Resume Next
+    CATIA.DisplayFileAlerts = oldAlerts
+    failureMessage = "Open standalone document failed: " & Err.Description
+    OpenStandaloneDocument = False
+    Err.Clear
+End Function
+
+Private Sub CloseStandaloneDocumentIfNeeded(ByVal standaloneDoc As Object, ByVal openedByMacro As Boolean)
+    On Error Resume Next
+    If standaloneDoc Is Nothing Then Exit Sub
+    If CLOSE_STANDALONE_DOCUMENT_AFTER_CAPTURE And openedByMacro Then
+        Dim oldAlerts As Variant
+        Err.Clear
+        oldAlerts = CATIA.DisplayFileAlerts
+        Err.Clear
+        CATIA.DisplayFileAlerts = False
+        If NEVER_SAVE_CATIA_DOCUMENTS Then
+            standaloneDoc.Close
+        Else
+            standaloneDoc.Close
+        End If
+        CATIA.DisplayFileAlerts = oldAlerts
+    End If
+    Err.Clear
+End Sub
+
+Private Function FindOpenDocumentByFullName(ByVal sourcePath As String, ByRef foundDoc As Object) As Boolean
+    On Error Resume Next
+    Dim i As Long
+    Dim doc As Object
+    For i = 1 To CATIA.Documents.Count
+        Set doc = CATIA.Documents.Item(i)
+        If SamePath(GetDocumentFullName(doc), sourcePath) Then
+            Set foundDoc = doc
+            FindOpenDocumentByFullName = True
+            Exit Function
+        End If
+    Next i
+    Err.Clear
+End Function
+
+Private Sub ActivateMainProductDocument()
+    On Error Resume Next
+    If Not gActiveDoc Is Nothing Then gActiveDoc.Activate
+    Err.Clear
+End Sub
+
+Private Sub EnsureAssemblyHideInitializedForFallback()
+    On Error Resume Next
+    ActivateMainProductDocument
+    If Not gAssemblyHideInitialized Then
+        SafeRestoreCatiaSession
+        HideAllComponents
+        gAssemblyHideInitialized = True
+    End If
+    Err.Clear
+End Sub
+
+Private Sub CacheImageForRecord(ByVal rec As Object)
+    On Error Resume Next
+    Dim cacheKey As String
+    Dim payload As String
+    cacheKey = ImageCacheKeyForRecord(rec)
+    If cacheKey = "" Then Exit Sub
+    If SafeRecValue(rec, "ImagePath") = "" Then Exit Sub
+    payload = SafeRecValue(rec, "ImagePath") & "|" & _
+              SafeRecValue(rec, "ThumbnailPath") & "|" & _
+              SafeRecValue(rec, "ImageFile") & "|" & _
+              SafeRecValue(rec, "ThumbnailFile")
+    gImageCaptureCache.Item(cacheKey) = payload
+    Err.Clear
+End Sub
+
+Private Function ReuseCachedImageForRecord(ByVal rec As Object) As Boolean
+    On Error Resume Next
+    Dim cacheKey As String
+    Dim payload As String
+    Dim parts As Variant
+    cacheKey = ImageCacheKeyForRecord(rec)
+    If cacheKey = "" Then Exit Function
+    If Not gImageCaptureCache.Exists(cacheKey) Then Exit Function
+
+    payload = CStr(gImageCaptureCache.Item(cacheKey))
+    parts = Split(payload, "|")
+    If UBound(parts) < 1 Then Exit Function
+    If Not gFSO.FileExists(CStr(parts(0))) Then Exit Function
+    If CStr(parts(1)) <> "" And Not gFSO.FileExists(CStr(parts(1))) Then Exit Function
+
+    rec.Item("ImagePath") = CStr(parts(0))
+    rec.Item("ImageFile") = gFSO.GetFileName(CStr(parts(0)))
+    rec.Item("ThumbnailPath") = CStr(parts(1))
+    If CStr(parts(1)) <> "" Then rec.Item("ThumbnailFile") = gFSO.GetFileName(CStr(parts(1)))
+    rec.Item("ExportStatus") = "EXISTING_REUSED"
+    rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "Image reused from current macro run cache.")
+    ReuseCachedImageForRecord = True
     Err.Clear
 End Function
 
@@ -1368,6 +1726,7 @@ End Sub
 
 Private Sub SafeRestoreCatiaSession()
     On Error Resume Next
+    ActivateMainProductDocument
     CATIA.RefreshDisplay = True
     If Not gActiveDoc Is Nothing Then gActiveDoc.Selection.Clear
     If Not gAllProducts Is Nothing Then SetVisibilityForCollection gAllProducts, True
@@ -1381,6 +1740,7 @@ Private Sub SafeRestoreCatiaSession()
     ApplyIsoViewAndFit
     If Not gActiveDoc Is Nothing Then gActiveDoc.Selection.Clear
     CATIA.StatusBar = ""
+    gAssemblyHideInitialized = False
     Err.Clear
 End Sub
 
@@ -2100,6 +2460,8 @@ Private Function GetBomCellValue(ByVal rec As Object, ByVal headerText As String
             GetBomCellValue = CStr(rec.Item("Revision"))
         Case "type", "componenttype"
             GetBomCellValue = CStr(rec.Item("Type"))
+        Case "sourcefilepath", "sourcefile", "filepath", "file"
+            GetBomCellValue = SafeRecValue(rec, "SourceFilePath")
         Case "nomenclature", "nomenklatura", "description", "opis"
             GetBomCellValue = CStr(rec.Item("Nomenclature"))
         Case "material", "materijal"
@@ -2462,6 +2824,9 @@ Private Sub UpdateSummarySheet()
     gWsSummary.Range("B10").Value = "TEST_MODE=" & CStr(TEST_MODE) & _
                                    "; TEST_MAX_ITEMS=" & CStr(TEST_MAX_ITEMS) & _
                                    "; HYBRID_PRODUCTION_MODE=" & CStr(HYBRID_PRODUCTION_MODE) & _
+                                   "; HYBRID_IMAGE_MODE=" & CStr(HYBRID_IMAGE_MODE) & _
+                                   "; PREFER_STANDALONE_PART_CAPTURE=" & CStr(PREFER_STANDALONE_PART_CAPTURE) & _
+                                   "; FALLBACK_TO_ASSEMBLY_HIDE_SHOW=" & CStr(FALLBACK_TO_ASSEMBLY_HIDE_SHOW) & _
                                    "; EXPORT_IMAGES=" & CStr(EXPORT_IMAGES) & _
                                    "; START_INDEX=" & CStr(START_INDEX) & _
                                    "; END_INDEX=" & CStr(END_INDEX) & _
@@ -2559,7 +2924,7 @@ Private Sub WriteBomRecordImmediate(ByVal rec As Object, ByVal includePicture As
         If SAVE_AFTER_EACH_IMAGE_BATCH And EXCEL_IMAGE_BATCH_SIZE > 0 Then
             If (gExcelImageInsertCount Mod EXCEL_IMAGE_BATCH_SIZE) = 0 Then SaveExcelCheckpoint
         End If
-    ElseIf includePicture And CStr(rec.Item("ExportStatus")) = "SKIPPED_FASTENER" Then
+    ElseIf includePicture And IsImageSkippedStatus(CStr(rec.Item("ExportStatus"))) Then
         DeletePicturesInCell gWsBom, gWsBom.Cells(rowIndex, gThumbnailColumnIndex)
         gWsBom.Cells(rowIndex, gThumbnailColumnIndex).Value = ""
     ElseIf includePicture And CStr(rec.Item("ExportStatus")) = "ERROR" Then
@@ -3028,6 +3393,55 @@ Private Function GetProductMass(ByVal prod As Object) As String
             If Err.Number = 0 And m <> 0 Then GetProductMass = Format$(m, "0.###")
         End If
     End If
+    Err.Clear
+End Function
+
+Private Function GetProductSourceFilePath(ByVal prod As Object) As String
+    On Error Resume Next
+
+    GetProductSourceFilePath = FindCatiaSourcePathInObjectChain(prod)
+    If IsSupportedCatiaSourceFile(GetProductSourceFilePath) Then Exit Function
+
+    Err.Clear
+    Dim refProd As Object
+    Set refProd = prod.ReferenceProduct
+    If Not refProd Is Nothing Then
+        GetProductSourceFilePath = FindCatiaSourcePathInObjectChain(refProd)
+        If IsSupportedCatiaSourceFile(GetProductSourceFilePath) Then Exit Function
+    End If
+
+    Err.Clear
+    GetProductSourceFilePath = ""
+End Function
+
+Private Function FindCatiaSourcePathInObjectChain(ByVal startObj As Object) As String
+    On Error Resume Next
+    Dim currentObj As Object
+    Dim i As Long
+    Dim candidate As String
+
+    Set currentObj = startObj
+    For i = 1 To 8
+        If currentObj Is Nothing Then Exit For
+        candidate = ""
+        candidate = CStr(currentObj.FullName)
+        If IsSupportedCatiaSourceFile(candidate) Then
+            FindCatiaSourcePathInObjectChain = candidate
+            Exit Function
+        End If
+        Err.Clear
+        Set currentObj = currentObj.Parent
+        If Err.Number <> 0 Then Exit For
+    Next i
+    Err.Clear
+End Function
+
+Private Function IsSupportedCatiaSourceFile(ByVal sourcePath As String) As Boolean
+    On Error Resume Next
+    Dim ext As String
+    If Trim$(sourcePath) = "" Then Exit Function
+    ext = LCase$(gFSO.GetExtensionName(sourcePath))
+    IsSupportedCatiaSourceFile = (ext = "catpart" Or ext = "catproduct")
     Err.Clear
 End Function
 

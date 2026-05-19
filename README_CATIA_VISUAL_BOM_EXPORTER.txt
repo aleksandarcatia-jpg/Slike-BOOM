@@ -42,6 +42,11 @@ Podrazumevana podesavanja za prvu proveru:
 - STOP_SCAN_AFTER_TEST_ITEMS=True
 - EXPORT_MAIN_ASSEMBLY_IMAGE=False
 - HYBRID_PRODUCTION_MODE=True
+- HYBRID_IMAGE_MODE=True
+- PREFER_STANDALONE_PART_CAPTURE=True
+- FALLBACK_TO_ASSEMBLY_HIDE_SHOW=True
+- CLOSE_STANDALONE_DOCUMENT_AFTER_CAPTURE=True
+- NEVER_SAVE_CATIA_DOCUMENTS=True
 - INSERT_IMAGES_IN_EXCEL=True
 - CREATE_THUMBNAIL_FILES=True
 - INSERT_THUMBNAIL_FILE_IN_EXCEL=True
@@ -65,6 +70,8 @@ Za full export:
 Vazno za velike sklopove:
 - Makro grupise po Part Number-u.
 - Jedna BOM stavka dobija jednu sliku, bez slikanja svih instanci.
+- Za slike makro prvo pokusava da nadje source CATPart/CATProduct fajl i capture uradi u posebnom dokumentu/prozoru. Ako to ne uspe, koristi se stari fallback hide/show u glavnom sklopu kada je FALLBACK_TO_ASSEMBLY_HIDE_SHOW=True.
+- Dokument koji makro sam otvori za standalone capture zatvara se bez snimanja. Glavni CATProduct se ne zatvara i ne snima.
 - U TEST_MODE=True makro zaustavlja BOM scan cim sakupi TEST_MAX_ITEMS jedinstvenih stavki, da ne cita ceo veliki sklop.
 - MAX_BOM_SCAN_SECONDS=0 znaci bez timeout prekida. Ako je vece od 0, upisuje se WARNING, ali full export se ne prekida automatski.
 - Quantity je broj pojavljivanja istog Part Number-a.
@@ -72,7 +79,7 @@ Vazno za velike sklopove:
 - Excel se kreira odmah i snima checkpoint posle prve slike, posle prvih 10 slika i zatim periodicno.
 - Ako slika vec postoji u IMAGES i thumbnail u THUMBNAILS, makro ih koristi ponovo.
 - Ako postoji full slika bez thumbnail-a, makro pokusava da napravi thumbnail i nastavi.
-- Standardni spojni elementi kao vijci, zavrtnji, matice/navrtke i podloske ostaju u BOM-u, ali dobijaju status SKIPPED_FASTENER i nemaju thumbnail kada je SKIP_FASTENER_IMAGES=True.
+- Standardni spojni elementi kao vijci, zavrtnji, matice/navrtke i podloske ostaju u BOM-u, ali dobijaju status SKIPPED_IMAGE_ONLY i nemaju thumbnail kada je SKIP_FASTENER_IMAGES=True.
 
 Excel:
 - Sheet SUMMARY: osnovni podaci, folder, debug log.

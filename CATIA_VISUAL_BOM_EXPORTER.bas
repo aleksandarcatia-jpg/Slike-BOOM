@@ -11,11 +11,11 @@ Option Explicit
 Private Const IMAGE_FORMAT As String = "png"
 Private Const FAST_SNIP_MODE As Boolean = True
 Private Const FAST_IMAGE_FORMAT As String = "jpg"
-Private Const FAST_ZOOM_IN_STEPS As Long = 1
+Private Const FAST_ZOOM_IN_STEPS As Long = 0
 Private Const FAST_CAPTURE_DELAY_SECONDS As Double = 0.05
 ' Veci FAST_CENTER_CROP_PERCENT znaci manje crop-a i vise prostora oko dela.
 ' Manji FAST_CENTER_CROP_PERCENT znaci jaci crop i blizi prikaz dela.
-Private Const FAST_CENTER_CROP_PERCENT As Double = 0.8
+Private Const FAST_CENTER_CROP_PERCENT As Double = 0.9
 Private Const MAX_SECONDS_PER_IMAGE As Double = 2
 Private Const EXPORT_PARTS As Boolean = True
 Private Const EXPORT_ASSEMBLIES As Boolean = True
@@ -1045,12 +1045,14 @@ Private Sub ApplyFastSnipView()
     viewer.Update
     DoEvents
 
-    Dim i As Long
-    For i = 1 To FAST_ZOOM_IN_STEPS
-        viewer.ZoomIn
-        viewer.Update
-        DoEvents
-    Next i
+    If FAST_ZOOM_IN_STEPS > 0 Then
+        Dim i As Long
+        For i = 1 To FAST_ZOOM_IN_STEPS
+            viewer.ZoomIn
+            viewer.Update
+            DoEvents
+        Next i
+    End If
 
     viewer.Update
     WaitSeconds FAST_CAPTURE_DELAY_SECONDS

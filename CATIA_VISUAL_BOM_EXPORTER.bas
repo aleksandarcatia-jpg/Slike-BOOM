@@ -16,6 +16,9 @@ Private Const FAST_CAPTURE_DELAY_SECONDS As Double = 0.05
 ' Veci FAST_CENTER_CROP_PERCENT znaci manje crop-a i vise prostora oko dela.
 ' Manji FAST_CENTER_CROP_PERCENT znaci jaci crop i blizi prikaz dela.
 Private Const FAST_CENTER_CROP_PERCENT As Double = 0.9
+Private Const AUTO_BEST_ISO_VIEW As Boolean = True
+Private Const ISO_VIEW_MODE As String = "AUTO_ROTATE"
+Private Const DEFAULT_ISO_VIEW_INDEX As Long = 1
 Private Const MAX_SECONDS_PER_IMAGE As Double = 2
 Private Const EXPORT_PARTS As Boolean = True
 Private Const EXPORT_ASSEMBLIES As Boolean = True
@@ -411,7 +414,7 @@ Private Sub ExportAllImages()
 
     TrySetCatiaWindowSize IMAGE_WIDTH, IMAGE_HEIGHT
     SafeRestoreCatiaSession
-    ApplyImageCaptureView
+    ApplyImageCaptureView Nothing
 
     Dim mainStart As Double
     mainStart = Timer
@@ -452,6 +455,7 @@ Private Sub ExportImageForBomRecord(ByVal rec As Object)
     Dim imageFile As String
     Dim itemStart As Double
     Dim itemTimeout As Double
+    Dim isoViewIndex As Long
 
     Set productRef = rec.Item("ProductRef")
     Set pathProducts = rec.Item("PathProducts")
@@ -482,7 +486,9 @@ Private Sub ExportImageForBomRecord(ByVal rec As Object)
         Exit Sub
     End If
 
-    ApplyImageCaptureView
+    isoViewIndex = SelectIsoViewForRecord(rec)
+    rec.Item("Note") = AppendNote(CStr(rec.Item("Note")), "ISO_VIEW=" & CStr(isoViewIndex))
+    ApplyImageCaptureView rec
 
     If HasTimedOut(itemStart, itemTimeout) Then
         rec.Item("ImageFile") = imageFile
@@ -499,7 +505,7 @@ Private Sub ExportImageForBomRecord(ByVal rec As Object)
         rec.Item("ImageFile") = imageFile
         rec.Item("ImagePath") = imagePath
         rec.Item("ExportStatus") = "OK"
-        AddLog CStr(rec.Item("PartNumber")), "OK", "Image exported.", imagePath
+        AddLog CStr(rec.Item("PartNumber")), "OK", "Image exported. ISO_VIEW=" & CStr(isoViewIndex), imagePath
     Else
         rec.Item("ImageFile") = imageFile
         rec.Item("ImagePath") = imagePath
@@ -981,15 +987,15 @@ Private Sub SetVisibilityForCollection(ByVal products As Collection, ByVal showI
     Err.Clear
 End Sub
 
-Private Sub ApplyImageCaptureView()
+Private Sub ApplyImageCaptureView(ByVal rec As Object)
     If FAST_SNIP_MODE Then
-        ApplyFastSnipView
+        ApplyFastSnipView rec
     Else
         ApplyIsoViewAndFit
     End If
 End Sub
 
-Private Sub ApplyFastSnipView()
+Private Sub ApplyFastSnipView(ByVal rec As Object)
     On Error Resume Next
 
     Dim viewer As Object
@@ -1020,25 +1026,9 @@ Private Sub ApplyFastSnipView()
         End If
     End If
 
-    Dim vp As Object
-    Set vp = viewer.Viewpoint3D
-
-    Dim sight(2) As Double
-    Dim up(2) As Double
-    sight(0) = 1#
-    sight(1) = -1#
-    sight(2) = 1#
-    up(0) = -0.4082482905
-    up(1) = 0.4082482905
-    up(2) = 0.8164965809
-
-    vp.PutSightDirection sight
-    vp.PutUpDirection up
-    If USE_PARALLEL_PROJECTION Then
-        Err.Clear
-        vp.ProjectionMode = CAT_PROJECTION_CYLINDRIC
-        Err.Clear
-    End If
+    Dim viewIndex As Long
+    viewIndex = SelectIsoViewForRecord(rec)
+    ApplyIsoViewByIndex viewIndex
 
     viewer.Update
     viewer.Reframe
@@ -1058,6 +1048,135 @@ Private Sub ApplyFastSnipView()
     WaitSeconds FAST_CAPTURE_DELAY_SECONDS
     Err.Clear
 End Sub
+
+Private Sub ApplyIsoViewByIndex(ByVal viewIndex As Long)
+    On Error Resume Next
+
+    Dim viewer As Object
+    Dim vp As Object
+    Dim sight(2) As Double
+    Dim up(2) As Double
+    Dim idx As Long
+
+    idx = NormalizeIsoViewIndex(viewIndex)
+    Set viewer = CATIA.ActiveWindow.ActiveViewer
+    viewer.Activate
+    Set vp = viewer.Viewpoint3D
+
+    Select Case idx
+        Case 2
+            sight(0) = -1#
+            sight(1) = -1#
+            sight(2) = 1#
+            up(0) = 0.4082482905
+            up(1) = 0.4082482905
+            up(2) = 0.8164965809
+        Case 3
+            sight(0) = 1#
+            sight(1) = 1#
+            sight(2) = 1#
+            up(0) = -0.4082482905
+            up(1) = -0.4082482905
+            up(2) = 0.8164965809
+        Case 4
+            sight(0) = -1#
+            sight(1) = 1#
+            sight(2) = 1#
+            up(0) = 0.4082482905
+            up(1) = -0.4082482905
+            up(2) = 0.8164965809
+        Case Else
+            sight(0) = 1#
+            sight(1) = -1#
+            sight(2) = 1#
+            up(0) = -0.4082482905
+            up(1) = 0.4082482905
+            up(2) = 0.8164965809
+    End Select
+
+    vp.PutSightDirection sight
+    vp.PutUpDirection up
+    If USE_PARALLEL_PROJECTION Then
+        Err.Clear
+        vp.ProjectionMode = CAT_PROJECTION_CYLINDRIC
+        Err.Clear
+    End If
+    Err.Clear
+End Sub
+
+Private Function SelectIsoViewForRecord(ByVal rec As Object) As Long
+    On Error Resume Next
+
+    Dim searchText As String
+    Dim itemNo As Long
+    Dim modeText As String
+    Dim plocaAccent As String
+    Dim nosacAccent As String
+
+    SelectIsoViewForRecord = NormalizeIsoViewIndex(DEFAULT_ISO_VIEW_INDEX)
+    If Not AUTO_BEST_ISO_VIEW Then Exit Function
+
+    searchText = IsoRecordSearchText(rec)
+    itemNo = IsoRecordNo(rec)
+    modeText = UCase$(CStr(ISO_VIEW_MODE))
+    plocaAccent = "plo" & ChrW$(269) & "a"
+    nosacAccent = "nosa" & ChrW$(269)
+
+    If InStr(searchText, "cev") > 0 Or InStr(searchText, "pipe") > 0 Or InStr(searchText, "tube") > 0 Then
+        SelectIsoViewForRecord = 2
+    ElseIf InStr(searchText, "luk") > 0 Or InStr(searchText, "koleno") > 0 Then
+        SelectIsoViewForRecord = 3
+    ElseIf InStr(searchText, "ploca") > 0 Or InStr(searchText, plocaAccent) > 0 Or InStr(searchText, "plate") > 0 Or InStr(searchText, "lim") > 0 Then
+        If (itemNo Mod 2) = 0 Then
+            SelectIsoViewForRecord = 3
+        Else
+            SelectIsoViewForRecord = 1
+        End If
+    ElseIf InStr(searchText, "uska") > 0 Or InStr(searchText, "nosac") > 0 Or InStr(searchText, nosacAccent) > 0 Or InStr(searchText, "bracket") > 0 Then
+        SelectIsoViewForRecord = 2
+    ElseIf modeText = "AUTO_ROTATE" Then
+        SelectIsoViewForRecord = ((itemNo - 1) Mod 4) + 1
+    End If
+
+    SelectIsoViewForRecord = NormalizeIsoViewIndex(SelectIsoViewForRecord)
+    Err.Clear
+End Function
+
+Private Function IsoRecordSearchText(ByVal rec As Object) As String
+    On Error Resume Next
+    IsoRecordSearchText = ""
+    If Not rec Is Nothing Then
+        IsoRecordSearchText = LCase$(SafeText(CStr(rec.Item("PartNumber")) & " " & CStr(rec.Item("Nomenclature"))))
+    End If
+    If Err.Number <> 0 Then
+        IsoRecordSearchText = ""
+        Err.Clear
+    End If
+End Function
+
+Private Function IsoRecordNo(ByVal rec As Object) As Long
+    On Error Resume Next
+    IsoRecordNo = 1
+    If Not rec Is Nothing Then IsoRecordNo = CLng(rec.Item("No"))
+    If Err.Number <> 0 Or IsoRecordNo < 1 Then
+        IsoRecordNo = 1
+        Err.Clear
+    End If
+End Function
+
+Private Function NormalizeIsoViewIndex(ByVal viewIndex As Long) As Long
+    On Error Resume Next
+    Dim idx As Long
+    idx = CLng(viewIndex)
+    If Err.Number <> 0 Then
+        idx = 1
+        Err.Clear
+    End If
+    Do While idx < 1
+        idx = idx + 4
+    Loop
+    NormalizeIsoViewIndex = ((idx - 1) Mod 4) + 1
+End Function
 
 Private Sub ApplyIsoViewAndFit()
     On Error Resume Next

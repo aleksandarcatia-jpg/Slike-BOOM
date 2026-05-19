@@ -63,8 +63,11 @@ Private Const IMAGE_WIDTH As Long = 1000
 Private Const IMAGE_HEIGHT As Long = 750
 Private Const INSERT_IMAGES_IN_EXCEL As Boolean = True
 Private Const TEST_MODE As Boolean = True
-Private Const TEST_MAX_ITEMS As Long = 10
+Private Const TEST_MAX_ITEMS As Long = 50
 Private Const VISIBILITY_BATCH_SIZE As Long = 200
+Private Const SKIP_FASTENER_IMAGES As Boolean = True
+Private Const SKIP_FASTENER_ROWS As Boolean = False
+Private Const FASTENER_KEYWORDS As String = "vijak|vijci|zavrtanj|zavrtnji|screw|bolt|hex bolt|hexagon bolt|imbus|allen screw|navrtka|matica|nut|hex nut|podloska|washer|plain washer|spring washer|lock washer|DIN 125|DIN125|DIN 127|DIN127|DIN 933|DIN933|DIN 931|DIN931|DIN 934|DIN934|ISO 4014|ISO 4017|ISO 4032|ISO 7089|ISO 7090"
 Private Const OUTPUT_TO_DESKTOP As Boolean = True
 
 ' CATIA VisProperties show constants.
@@ -455,13 +458,17 @@ Private Sub AddOrUpdateBomItem(ByVal prod As Object, _
                                ByVal pathProducts As Collection)
     On Error GoTo AddError
 
-    gTotalInstances = gTotalInstances + 1
-
     Dim pn As String
     Dim key As String
     Dim rec As Object
 
     pn = GetProductPartNumber(prod)
+    If SKIP_FASTENER_ROWS And IsFastenerProduct(prod, pn) Then
+        WriteDebugPhase "ITEM_SKIPPED_FASTENER", 0, pn, "Fastener row skipped by SKIP_FASTENER_ROWS."
+        Exit Sub
+    End If
+
+    gTotalInstances = gTotalInstances + 1
     If pn <> "" Then
         key = "PN|" & UCase$(Trim$(pn))
     Else
@@ -618,7 +625,7 @@ Private Sub ExportAllImages()
             WriteDebugPhase "SAVE_CHECKPOINT", itemIndex, CStr(rec.Item("PartNumber")), "Periodic save."
         End If
 
-        If gSuccessfulImageCount = 0 And FIRST_IMAGE_TIMEOUT_SECONDS > 0 And HasTimedOut(firstImageStart, FIRST_IMAGE_TIMEOUT_SECONDS) Then
+        If CStr(rec.Item("ExportStatus")) <> "SKIPPED_FASTENER" And gSuccessfulImageCount = 0 And FIRST_IMAGE_TIMEOUT_SECONDS > 0 And HasTimedOut(firstImageStart, FIRST_IMAGE_TIMEOUT_SECONDS) Then
             gAbortMessage = "Prva slika nije napravljena u roku od " & CStr(FIRST_IMAGE_TIMEOUT_SECONDS) & " sekundi. Export je prekinut."
             WriteDebugPhase "ITEM_TIMEOUT", itemIndex, CStr(rec.Item("PartNumber")), gAbortMessage
             Exit For
@@ -675,6 +682,20 @@ Private Function ExportImageForBomRecord(ByVal rec As Object, ByVal previousVisi
     Set pathProducts = rec.Item("PathProducts")
     itemStart = Timer
     itemTimeout = ImageTimeoutSeconds()
+
+    If SKIP_FASTENER_IMAGES And IsFastenerItem(rec) Then
+        rec.Item("ImageFile") = ""
+        rec.Item("ImagePath") = ""
+        rec.Item("ThumbnailFile") = ""
+        rec.Item("ThumbnailPath") = ""
+        rec.Item("ExportStatus") = "SKIPPED_FASTENER"
+        rec.Item("Note") = "Image skipped for standard fastener"
+        SetLogContext gCurrentLogItemIndex, "ITEM_SKIPPED_FASTENER", "", CStr(rec.Item("IsoView"))
+        AddLog CStr(rec.Item("PartNumber")), "SKIPPED_FASTENER", "Image skipped for standard fastener.", ""
+        WriteDebugPhase "ITEM_SKIPPED_FASTENER", gCurrentLogItemIndex, CStr(rec.Item("PartNumber")), CStr(rec.Item("Nomenclature"))
+        Set ExportImageForBomRecord = previousVisibleProducts
+        Exit Function
+    End If
 
     imageFile = BuildUniqueImageFileName(CStr(rec.Item("PartNumber")), CStr(rec.Item("Nomenclature")), CLng(rec.Item("No")))
     imagePath = JoinPath(gImageFolder, imageFile)
@@ -1971,6 +1992,81 @@ Private Function NormalizeHeaderName(ByVal valueText As String) As String
     NormalizeHeaderName = s
 End Function
 
+Private Function IsFastenerProduct(ByVal prod As Object, ByVal partNumber As String) As Boolean
+    On Error Resume Next
+    Dim rec As Object
+    Set rec = CreateObject("Scripting.Dictionary")
+    rec.Add "PartNumber", partNumber
+    rec.Add "Nomenclature", GetProductNomenclature(prod)
+    rec.Add "Standard", GetPropertyValue(prod, "Standard")
+    rec.Add "Type", GetProductBomType(prod)
+    rec.Add "ProductRef", prod
+    IsFastenerProduct = IsFastenerItem(rec)
+    Err.Clear
+End Function
+
+Private Function IsFastenerItem(ByVal rec As Object) As Boolean
+    On Error Resume Next
+    Dim prod As Object
+    Dim scanText As String
+    Dim keywords As Variant
+    Dim kw As Variant
+    Dim normalizedKw As String
+
+    scanText = SafeRecValue(rec, "PartNumber") & " " & _
+               SafeRecValue(rec, "Nomenclature") & " " & _
+               SafeRecValue(rec, "Standard") & " " & _
+               SafeRecValue(rec, "Type")
+
+    If rec.Exists("ProductRef") Then
+        Set prod = rec.Item("ProductRef")
+        If Not prod Is Nothing Then
+            scanText = scanText & " " & GetPropertyValue(prod, "Keywords", "Keyword", "Description", "Opis", "Component Type", "ComponentType", "Standard", "Nomenclature")
+        End If
+    End If
+
+    scanText = NormalizeFastenerText(scanText)
+    keywords = Split(FASTENER_KEYWORDS, "|")
+    For Each kw In keywords
+        normalizedKw = NormalizeFastenerText(CStr(kw))
+        If normalizedKw <> "" Then
+            If InStr(1, scanText, normalizedKw, vbTextCompare) > 0 Then
+                IsFastenerItem = True
+                Exit Function
+            End If
+        End If
+    Next kw
+    Err.Clear
+End Function
+
+Private Function SafeRecValue(ByVal rec As Object, ByVal keyName As String) As String
+    On Error Resume Next
+    If rec.Exists(keyName) Then SafeRecValue = CStr(rec.Item(keyName))
+    Err.Clear
+End Function
+
+Private Function NormalizeFastenerText(ByVal valueText As String) As String
+    Dim s As String
+    s = LCase$(CStr(valueText))
+    s = Replace(s, ChrW$(&H10D), "c")
+    s = Replace(s, ChrW$(&H107), "c")
+    s = Replace(s, ChrW$(&H161), "s")
+    s = Replace(s, ChrW$(&H111), "d")
+    s = Replace(s, ChrW$(&H17E), "z")
+    s = Replace(s, ".", " ")
+    s = Replace(s, "-", " ")
+    s = Replace(s, "_", " ")
+    s = Replace(s, "/", " ")
+    s = Replace(s, "\", " ")
+    s = Replace(s, vbTab, " ")
+    s = Replace(s, vbCr, " ")
+    s = Replace(s, vbLf, " ")
+    Do While InStr(1, s, "  ", vbTextCompare) > 0
+        s = Replace(s, "  ", " ")
+    Loop
+    NormalizeFastenerText = Trim$(s)
+End Function
+
 Private Function GetBomCellValue(ByVal rec As Object, ByVal headerText As String) As String
     On Error Resume Next
     Select Case NormalizeHeaderName(headerText)
@@ -2257,11 +2353,16 @@ Private Sub PrepareSummarySheetImmediate()
     gWsSummary.Range("A9").Value = "Excel File"
     gWsSummary.Range("A10").Value = "Mode"
     gWsSummary.Range("A11").Value = "Debug Log"
-    gWsSummary.Range("A13").Value = "Main Assembly Preview"
-    gWsSummary.Range("A3:A13").Font.Bold = True
+    gWsSummary.Range("A12").Value = "Total BOM Items"
+    gWsSummary.Range("A13").Value = "Image Export Items"
+    gWsSummary.Range("A14").Value = "Skipped Fasteners"
+    gWsSummary.Range("A15").Value = "Errors"
+    gWsSummary.Range("A16").Value = "Timeout Items"
+    gWsSummary.Range("A18").Value = "Main Assembly Preview"
+    gWsSummary.Range("A3:A18").Font.Bold = True
     gWsSummary.Columns("A").ColumnWidth = 28
     gWsSummary.Columns("B").ColumnWidth = 95
-    gWsSummary.Rows("14:31").RowHeight = 22
+    gWsSummary.Rows("19:36").RowHeight = 22
     ApplyUsedRangeBorders gWsSummary
     Err.Clear
 End Sub
@@ -2346,14 +2447,47 @@ Private Sub UpdateSummarySheet()
                                    "; END_INDEX=" & CStr(END_INDEX) & _
                                    "; BOM_COLUMNS=" & gCatiaBomColumnsSource
     gWsSummary.Range("B11").Value = gDebugLogPath
+    gWsSummary.Range("B12").Value = gBomItems.Count
+    gWsSummary.Range("B13").Value = CountImageExportItems()
+    gWsSummary.Range("B14").Value = CountFastenerItems()
+    gWsSummary.Range("B15").Value = CountBomItemsByStatus("ERROR")
+    gWsSummary.Range("B16").Value = CountBomItemsByStatus("TIMEOUT")
 
     If EXPORT_MAIN_ASSEMBLY_IMAGE And EXPORT_IMAGES And INSERT_IMAGES_IN_EXCEL And Not gMainPreviewInserted And gFSO.FileExists(gMainImagePath) Then
-        InsertPictureIntoRange gWsSummary, gMainImagePath, "A14:D31"
+        InsertPictureIntoRange gWsSummary, gMainImagePath, "A19:D36"
         gMainPreviewInserted = True
     End If
     ApplyUsedRangeBorders gWsSummary
     Err.Clear
 End Sub
+
+Private Function CountFastenerItems() As Long
+    On Error Resume Next
+    Dim key As Variant
+    Dim rec As Object
+    For Each key In gBomItems.Keys
+        Set rec = gBomItems.Item(CStr(key))
+        If IsFastenerItem(rec) Then CountFastenerItems = CountFastenerItems + 1
+    Next key
+    Err.Clear
+End Function
+
+Private Function CountImageExportItems() As Long
+    CountImageExportItems = gBomItems.Count
+    If SKIP_FASTENER_IMAGES Then CountImageExportItems = gBomItems.Count - CountFastenerItems()
+    If CountImageExportItems < 0 Then CountImageExportItems = 0
+End Function
+
+Private Function CountBomItemsByStatus(ByVal statusText As String) As Long
+    On Error Resume Next
+    Dim key As Variant
+    Dim rec As Object
+    For Each key In gBomItems.Keys
+        Set rec = gBomItems.Item(CStr(key))
+        If UCase$(CStr(rec.Item("ExportStatus"))) = UCase$(statusText) Then CountBomItemsByStatus = CountBomItemsByStatus + 1
+    Next key
+    Err.Clear
+End Function
 
 Private Sub WriteBomRecordImmediate(ByVal rec As Object, ByVal includePicture As Boolean)
     On Error Resume Next
@@ -2405,6 +2539,9 @@ Private Sub WriteBomRecordImmediate(ByVal rec As Object, ByVal includePicture As
         If SAVE_AFTER_EACH_IMAGE_BATCH And EXCEL_IMAGE_BATCH_SIZE > 0 Then
             If (gExcelImageInsertCount Mod EXCEL_IMAGE_BATCH_SIZE) = 0 Then SaveExcelCheckpoint
         End If
+    ElseIf includePicture And CStr(rec.Item("ExportStatus")) = "SKIPPED_FASTENER" Then
+        DeletePicturesInCell gWsBom, gWsBom.Cells(rowIndex, gThumbnailColumnIndex)
+        gWsBom.Cells(rowIndex, gThumbnailColumnIndex).Value = ""
     ElseIf includePicture And CStr(rec.Item("ExportStatus")) = "ERROR" Then
         gWsBom.Cells(rowIndex, gThumbnailColumnIndex).Value = "ERROR"
     End If
@@ -2768,6 +2905,15 @@ InsertFailed:
     AddLog "", "WARNING", "Excel nije uspeo da ubaci sliku: " & imagePath & " | " & Err.Description, imagePath
     Err.Clear
 End Function
+
+Private Sub DeletePicturesInCell(ByVal ws As Object, ByVal cell As Object)
+    On Error Resume Next
+    Dim shp As Object
+    For Each shp In ws.Shapes
+        If shp.TopLeftCell.Row = cell.Row And shp.TopLeftCell.Column = cell.Column Then shp.Delete
+    Next shp
+    Err.Clear
+End Sub
 
 Private Sub InsertPictureIntoRange(ByVal ws As Object, ByVal imagePath As String, ByVal rangeAddress As String)
     On Error GoTo InsertFailed

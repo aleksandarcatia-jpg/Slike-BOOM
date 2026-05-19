@@ -38,7 +38,7 @@ U njemu se prave:
 
 Podrazumevana podesavanja za prvu proveru:
 - TEST_MODE=True
-- TEST_MAX_ITEMS=10
+- TEST_MAX_ITEMS=50
 - EXPORT_MAIN_ASSEMBLY_IMAGE=False
 - HYBRID_PRODUCTION_MODE=True
 - INSERT_IMAGES_IN_EXCEL=True
@@ -50,6 +50,8 @@ Podrazumevana podesavanja za prvu proveru:
 - FAST_CENTER_CROP_PERCENT=0.90
 - RESUME_MODE=True
 - SKIP_EXISTING_IMAGES=True
+- SKIP_FASTENER_IMAGES=True
+- SKIP_FASTENER_ROWS=False
 - START_INDEX=1
 - END_INDEX=0
 
@@ -66,6 +68,7 @@ Vazno za velike sklopove:
 - Excel se kreira odmah i snima checkpoint posle prve slike, posle prvih 10 slika i zatim periodicno.
 - Ako slika vec postoji u IMAGES i thumbnail u THUMBNAILS, makro ih koristi ponovo.
 - Ako postoji full slika bez thumbnail-a, makro pokusava da napravi thumbnail i nastavi.
+- Standardni spojni elementi kao vijci, zavrtnji, matice/navrtke i podloske ostaju u BOM-u, ali dobijaju status SKIPPED_FASTENER i nemaju thumbnail kada je SKIP_FASTENER_IMAGES=True.
 
 Excel:
 - Sheet SUMMARY: osnovni podaci, folder, debug log.

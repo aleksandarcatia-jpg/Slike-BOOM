@@ -39,6 +39,7 @@ U njemu se prave:
 Podrazumevana podesavanja za prvu proveru:
 - TEST_MODE=True
 - TEST_MAX_ITEMS=50
+- STOP_SCAN_AFTER_TEST_ITEMS=True
 - EXPORT_MAIN_ASSEMBLY_IMAGE=False
 - HYBRID_PRODUCTION_MODE=True
 - INSERT_IMAGES_IN_EXCEL=True
@@ -58,11 +59,14 @@ Podrazumevana podesavanja za prvu proveru:
 Za full export:
 1. U kodu podesite TEST_MODE=False.
 2. Ostavite MAX_ITEMS_TO_EXPORT=0.
-3. Po potrebi koristite START_INDEX / END_INDEX za batch rad, npr. 1-200, 201-400.
+3. Ostavite MAX_BOM_SCAN_SECONDS=0 ako zelite da veliki sklop skenira koliko god treba.
+4. Po potrebi koristite START_INDEX / END_INDEX za batch rad, npr. 1-200, 201-400.
 
 Vazno za velike sklopove:
 - Makro grupise po Part Number-u.
 - Jedna BOM stavka dobija jednu sliku, bez slikanja svih instanci.
+- U TEST_MODE=True makro zaustavlja BOM scan cim sakupi TEST_MAX_ITEMS jedinstvenih stavki, da ne cita ceo veliki sklop.
+- MAX_BOM_SCAN_SECONDS=0 znaci bez timeout prekida. Ako je vece od 0, upisuje se WARNING, ali full export se ne prekida automatski.
 - Quantity je broj pojavljivanja istog Part Number-a.
 - Ako Part Number ne postoji, koristi se TreePath fallback.
 - Excel se kreira odmah i snima checkpoint posle prve slike, posle prvih 10 slika i zatim periodicno.

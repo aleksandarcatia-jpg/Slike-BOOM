@@ -22,7 +22,7 @@ Private Const DEFAULT_ISO_VIEW_INDEX As Long = 1
 Private Const MAX_SECONDS_PER_IMAGE As Double = 5
 Private Const EXPORT_MAIN_ASSEMBLY_IMAGE As Boolean = False
 Private Const HYBRID_PRODUCTION_MODE As Boolean = True
-Private Const MAX_BOM_SCAN_SECONDS As Double = 300
+Private Const MAX_BOM_SCAN_SECONDS As Double = 0
 Private Const FIRST_IMAGE_TIMEOUT_SECONDS As Double = 120
 Private Const ITEM_TIMEOUT_SECONDS As Double = 5
 Private Const EXPORT_PARTS As Boolean = True
@@ -64,6 +64,7 @@ Private Const IMAGE_HEIGHT As Long = 750
 Private Const INSERT_IMAGES_IN_EXCEL As Boolean = True
 Private Const TEST_MODE As Boolean = True
 Private Const TEST_MAX_ITEMS As Long = 50
+Private Const STOP_SCAN_AFTER_TEST_ITEMS As Boolean = True
 Private Const VISIBILITY_BATCH_SIZE As Long = 200
 Private Const SKIP_FASTENER_IMAGES As Boolean = True
 Private Const SKIP_FASTENER_ROWS As Boolean = False
@@ -136,6 +137,7 @@ Private gEffectiveStartIndex As Long
 Private gExcelImageInsertCount As Long
 Private gBomScanStart As Double
 Private gBomScanTimedOut As Boolean
+Private gTestScanLimitReached As Boolean
 Private gAbortMessage As String
 Private gSuccessfulImageCount As Long
 Private gCurrentLogItemIndex As Long
@@ -169,6 +171,7 @@ Public Sub CATIA_VISUAL_BOM_EXPORTER()
     gExcelImageInsertCount = 0
     gBomScanStart = 0
     gBomScanTimedOut = False
+    gTestScanLimitReached = False
     gAbortMessage = ""
     gSuccessfulImageCount = 0
     gCurrentLogItemIndex = 0
@@ -206,14 +209,10 @@ Public Sub CATIA_VISUAL_BOM_EXPORTER()
     WriteDebugPhase "BOM_SCAN_START", 0, GetProductPartNumber(gRootProduct), "Product tree scan started."
     gBomScanStart = Timer
     gBomScanTimedOut = False
+    gTestScanLimitReached = False
     BuildBomFromProductTree gRootProduct
     If gBomScanTimedOut Then
-        gAbortMessage = "BOM scan traje duze od " & CStr(MAX_BOM_SCAN_SECONDS) & " sekundi. Export je prekinut pre slika."
-        WriteDebugPhase "ITEM_TIMEOUT", 0, "", gAbortMessage
-        SafeRestoreCatiaSession
-        FinalizeExcelReportImmediate
-        MsgBox gAbortMessage & vbCrLf & vbCrLf & "Detalji su u DEBUG_PHASE_LOG.txt.", vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
-        Exit Sub
+        AddLog GetProductPartNumber(gRootProduct), "WARNING", "BOM scan exceeded MAX_BOM_SCAN_SECONDS but export continues.", ""
     End If
     WriteDebugPhase "BOM_SCAN_DONE", 0, GetProductPartNumber(gRootProduct), "Product tree scan finished."
     WriteDebugPhase "UNIQUE_ITEMS_COUNT", gBomItems.Count, "", "Unique BOM items: " & CStr(gBomItems.Count) & "; total exported instances: " & CStr(gTotalInstances)
@@ -345,11 +344,13 @@ Private Sub TraverseProductChildren(ByVal parentProduct As Object, _
                                     ByVal selectedProducts As Collection, _
                                     ByVal parentWasSelected As Boolean)
     On Error GoTo TraverseError
-    If gBomScanTimedOut Then Exit Sub
-    If gBomScanStart > 0 And HasTimedOut(gBomScanStart, MAX_BOM_SCAN_SECONDS) Then
-        gBomScanTimedOut = True
-        WriteDebugPhase "BOM_SCAN_PROGRESS", gAllProducts.Count, "", "BOM scan timeout reached."
+    If ShouldStopScanAfterTestItems() Then
+        MarkTestScanLimitReached
         Exit Sub
+    End If
+    If MAX_BOM_SCAN_SECONDS > 0 And Not gBomScanTimedOut And gBomScanStart > 0 And HasTimedOut(gBomScanStart, MAX_BOM_SCAN_SECONDS) Then
+        gBomScanTimedOut = True
+        WriteDebugPhase "BOM_SCAN_PROGRESS", gAllProducts.Count, "", "WARNING: BOM scan timeout reached; export will continue."
     End If
 
     Dim children As Object
@@ -358,11 +359,13 @@ Private Sub TraverseProductChildren(ByVal parentProduct As Object, _
     Dim i As Long
     For i = 1 To children.Count
         DoEvents
-        If gBomScanTimedOut Then Exit For
-        If gBomScanStart > 0 And HasTimedOut(gBomScanStart, MAX_BOM_SCAN_SECONDS) Then
-            gBomScanTimedOut = True
-            WriteDebugPhase "BOM_SCAN_PROGRESS", gAllProducts.Count, "", "BOM scan timeout reached."
+        If ShouldStopScanAfterTestItems() Then
+            MarkTestScanLimitReached
             Exit For
+        End If
+        If MAX_BOM_SCAN_SECONDS > 0 And Not gBomScanTimedOut And gBomScanStart > 0 And HasTimedOut(gBomScanStart, MAX_BOM_SCAN_SECONDS) Then
+            gBomScanTimedOut = True
+            WriteDebugPhase "BOM_SCAN_PROGRESS", gAllProducts.Count, "", "WARNING: BOM scan timeout reached; export will continue."
         End If
 
         Dim child As Object
@@ -392,8 +395,12 @@ Private Sub TraverseProductChildren(ByVal parentProduct As Object, _
         If ShouldExportProduct(child, childSelected) Then
             AddOrUpdateBomItem child, parentAssemblyName, childTreePath, childPathProducts
         End If
+        If ShouldStopScanAfterTestItems() Then
+            MarkTestScanLimitReached
+            Exit For
+        End If
 
-        If HasChildren(child) And Not gBomScanTimedOut Then
+        If HasChildren(child) And Not ShouldStopScanAfterTestItems() Then
             TraverseProductChildren child, childLabel, childTreePath, childPathProducts, selectedProducts, childSelected
         End If
     Next i
@@ -402,6 +409,19 @@ Private Sub TraverseProductChildren(ByVal parentProduct As Object, _
 TraverseError:
     AddLog "", "WARNING", "Ne mogu potpuno da procitam decu sklopa '" & SafeText(parentProduct.Name) & "': " & Err.Description, ""
     Err.Clear
+End Sub
+
+Private Function ShouldStopScanAfterTestItems() As Boolean
+    If TEST_MODE And STOP_SCAN_AFTER_TEST_ITEMS And TEST_MAX_ITEMS > 0 Then
+        ShouldStopScanAfterTestItems = (gBomItems.Count >= TEST_MAX_ITEMS)
+    End If
+End Function
+
+Private Sub MarkTestScanLimitReached()
+    If Not gTestScanLimitReached Then
+        gTestScanLimitReached = True
+        WriteDebugPhase "BOM_SCAN_DONE", gBomItems.Count, "", "TEST item limit reached; stopping BOM scan early."
+    End If
 End Sub
 
 Private Function GetSelectedProducts() As Collection

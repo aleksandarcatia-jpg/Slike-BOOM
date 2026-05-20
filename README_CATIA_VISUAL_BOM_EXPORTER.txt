@@ -11,21 +11,23 @@ Fajlovi:
 Osnovna logika:
 1. Korisnik otvori glavni CATProduct u CATIA V5.
 2. Makro proveri da je aktivni dokument CATProduct.
-3. Makro uzme CATIA BOM objekat:
+3. Makro pita korisnika da izabere folder preko Windows folder picker-a.
+4. Makro sam pravi XLS putanju:
+   <RootPartNumber>_VISUAL_BOM_EXPORT.xls
+5. Makro uzme CATIA BOM objekat:
    product1.GetItem("BillOfMaterial")
-4. Makro podesi BOM format:
+6. Makro podesi BOM format:
    Nomenclature, Quantity, Part Number, Dimenzija, Material, Mass, Standard.
-5. Makro pita korisnika gde zeli da sacuva Excel preko Save As dialoga.
-6. Makro eksportuje CATIA BOM direktno u XLS:
-   assemblyConvertor1.Print "XLS", selectedPath, product1
-7. Makro otvara taj isti Excel fajl i dodaje samo pomocne kolone:
+7. Makro eksportuje CATIA BOM direktno u XLS:
+   assemblyConvertor1.Print "XLS", bomExcelPath, product1
+8. Makro otvara taj isti Excel fajl i dodaje samo pomocne kolone:
    Thumbnail, Image Path, Thumbnail Path, Export Status, Image Skip Reason.
-8. Product Tree se koristi samo za indeks:
+9. Product Tree se koristi samo za indeks:
    Part Number -> source CATPart/CATProduct path.
-9. Za svaki BOM red kome treba slika, makro otvara source CATPart/CATProduct kao standalone dokument/prozor.
-10. Makro napravi JPG sliku, napravi mali thumbnail i ubaci thumbnail u Excel.
-11. Makro zatvara samo dokument koji je sam otvorio za slikanje, bez snimanja.
-12. Excel ostaje otvoren korisniku.
+10. Za svaki BOM red kome treba slika, makro otvara source CATPart/CATProduct kao standalone dokument/prozor.
+11. Makro napravi JPG sliku, napravi mali thumbnail i ubaci thumbnail u Excel.
+12. Makro zatvara samo dokument koji je sam otvorio za slikanje, bez snimanja.
+13. Excel ostaje otvoren korisniku.
 
 Sta makro NE radi:
 - Ne pravi BOM iz Product Tree-a.
@@ -38,21 +40,28 @@ Sta makro NE radi:
 - Ne snima CATPart/CATProduct dokumente.
 - Ne zatvara glavni CATProduct.
 
-Save As:
-- Default naziv je:
-  <RootPartNumber>_VISUAL_BOM_EXPORT.xls
+Folder picker:
+- Makro koristi Shell.Application BrowseForFolder.
+- Korisnik bira samo folder, ne fajl.
 - Default folder je folder aktivnog CATProduct-a, ako postoji.
 - Ako aktivni CATProduct nema folder, default je Desktop.
-- Save As dialog ceka korisnika neograniceno dugo i nije deo timeout merenja.
+- Folder picker ceka korisnika neograniceno dugo i nije deo timeout merenja.
 - Ako korisnik klikne Cancel, makro prekida rad i prikazuje:
   Export je otkazan od strane korisnika.
+- Ako XLS fajl vec postoji, korisnik bira:
+  YES = zameni postojeci fajl
+  NO = napravi novi fajl sa timestamp nastavkom
+  CANCEL = prekini export
 
 Output folder:
 Ako korisnik izabere:
-  D:\Project\MyBOM.xls
+  D:\Project
+
+I makro napravi Excel:
+  D:\Project\3260.24.00.00_VISUAL_BOM_EXPORT.xls
 
 Makro pravi folder:
-  D:\Project\MyBOM_FILES
+  D:\Project\3260.24.00.00_VISUAL_BOM_EXPORT_FILES
 
 U njemu:
 - IMAGES
@@ -128,7 +137,7 @@ TEST_MODE:
 - Ako faza predje limit, DEBUG_PHASE_LOG.txt dobija TIMEOUT i makro prikazuje fazu koja je predugo trajala.
 
 StatusBar kontrolne tacke:
-- 1/6 Biranje Excel lokacije...
+- Cekam izbor foldera za Excel export...
 - 2/6 Exportujem CATIA BOM u Excel...
 - 3/6 BOM Excel napravljen.
 - 4/6 Indeksiram CATIA partove...
@@ -142,10 +151,15 @@ FULL MODE:
 
 DEBUG_PHASE_LOG.txt belezi:
 START
+USER_FOLDER_DIALOG_OPENED
+USER_FOLDER_SELECTED
+USER_FOLDER_CANCELLED
+OUTPUT_XLS_PATH_PREPARED
+OUTPUT_XLS_EXISTS
+OUTPUT_XLS_OVERWRITE_CONFIRMED
+OUTPUT_XLS_TIMESTAMP_CREATED
+OUTPUT_XLS_CANCELLED
 BOM_FORMAT_SET
-USER_SAVE_PATH_DIALOG_OPENED
-USER_SAVE_PATH_SELECTED
-USER_SAVE_CANCELLED
 CATIA_BOM_PRINT_XLS_START
 CATIA_BOM_PRINT_XLS_DONE
 EXCEL_OPENED

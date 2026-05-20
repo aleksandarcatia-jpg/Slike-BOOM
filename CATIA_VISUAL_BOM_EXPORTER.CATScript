@@ -32,7 +32,6 @@ Const TEST_PHASE_TIMEOUT_SECONDS = 30
 Const SAVE_EVERY_N_ROWS = 25
 Const RESUME_MODE = True
 Const SKIP_EXISTING_IMAGES = True
-Const OUTPUT_TO_DESKTOP = False
 Const USE_SHADED_WITH_EDGES = True
 Const USE_WHITE_BACKGROUND = True
 Const USE_PARALLEL_PROJECTION = True
@@ -96,12 +95,11 @@ Sub CATIA_VISUAL_BOM_EXPORTER()
 
     InitializeRuntime
     If Not ValidateActiveProductDocument() Then Exit Sub
-    If Not PrepareBillOfMaterialFormat() Then Exit Sub
     If Not SelectExportPathAndPrepareFolders() Then Exit Sub
 
     WriteDebugPhase "START", 0, "", "", "", "CATIA_VISUAL_BOM_EXPORTER started."
 
-    If Not PrintCatiaBomToXls() Then
+    If Not ExportBomWithBillOfMaterialPrintXls(gExcelPath) Then
         If gAbortAlreadyHandled Then Exit Sub
         AbortWithMessage "CATIA BillOfMaterial Print XLS nije uspeo.", "CATIA_BOM_PRINT_XLS_START", 0, "", "", ""
         Exit Sub
@@ -184,17 +182,131 @@ Function ValidateActiveProductDocument()
     Err.Clear
 End Function
 
-Function PrepareBillOfMaterialFormat()
+Function SelectExportPathAndPrepareFolders()
     On Error Resume Next
-    PrepareBillOfMaterialFormat = False
-    Set gAssemblyConvertor = gProduct.GetItem("BillOfMaterial")
-    If Err.Number <> 0 Or gAssemblyConvertor Is Nothing Then
-        Err.Clear
-        MsgBox "CATIA BillOfMaterial objekat nije dostupan preko product.GetItem(""BillOfMaterial"").", vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
+    SelectExportPathAndPrepareFolders = False
+
+    Dim defaultFolder
+    Dim selectedFolder
+    Dim rootPartNumber
+
+    rootPartNumber = GetProductPartNumber(gProduct)
+    defaultFolder = GetDefaultOutputFolder()
+
+    CATIA.StatusBar = ChrW(&H10C) & "ekam izbor foldera za Excel export..."
+    WriteDebugPhase "USER_FOLDER_DIALOG_OPENED", 0, "", "", "", "Waiting for user folder selection - no timeout."
+    selectedFolder = AskUserForOutputFolder(defaultFolder)
+    If selectedFolder = "" Then
+        CATIA.StatusBar = ""
+        WriteDebugPhase "USER_FOLDER_CANCELLED", 0, "", "", "", "User cancelled folder selection."
+        MsgBox "Export je otkazan od strane korisnika.", vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
         Exit Function
     End If
 
+    WriteDebugPhase "USER_FOLDER_SELECTED", 0, "", "", selectedFolder, selectedFolder
+    gExcelPath = BuildBomExcelPath(selectedFolder, rootPartNumber)
+    gExcelPath = ResolveExistingOutputFile(gExcelPath)
+    If gExcelPath = "" Then
+        CATIA.StatusBar = ""
+        WriteDebugPhase "OUTPUT_XLS_CANCELLED", 0, "", "", "", "User cancelled existing file decision."
+        MsgBox "Export je otkazan od strane korisnika.", vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
+        Exit Function
+    End If
+
+    PrepareFoldersNextToExcel gExcelPath
+    WriteDebugPhase "OUTPUT_XLS_PATH_PREPARED", 0, "", "", gExcelPath, gExcelPath
+    SelectExportPathAndPrepareFolders = True
+    Err.Clear
+End Function
+
+Function AskUserForOutputFolder(defaultFolder)
+    On Error Resume Next
+    AskUserForOutputFolder = ""
+    Dim shellApp
+    Dim folder
+    Dim folderPath
+    Set shellApp = CreateObject("Shell.Application")
+    Set folder = shellApp.BrowseForFolder(0, "Izaberite folder gde zelite da sacuvate CATIA BOM Excel export", 0, defaultFolder)
+    If folder Is Nothing Then
+        Err.Clear
+        Exit Function
+    End If
+    folderPath = folder.Self.Path
+    AskUserForOutputFolder = CStr(folderPath)
+    Err.Clear
+End Function
+
+Function GetDefaultOutputFolder()
+    On Error Resume Next
+    GetDefaultOutputFolder = CStr(gProductDocument.Path)
+    If GetDefaultOutputFolder = "" Then GetDefaultOutputFolder = gShell.SpecialFolders("Desktop")
+    Err.Clear
+End Function
+
+Function BuildBomExcelPath(selectedFolder, rootPartNumber)
+    Dim baseName
+    baseName = SafeFileName(rootPartNumber)
+    If baseName = "" Then baseName = SafeFileName(gProduct.Name)
+    If baseName = "" Then baseName = "CATIA_BOM"
+    BuildBomExcelPath = JoinPath(selectedFolder, baseName & "_VISUAL_BOM_EXPORT.xls")
+End Function
+
+Function ResolveExistingOutputFile(xlsPath)
+    On Error Resume Next
+    ResolveExistingOutputFile = xlsPath
+    If Not gFSO.FileExists(xlsPath) Then Exit Function
+
+    WriteDebugPhase "OUTPUT_XLS_EXISTS", 0, "", "", xlsPath, xlsPath
+    Dim answer
+    answer = MsgBox("Fajl vec postoji:" & vbCrLf & xlsPath & vbCrLf & vbCrLf & _
+                    "YES = zameni postojeci fajl" & vbCrLf & _
+                    "NO = napravi novi fajl sa timestamp nastavkom" & vbCrLf & _
+                    "CANCEL = prekini export", _
+                    vbYesNoCancel + vbQuestion, "CATIA_VISUAL_BOM_EXPORTER")
+
+    If answer = vbYes Then
+        gFSO.DeleteFile xlsPath, True
+        WriteDebugPhase "OUTPUT_XLS_OVERWRITE_CONFIRMED", 0, "", "", xlsPath, xlsPath
+        ResolveExistingOutputFile = xlsPath
+    ElseIf answer = vbNo Then
+        ResolveExistingOutputFile = Replace(xlsPath, ".xls", "_" & TimestampForFile() & ".xls")
+        WriteDebugPhase "OUTPUT_XLS_TIMESTAMP_CREATED", 0, "", "", ResolveExistingOutputFile, ResolveExistingOutputFile
+    Else
+        ResolveExistingOutputFile = ""
+    End If
+    Err.Clear
+End Function
+
+Sub PrepareFoldersNextToExcel(bomExcelPath)
+    gOutputFolder = JoinPath(gFSO.GetParentFolderName(bomExcelPath), gFSO.GetBaseName(bomExcelPath) & "_FILES")
+    gImageFolder = JoinPath(gOutputFolder, "IMAGES")
+    gThumbnailFolder = JoinPath(gOutputFolder, "THUMBNAILS")
+    gDebugLogPath = JoinPath(gOutputFolder, "DEBUG_PHASE_LOG.txt")
+    EnsureFolder gOutputFolder
+    EnsureFolder gImageFolder
+    EnsureFolder gThumbnailFolder
+End Sub
+
+Function ExportBomWithBillOfMaterialPrintXls(bomExcelPath)
+    On Error Resume Next
+    ExportBomWithBillOfMaterialPrintXls = False
+    Dim productDocument1
+    Dim product1
+    Dim assemblyConvertor1
     Dim arrayOfVariantOfBSTR1(6)
+    Dim phaseStart
+
+    Set productDocument1 = CATIA.ActiveDocument
+    Set product1 = productDocument1.Product
+    Set assemblyConvertor1 = product1.GetItem("BillOfMaterial")
+    Set gAssemblyConvertor = assemblyConvertor1
+
+    If Err.Number <> 0 Or assemblyConvertor1 Is Nothing Then
+        AbortWithMessage "CATIA BillOfMaterial objekat nije dostupan preko product.GetItem(""BillOfMaterial"").", "BOM_FORMAT_SET", 0, "", "", bomExcelPath
+        Err.Clear
+        Exit Function
+    End If
+
     arrayOfVariantOfBSTR1(0) = "Nomenclature"
     arrayOfVariantOfBSTR1(1) = "Quantity"
     arrayOfVariantOfBSTR1(2) = "Part Number"
@@ -203,98 +315,35 @@ Function PrepareBillOfMaterialFormat()
     arrayOfVariantOfBSTR1(5) = "Mass"
     arrayOfVariantOfBSTR1(6) = "Standard"
 
-    gAssemblyConvertor.SetSecondaryFormat arrayOfVariantOfBSTR1
+    WriteDebugPhase "BOM_FORMAT_SET", 0, "", "", "", "Setting CATIA BOM secondary format."
+    Err.Clear
+    assemblyConvertor1.SetSecondaryFormat arrayOfVariantOfBSTR1
     If Err.Number <> 0 Then
-        MsgBox "SetSecondaryFormat za CATIA BOM nije uspeo: " & Err.Description, vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
+        AbortWithMessage "CATIA SetSecondaryFormat nije uspeo: " & Err.Description, "BOM_FORMAT_SET", 0, "", "", bomExcelPath
         Err.Clear
         Exit Function
     End If
 
-    PrepareBillOfMaterialFormat = True
-    Err.Clear
-End Function
-
-Function SelectExportPathAndPrepareFolders()
-    On Error Resume Next
-    SelectExportPathAndPrepareFolders = False
-
-    Dim defaultFolder
-    Dim defaultName
-    Dim defaultPath
-    defaultFolder = CStr(gProductDocument.Path)
-    If defaultFolder = "" Then defaultFolder = gShell.SpecialFolders("Desktop")
-    defaultName = SafeFileName(GetProductPartNumber(gProduct))
-    If defaultName = "" Then defaultName = SafeFileName(gProduct.Name)
-    If defaultName = "" Then defaultName = "CATIA_BOM"
-    defaultPath = JoinPath(defaultFolder, defaultName & "_VISUAL_BOM_EXPORT.xls")
-
-    CATIA.StatusBar = "1/6 Biranje Excel lokacije..."
-    MsgBox "Izaberi lokaciju za BOM Excel.", vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
-    CATIA.StatusBar = ChrW(&H10C) & "ekam da korisnik izabere lokaciju za Excel..."
-    WriteDebugPhase "USER_SAVE_PATH_DIALOG_OPENED", 0, "", "", "", "Waiting for user input - no timeout."
-    gExcelPath = AskUserForBomExcelSavePath(defaultPath)
-    If gExcelPath = "" Then
-        WriteDebugPhase "USER_SAVE_CANCELLED", 0, "", "", "", "User cancelled Save As dialog."
-        MsgBox "Export je otkazan od strane korisnika.", vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
-        Exit Function
-    End If
-
-    gOutputFolder = JoinPath(gFSO.GetParentFolderName(gExcelPath), gFSO.GetBaseName(gExcelPath) & "_FILES")
-    gImageFolder = JoinPath(gOutputFolder, "IMAGES")
-    gThumbnailFolder = JoinPath(gOutputFolder, "THUMBNAILS")
-    gDebugLogPath = JoinPath(gOutputFolder, "DEBUG_PHASE_LOG.txt")
-    EnsureFolder gOutputFolder
-    EnsureFolder gImageFolder
-    EnsureFolder gThumbnailFolder
-    WriteDebugPhase "USER_SAVE_PATH_SELECTED", 0, "", "", gExcelPath, gExcelPath
-    SelectExportPathAndPrepareFolders = True
-    Err.Clear
-End Function
-
-Function AskUserForBomExcelSavePath(defaultPath)
-    On Error Resume Next
-    AskUserForBomExcelSavePath = ""
-    Dim xl
-    Dim selectedPath
-    Set xl = CreateObject("Excel.Application")
-    If Err.Number <> 0 Or xl Is Nothing Then
-        Err.Clear
-        MsgBox "Microsoft Excel nije dostupan za Save As dialog.", vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
-        Exit Function
-    End If
-
-    xl.Visible = False
-    selectedPath = xl.GetSaveAsFilename(defaultPath, "Excel 97-2003 Workbook (*.xls), *.xls", , "Sacuvaj CATIA BOM Excel export")
-    xl.Quit
-    Set xl = Nothing
-
-    If VarType(selectedPath) = vbBoolean Then
-        AskUserForBomExcelSavePath = ""
-    Else
-        AskUserForBomExcelSavePath = CStr(selectedPath)
-        If LCase(Right(AskUserForBomExcelSavePath, 4)) <> ".xls" Then AskUserForBomExcelSavePath = AskUserForBomExcelSavePath & ".xls"
-    End If
-    Err.Clear
-End Function
-
-Function PrintCatiaBomToXls()
-    On Error Resume Next
-    PrintCatiaBomToXls = False
-    Dim phaseStart
-    WriteDebugPhase "BOM_FORMAT_SET", 0, "", "", "", "Secondary BOM format set: Nomenclature|Quantity|Part Number|Dimenzija|Material|Mass|Standard"
-    WriteDebugPhase "CATIA_BOM_PRINT_XLS_START", 0, "", "", gExcelPath, "assemblyConvertor.Print ""XLS"""
-
+    WriteDebugPhase "CATIA_BOM_PRINT_XLS_START", 0, "", "", bomExcelPath, bomExcelPath
     CATIA.StatusBar = "2/6 Exportujem CATIA BOM u Excel..."
     phaseStart = Timer
-    If gFSO.FileExists(gExcelPath) Then gFSO.DeleteFile gExcelPath, True
     Err.Clear
-    gAssemblyConvertor.Print "XLS", gExcelPath, gProduct
-    If Err.Number = 0 And gFSO.FileExists(gExcelPath) Then
-        CATIA.StatusBar = "3/6 BOM Excel napravljen."
-        WriteDebugPhase "CATIA_BOM_PRINT_XLS_DONE", 0, "", "", gExcelPath, "CATIA BOM XLS created."
-        If Not CheckTimedPhase("CATIA_BOM_PRINT_XLS", phaseStart, 0, "", "", gExcelPath) Then Exit Function
-        PrintCatiaBomToXls = True
+    assemblyConvertor1.Print "XLS", bomExcelPath, product1
+    If Err.Number <> 0 Then
+        AbortWithMessage "CATIA BillOfMaterial.Print XLS nije uspeo: " & Err.Description, "CATIA_BOM_PRINT_XLS_START", 0, "", "", bomExcelPath
+        Err.Clear
+        Exit Function
     End If
+
+    If Not gFSO.FileExists(bomExcelPath) Then
+        AbortWithMessage "CATIA nije napravila XLS fajl: " & bomExcelPath, "CATIA_BOM_PRINT_XLS_DONE", 0, "", "", bomExcelPath
+        Exit Function
+    End If
+
+    CATIA.StatusBar = "3/6 BOM Excel napravljen."
+    WriteDebugPhase "CATIA_BOM_PRINT_XLS_DONE", 0, "", "", bomExcelPath, bomExcelPath
+    If Not CheckTimedPhase("CATIA_BOM_PRINT_XLS", phaseStart, 0, "", "", bomExcelPath) Then Exit Function
+    ExportBomWithBillOfMaterialPrintXls = True
     Err.Clear
 End Function
 
@@ -307,7 +356,7 @@ Function OpenBomWorkbookAndPrepareSheets()
         Exit Function
     End If
 
-    gExcelApp.Visible = False
+    gExcelApp.Visible = True
     gExcelApp.DisplayAlerts = False
     gExcelApp.ScreenUpdating = False
     Set gWorkbook = gExcelApp.Workbooks.Open(gExcelPath)

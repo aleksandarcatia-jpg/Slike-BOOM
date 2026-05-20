@@ -1,43 +1,103 @@
-CATIA_VISUAL_BOM_EXPORTER - native CATIA BOM + standalone thumbnails
+CATIA_VISUAL_BOM_EXPORTER
+=========================
 
 Cilj:
-CATIA native Bill of Material -> Excel -> thumbnail slike direktno u Excelu.
+CATIA Bill of Material export u Excel + thumbnail slike delova u istom Excel fajlu.
 
 Fajlovi:
 - CATIA_VISUAL_BOM_EXPORTER.CATScript
 - CATIA_VISUAL_BOM_EXPORTER.bas
 
-Makro sada koristi CATIA native BOM kao jedini izvor BOM podataka.
-Ne rekonstruise BOM iz Product Tree-a, ne racuna Quantity, ne grupise redove i ne menja redosled redova.
-
-Osnovni tok:
-1. Otvorite glavni CATProduct u CATIA V5.
-2. U CATIA podesite BOM kroz Analyze > Bill of Material > Define formats / Define Bill of Material.
-3. Pokrenite makro.
-4. Makro poziva Product.ExtractBOM i cita CATIA native BOM kolone i redove.
-5. Excel dobija iste BOM kolone, plus:
-   - Thumbnail
-   - Image Path
-   - Thumbnail Path
-   - Export Status
-   - Image Skip Reason
-6. Product Tree se koristi samo za indeks:
+Osnovna logika:
+1. Korisnik otvori glavni CATProduct u CATIA V5.
+2. Makro proveri da je aktivni dokument CATProduct.
+3. Makro uzme CATIA BOM objekat:
+   product1.GetItem("BillOfMaterial")
+4. Makro podesi BOM format:
+   Nomenclature, Quantity, Part Number, Dimenzija, Material, Mass, Standard.
+5. Makro pita korisnika gde zeli da sacuva Excel preko Save As dialoga.
+6. Makro eksportuje CATIA BOM direktno u XLS:
+   assemblyConvertor1.Print "XLS", selectedPath, product1
+7. Makro otvara taj isti Excel fajl i dodaje samo pomocne kolone:
+   Thumbnail, Image Path, Thumbnail Path, Export Status, Image Skip Reason.
+8. Product Tree se koristi samo za indeks:
    Part Number -> source CATPart/CATProduct path.
-7. Part Number lookup se radi preko normalizovane vrednosti: skidaju se navodnici, TAB/CR/LF, zavrsni separatori kao zarez/semicolon/colon/pipe i visestruki razmaci.
-8. Ako exact match ne uspe, makro pokusava match bez REV nastavka i zatim jedinstveni safe partial match.
-9. Slike se prave samo otvaranjem CATPart/CATProduct fajla kao standalone dokument/prozor.
-10. Makro zatvara samo dokumente koje je sam otvorio za slikanje i nikada ih ne snima.
+9. Za svaki BOM red kome treba slika, makro otvara source CATPart/CATProduct kao standalone dokument/prozor.
+10. Makro napravi JPG sliku, napravi mali thumbnail i ubaci thumbnail u Excel.
+11. Makro zatvara samo dokument koji je sam otvorio za slikanje, bez snimanja.
+12. Excel ostaje otvoren korisniku.
 
-Izlazni folder:
-ROOT_PARTNUMBER_VISUAL_BOM_EXPORT
+Sta makro NE radi:
+- Ne pravi BOM iz Product Tree-a.
+- Ne racuna Quantity.
+- Ne menja redosled redova.
+- Ne menja postojece CATIA BOM vrednosti.
+- Ne koristi hide/show za slike.
+- Ne koristi CATIA hide/show metodu za slike.
+- Ne koristi fallback na assembly visibility capture.
+- Ne snima CATPart/CATProduct dokumente.
+- Ne zatvara glavni CATProduct.
+
+Save As:
+- Default naziv je:
+  <RootPartNumber>_VISUAL_BOM_EXPORT.xls
+- Default folder je folder aktivnog CATProduct-a, ako postoji.
+- Ako aktivni CATProduct nema folder, default je Desktop.
+- Ako korisnik klikne Cancel, makro prekida rad i prikazuje:
+  Export je otkazan od strane korisnika.
+
+Output folder:
+Ako korisnik izabere:
+  D:\Project\MyBOM.xls
+
+Makro pravi folder:
+  D:\Project\MyBOM_FILES
 
 U njemu:
-- VISUAL_BOM_EXPORT.xlsx
 - IMAGES
 - THUMBNAILS
 - DEBUG_PHASE_LOG.txt
 
-Podrazumevana podesavanja:
+Excel struktura:
+- Prvi sheet je CATIA BOM sheet.
+- Postojece CATIA BOM kolone ostaju netaknute.
+- Thumbnail kolona se dodaje odmah posle Part Number kolone.
+- Na kraj se dodaju:
+  Image Path, Thumbnail Path, Export Status, Image Skip Reason.
+- Dodaju se i sheetovi:
+  EXPORT_LOG
+  SUMMARY
+
+Part Number lookup:
+- Makro normalizuje Part Number iz Excel BOM-a i iz Product Tree index-a.
+- Normalizacija radi:
+  trim razmaka, uklanjanje navodnika, TAB/CR/LF, zavrsnih separatora
+  comma, semicolon, colon, pipe, visestrukih razmaka i uppercase.
+- Primer:
+  "2417.01.14.01.04.01," -> "2417.01.14.01.04.01"
+- Ako exact match ne uspe, makro pokusava match bez REV nastavka.
+- Ako ni to ne uspe, pokusava safe unique partial match samo kada postoji jedan kandidat.
+
+Slike:
+- Slike se prave samo standalone metodom:
+  CATIA.Documents.Open(sourcePath)
+  standaloneDoc.Activate
+  viewer.Reframe
+  viewer.CaptureToFile 2, imagePath
+  standaloneDoc.Close
+- Full slike idu u IMAGES folder.
+- Male thumbnail slike idu u THUMBNAILS folder.
+- Excel ubacuje samo thumbnail sliku, ne full-size sliku.
+
+Fastener elementi:
+- Vijci, zavrtnji, navrtke/matice, podloske i slicni standardni elementi ostaju u BOM-u.
+- Za njih se ne pravi slika.
+- Export Status:
+  SKIPPED_IMAGE_ONLY
+- Image Skip Reason:
+  Standard fastener - retained in BOM, image skipped
+
+Default konfiguracija:
 - TEST_MODE=True
 - TEST_MAX_ROWS=20
 - STANDALONE_CAPTURE_ONLY=True
@@ -56,13 +116,43 @@ Podrazumevana podesavanja:
 - RESUME_MODE=True
 - SKIP_EXISTING_IMAGES=True
 
-Vazno:
-- Hide/show metoda nije deo glavnog toka.
-- Makro ne poziva SetShow / NoShow radi slikanja.
-- Ako native CATIA BOM export ne uspe, makro se zaustavlja i ne pravi rucni BOM fallback.
-- Ako Part Number iz BOM reda nema source CATPart/CATProduct fajl, makro sacuva Excel do tada i stane sa jasnom porukom.
-- Ako je source fajl CGR ili drugi nepodrzan format, makro staje sa statusom UNSUPPORTED_SOURCE_FILE.
-- Fastener redovi ostaju u Excelu, ali nemaju sliku i dobijaju status SKIPPED_IMAGE_ONLY.
+TEST_MODE:
+- CATIA eksportuje kompletan BOM Excel.
+- Svi redovi ostaju u Excelu.
+- Makro dodaje slike samo za prvih TEST_MAX_ROWS ne-fastener redova.
+- Ostali neobradjeni redovi dobijaju:
+  NOT_PROCESSED_TEST_LIMIT
+
+FULL MODE:
+- Podesiti:
+  Const TEST_MODE = False
+- Makro obradjuje sve ne-fastener redove iz CATIA BOM-a.
+
+DEBUG_PHASE_LOG.txt belezi:
+START
+BOM_FORMAT_SET
+USER_SAVE_PATH_SELECTED
+CATIA_BOM_PRINT_XLS_START
+CATIA_BOM_PRINT_XLS_DONE
+EXCEL_OPENED
+BOM_HEADERS_READ
+CATIA_FILE_INDEX_START
+CATIA_FILE_INDEX_ITEM
+CATIA_FILE_INDEX_DONE
+ROW_START
+FASTENER_SKIPPED_IMAGE
+SOURCE_FILE_FOUND
+SOURCE_FILE_NOT_FOUND
+STANDALONE_OPEN_START
+STANDALONE_OPEN_DONE
+STANDALONE_CAPTURE_START
+STANDALONE_CAPTURE_DONE
+THUMBNAIL_CREATED
+EXCEL_THUMBNAIL_INSERTED
+STANDALONE_CLOSE_DONE
+SAVE_CHECKPOINT
+ERROR
+FINISH
 
 Kako pokrenuti CATScript:
 1. Tools > Macro > Macros...
@@ -78,21 +168,3 @@ Kako pokrenuti VBA verziju:
 4. Insert > Module.
 5. Iskopirajte kompletan sadrzaj CATIA_VISUAL_BOM_EXPORTER.bas.
 6. Pokrenite CATIA_VISUAL_BOM_EXPORTER.
-
-TEST_MODE:
-- Kada je TEST_MODE=True, Excel sadrzi ceo CATIA native BOM.
-- Makro pravi slike samo za prvih TEST_MAX_ROWS ne-fastener redova.
-- Fastener redovi ostaju bez slike.
-
-FULL MODE:
-- Podesite TEST_MODE=False.
-- Makro obradjuje sve ne-fastener redove iz CATIA native BOM-a.
-
-DEBUG_PHASE_LOG.txt belezi:
-START, CATIA_NATIVE_BOM_EXPORT_START, CATIA_NATIVE_BOM_EXPORT_DONE,
-BOM_HEADERS_READ, EXCEL_CREATED, CATIA_FILE_INDEX_START,
-CATIA_FILE_INDEX_DONE, ROW_START, FASTENER_SKIPPED_IMAGE,
-SOURCE_FILE_FOUND, SOURCE_FILE_NOT_FOUND, UNSUPPORTED_SOURCE_FILE,
-STANDALONE_OPEN_START, STANDALONE_OPEN_DONE, STANDALONE_CAPTURE_START,
-STANDALONE_CAPTURE_DONE, THUMBNAIL_CREATED, EXCEL_THUMBNAIL_INSERTED,
-STANDALONE_CLOSE_DONE, SAVE_CHECKPOINT, ERROR, FINISH.

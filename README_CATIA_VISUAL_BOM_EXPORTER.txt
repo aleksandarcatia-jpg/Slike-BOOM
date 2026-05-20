@@ -18,27 +18,34 @@ Glavni princip:
 
 Osnovni tok:
 1. Korisnik otvori glavni CATProduct.
-2. Makro pita korisnika da izabere folder preko Windows folder picker-a.
-3. Ako folder picker ne radi, makro koristi fallback InputBox.
-4. Makro napravi XLS putanju:
+2. Makro pita korisnika da izabere finalni folder za Excel.
+3. Izbor foldera ide redom: Excel FileDialog folder picker, Shell BrowseForFolder, pa fallback InputBox.
+4. Makro napravi finalnu XLS putanju:
    <RootPartNumber>_VISUAL_BOM_EXPORT.xls
-5. Makro koristi CATIA BillOfMaterial objekat:
+5. Makro napravi lokalni work XLS u:
+   C:\Temp\CATIA_VISUAL_BOM_WORK
+6. Makro koristi CATIA BillOfMaterial objekat:
    product1.GetItem("BillOfMaterial")
-6. Normalno ne poziva SetSecondaryFormat.
-7. Makro poziva:
-   assemblyConvertor1.Print "XLS", bomExcelPath, product1
-8. Makro otvara taj isti XLS:
-   Excel.Workbooks.Open(bomExcelPath)
-9. Makro dodaje pomocne kolone:
+7. Normalno ne poziva SetSecondaryFormat.
+8. Makro poziva CATIA Print "XLS" samo na lokalni work fajl:
+   assemblyConvertor1.Print "XLS", workExcelPath, product1
+9. Makro otvara lokalni XLS:
+   Excel.Workbooks.Open(workExcelPath)
+10. Makro dodaje pomocne kolone:
    Thumbnail, Image Path, Cropped Image Path, Thumbnail Path, Export Status, Image Skip Reason.
-10. Product Tree se koristi samo za indeks:
+11. Iz Excel BOM-a pravi listu potrebnih Part Number-a.
+12. Product Tree se koristi samo za indeks:
    Part Number -> source CATPart/CATProduct path.
-11. Slike se prave samo standalone metodom:
+13. Za velike sklopove indeksira samo potrebne Part Number-e i prekida skeniranje kada ih nadje.
+14. Slike se prave samo standalone metodom:
    CATIA.Documents.Open(sourcePath)
-12. Excel ostaje otvoren korisniku.
+15. Isti Part Number se ne slika ponovo; koristi se image cache / postojeći thumbnail.
+16. Na kraju se Excel snima/kopira na finalnu lokaciju koju je korisnik izabrao.
+17. Excel ostaje otvoren korisniku.
 
 Konfiguracija:
 - FORCE_DEFAULT_BOM_COLUMNS=False
+- USE_LOCAL_WORK_FOLDER_FOR_CATIA_PRINT=True
 - SMOKE_TEST_BOM_ONLY=False
 - DEBUG_FORCE_RECORDER_STYLE_PATH=False
 - STOP_ON_SOURCE_NOT_FOUND=False
@@ -65,6 +72,9 @@ Konfiguracija:
 - SAVE_EVERY_N_ROWS=25
 - RESUME_MODE=True
 - SKIP_EXISTING_IMAGES=True
+- STOP_INDEX_SCAN_WHEN_ALL_FOUND=True
+- INDEX_ONLY_NEEDED_PART_NUMBERS=True
+- MAX_SOURCE_NOT_FOUND_BEFORE_WARNING=20
 
 FORCE_DEFAULT_BOM_COLUMNS:
 - Default je False.
@@ -81,18 +91,24 @@ SMOKE_TEST_BOM_ONLY:
 
 DEBUG_FORCE_RECORDER_STYLE_PATH:
 - Default je False.
-- Kada je True, makro koristi:
-  C:\Temp\CATIA_BOM_TEST.xls
+- Kada je True, makro koristi lokalni dijagnosticki fajl:
+  C:\Temp\CATIA_VISUAL_BOM_WORK\CATIA_BOM_TEST.xls
 - Ovo sluzi samo za dijagnostiku CATIA Print "XLS" problema.
 
 Folder i fajlovi:
 Ako korisnik izabere folder:
   D:\Project
 
-I Excel bude:
+Finalni Excel bude:
   D:\Project\3260.24.00.00_VISUAL_BOM_EXPORT.xls
 
-Makro pravi folder:
+CATIA Print "XLS" se prvo radi lokalno:
+  C:\Temp\CATIA_VISUAL_BOM_WORK\3260.24.00.00_VISUAL_BOM_EXPORT_WORK.xls
+
+Lokalni work folder je:
+  C:\Temp\CATIA_VISUAL_BOM_WORK\3260.24.00.00_VISUAL_BOM_EXPORT_FILES
+
+Na kraju makro kopira fajlove u finalni folder:
   D:\Project\3260.24.00.00_VISUAL_BOM_EXPORT_FILES
 
 U njemu:
@@ -125,13 +141,24 @@ Crop:
 - Thumbnail se pravi iz CROPPED fajla.
 - DEBUG log dobija AUTO_CROP_FAILED_OR_SKIPPED kada je pixel auto-crop preskocen.
 
+Optimizacija za velike sklopove:
+- Makro prvo cita Part Number-e iz CATIA BOM Excel-a.
+- Fastener redovi i redovi bez Part Number-a se ne ubacuju u listu za slike.
+- U TEST_MODE obradjuje se samo prvih TEST_MAX_ROWS kandidata za slike.
+- Product Tree scan trazi samo potrebne Part Number-e.
+- Kada nadje sve potrebne source fajlove, prekida dalji scan.
+- Image cache sprecava ponovno otvaranje i slikanje istog Part Number-a.
+- Ako image/cropped/thumbnail vec postoje, koriste se ponovo.
+
 DEBUG_PHASE_LOG.txt belezi faze:
 START
 SMOKE_TEST_BOM_ONLY
 USER_FOLDER_DIALOG_OPENED
 USER_FOLDER_SELECTED
 USER_FOLDER_CANCELLED
-OUTPUT_XLS_PATH_PREPARED
+FINAL_XLS_PATH_PREPARED
+LOCAL_WORK_FOLDER_PREPARED
+LOCAL_WORK_XLS_PATH_PREPARED
 OUTPUT_XLS_EXISTS
 OUTPUT_XLS_OVERWRITE_CONFIRMED
 OUTPUT_XLS_TIMESTAMP_CREATED
@@ -142,9 +169,10 @@ BOM_FORMAT_SET_DONE
 CATIA_BOM_PRINT_XLS_START
 CATIA_BOM_PRINT_XLS_DONE
 CATIA_BOM_PRINT_XLS_FAILED
-EXCEL_OPENED
+EXCEL_OPENED_LOCAL_WORKBOOK
 BOM_HEADERS_READ
 HELPER_COLUMNS_ADDED
+NEEDED_PART_NUMBERS_BUILT
 CATIA_FILE_INDEX_START
 CATIA_FILE_INDEX_ITEM
 CATIA_FILE_INDEX_DONE
@@ -161,8 +189,15 @@ AUTO_CROP_DONE
 AUTO_CROP_FAILED_OR_SKIPPED
 THUMBNAIL_CREATED
 EXCEL_THUMBNAIL_INSERTED
+EXISTING_REUSED
 STANDALONE_CLOSE_DONE
 SAVE_CHECKPOINT
+FINAL_SAVEAS_START
+FINAL_SAVEAS_DONE
+FINAL_COPY_START
+FINAL_COPY_DONE
+COPY_OUTPUT_FILES_DONE
+COPY_OUTPUT_FILES_FAILED
 ERROR
 FINISH
 

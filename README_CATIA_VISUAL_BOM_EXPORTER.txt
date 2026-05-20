@@ -103,12 +103,36 @@ Makro sme da doda/popuni samo:
 Part Number kolone koje se prepoznaju:
 - Part Number
 - PartNumber
+- Part No.
 - Part No
+- PartNo
+- Part-No
 - PN
+- P/N
 - Number
 - Broj dela
 - Br. dela
 - Oznaka
+- Pozicija-DoN
+- Position-DoN
+- Item-DoN
+- Drawing No
+- Drawing Number
+- Drw. No
+- Drw No
+- Broj crteza
+- Br. crteza
+
+Ako postoji vise mogucih Part Number kolona, prioritet je:
+1. PARTNUMBER / PARTNO / PN
+2. DRAWINGNO / DRWNO / BROJCRTEZA
+3. OZNAKA / POZICIJA / ITEM
+4. NUMBER
+
+Ako Part Number kolona nije pronadjena:
+- makro ne koristi prvu kolonu kao fallback
+- slikanje se prekida jasnom porukom
+- DEBUG_PHASE_LOG.txt sadrzi raw i normalized header-e
 
 Redovi bez Part Number-a:
 - ostaju u Excelu
@@ -155,6 +179,41 @@ Optimizacija za velike sklopove
 - Ako se isti Part Number ponovi, koristi postojeci thumbnail.
 - Export Status = EXISTING_REUSED
 - Excel se snima na svakih 25 redova.
+
+Source izbor za slike
+---------------------
+
+Makro cuva kandidate iz Product Tree-a po normalized Part Number-u:
+- raw Part Number
+- normalized Part Number
+- source path
+- ekstenzija CATPart/CATProduct
+- da li je root assembly
+- da li ima children
+- depth
+- product name
+
+Pravila izbora:
+- exact normalized match ima prioritet
+- zatim exact match bez REV nastavka
+- safe unique partial match samo ako je jedinstven i dovoljno siguran
+- CATPart se bira pre CATProduct kada postoji
+- root assembly se ne koristi kao slika za red
+- CATProduct se koristi samo kao podsklop ako nema CATPart kandidata i ako je dozvoljeno
+
+Relevantne konfiguracije:
+- PREFER_CATPART_OVER_CATPRODUCT=True
+- ALLOW_ROOT_ASSEMBLY_IMAGE=False
+- ALLOW_SUBASSEMBLY_IMAGE=True
+
+DEBUG log za svaki source match pise:
+- raw i normalized BOM Part Number
+- matched ProductTree Part Number
+- source extension
+- CATPart/CATProduct
+- root assembly
+- has children
+- match method: EXACT, NO_REV ili SAFE_UNIQUE_PARTIAL
 
 DEBUG_PHASE_LOG.txt faze
 ------------------------

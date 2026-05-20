@@ -18,6 +18,9 @@ Const RESUME_MODE = True
 Const TEST_MODE = True
 Const TEST_MAX_ROWS = 20
 Const SKIP_FASTENER_IMAGES = True
+Const PREFER_CATPART_OVER_CATPRODUCT = True
+Const ALLOW_ROOT_ASSEMBLY_IMAGE = False
+Const ALLOW_SUBASSEMBLY_IMAGE = True
 Const FASTENER_KEYWORDS = "vijak|vijci|zavrtanj|zavrtnji|screw|bolt|hex bolt|hexagon bolt|imbus|allen screw|navrtka|matica|nut|hex nut|podloska|washer|plain washer|spring washer|lock washer|DIN 125|DIN125|DIN 127|DIN127|DIN 933|DIN933|DIN 931|DIN931|DIN 934|DIN934|ISO 4014|ISO 4017|ISO 4032|ISO 7089|ISO 7090"
 Const IMAGE_WIDTH = 1000
 Const IMAGE_HEIGHT = 750
@@ -84,6 +87,16 @@ Dim gRowsWithoutPartNumber
 Dim gSourceNotFoundRows
 Dim gImageCaptureFailedRows
 Dim gErrorCount
+Dim gLastMatchMethod
+Dim gLastMatchedRawPartNumber
+Dim gLastMatchedNormalizedPartNumber
+Dim gLastMatchedSourceExtension
+Dim gLastMatchedIsRootAssembly
+Dim gLastMatchedHasChildren
+Dim gLastMatchedDepth
+Dim gLastMatchedProductName
+Dim gLastMatchedCandidateCount
+Dim gLastMatchBlockedReason
 Dim gAbortAlreadyHandled
 Dim gPhase2Success
 Dim gPendingDebugText
@@ -131,6 +144,7 @@ Sub InitializeRuntime()
     gSourceNotFoundRows = 0
     gImageCaptureFailedRows = 0
     gErrorCount = 0
+    ResetLastSourceMatch
     gAbortAlreadyHandled = False
     gPhase2Success = False
     gPendingDebugText = ""
@@ -561,7 +575,7 @@ Function OpenLocalWorkbookAndPrepareColumns()
 
     If Not FindBomHeaderRowAndPartNumberColumn() Then
         SaveExcelCheckpoint "Part Number column missing", 0, "", ""
-        MsgBox "Kolona Part Number / PN / Oznaka nije pronadjena u BOM Excel fajlu. Slikanje je prekinuto.", vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
+        MsgBox "Part Number / Part No. kolona nije pronadjena u BOM-u. Proverite naziv kolone.", vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
         Exit Function
     End If
     WriteDebugPhase "PART_NUMBER_COLUMN_FOUND", gHeaderRow, "", "", "", "Column=" & CStr(gPartNumberColumnIndex)
@@ -593,29 +607,63 @@ Function FindBomHeaderRowAndPartNumberColumn()
     Dim maxCol
     Dim r
     Dim c
+    Dim rawHeader
+    Dim normalizedHeader
+    Dim priority
+    Dim bestPriority
+    Dim bestRow
+    Dim bestCol
     Set used = gWsBom.UsedRange
     maxRow = used.Row + used.Rows.Count - 1
     maxCol = used.Column + used.Columns.Count - 1
     If maxRow > 30 Then maxRow = 30
     If maxCol > 120 Then maxCol = 120
 
+    bestPriority = 9999
+    bestRow = 0
+    bestCol = 0
     For r = 1 To maxRow
         For c = 1 To maxCol
-            If IsPartNumberHeader(CStr(gWsBom.Cells(r, c).Value)) Then
-                gHeaderRow = r
-                gPartNumberColumnIndex = c
-                FindBomHeaderRowAndPartNumberColumn = True
-                Exit Function
+            rawHeader = CStr(gWsBom.Cells(r, c).Value)
+            If Trim(rawHeader) <> "" Then
+                normalizedHeader = NormalizeHeaderName(rawHeader)
+                WriteDebugPhase "BOM_HEADERS_READ", r, rawHeader, normalizedHeader, "", "Header[" & CStr(c) & "] Raw='" & rawHeader & "' Normalized='" & normalizedHeader & "'"
+                priority = PartNumberHeaderPriority(normalizedHeader)
+                If priority > 0 Then
+                    If priority < bestPriority Then
+                        bestPriority = priority
+                        bestRow = r
+                        bestCol = c
+                    End If
+                End If
             End If
         Next
     Next
+
+    If bestCol > 0 Then
+        gHeaderRow = bestRow
+        gPartNumberColumnIndex = bestCol
+        FindBomHeaderRowAndPartNumberColumn = True
+    End If
     Err.Clear
 End Function
 
 Function IsPartNumberHeader(valueText)
-    Dim h
-    h = NormalizeHeaderName(valueText)
-    IsPartNumberHeader = (h = "partnumber" Or h = "partno" Or h = "pn" Or h = "number" Or h = "brojdela" Or h = "brdela" Or h = "oznaka")
+    IsPartNumberHeader = (PartNumberHeaderPriority(NormalizeHeaderName(valueText)) > 0)
+End Function
+
+Function PartNumberHeaderPriority(normalizedHeader)
+    PartNumberHeaderPriority = 0
+    Select Case CStr(normalizedHeader)
+        Case "PARTNUMBER", "PARTNO", "PN"
+            PartNumberHeaderPriority = 1
+        Case "DRAWINGNO", "DRAWINGNUMBER", "DRWNO", "DRWNODON", "BROJCRTEZA", "BRCRTEZA"
+            PartNumberHeaderPriority = 2
+        Case "OZNAKA", "POZICIJA", "POZICIJADON", "POSITIONDON", "ITEM", "ITEMDON"
+            PartNumberHeaderPriority = 3
+        Case "NUMBER"
+            PartNumberHeaderPriority = 4
+    End Select
 End Function
 
 Function IsImageHeader(valueText)
@@ -730,25 +778,41 @@ Sub BuildCatiaFileIndex()
     On Error Resume Next
     WriteDebugPhase "CATIA_FILE_INDEX_START", 0, "", "", "", "Indexing source files for needed Part Numbers."
     CATIA.StatusBar = "Indexing source files: found 0 / " & CStr(gNeededPartNumbers.Count)
-    If gNeededPartNumbers.Count > 0 Then TraverseProductForSourceIndex gProduct
+    If gNeededPartNumbers.Count > 0 Then TraverseProductForSourceIndex gProduct, 0
     WriteDebugPhase "CATIA_FILE_INDEX_DONE", 0, "", "", "", "Found=" & CStr(gFoundNeededPartNumbers.Count) & " / Needed=" & CStr(gNeededPartNumbers.Count)
     Err.Clear
 End Sub
 
-Sub TraverseProductForSourceIndex(prod)
+Sub TraverseProductForSourceIndex(prod, depth)
     On Error Resume Next
     If AllNeededPartNumbersFound() Then Exit Sub
 
     Dim rawPn
     Dim normalizedPn
     Dim sourcePath
+    Dim ext
+    Dim isRoot
+    Dim hasChildren
+    Dim productName
     rawPn = GetProductPartNumber(prod)
     normalizedPn = NormalizePartNumber(rawPn)
     If ShouldIndexPartNumber(normalizedPn) Then
         sourcePath = GetProductSourceFilePath(prod)
         If normalizedPn <> "" And sourcePath <> "" Then
-            If Not SamePath(sourcePath, gMainDocumentFullName) Then
-                If Not gSourceIndex.Exists(normalizedPn) Then gSourceIndex.Item(normalizedPn) = sourcePath
+            ext = UCase(gFSO.GetExtensionName(sourcePath))
+            isRoot = SamePath(sourcePath, gMainDocumentFullName)
+            hasChildren = ProductHasChildren(prod)
+            productName = CStr(prod.Name)
+            WriteDebugPhase "CATIA_FILE_INDEX_ITEM", 0, rawPn, normalizedPn, sourcePath, _
+                "ProductName=" & productName & _
+                "; Extension=" & ext & _
+                "; IsRootAssembly=" & CStr(isRoot) & _
+                "; HasChildren=" & CStr(hasChildren) & _
+                "; Depth=" & CStr(depth)
+            If isRoot And Not ALLOW_ROOT_ASSEMBLY_IMAGE Then
+                WriteDebugPhase "ROOT_ASSEMBLY_MATCH_BLOCKED", 0, rawPn, normalizedPn, sourcePath, "Root assembly not added to source index."
+            Else
+                AddSourceCandidate rawPn, normalizedPn, sourcePath, ext, isRoot, hasChildren, depth, productName
                 MarkNeededPartNumberFound normalizedPn, sourcePath
             End If
         End If
@@ -763,12 +827,56 @@ Sub TraverseProductForSourceIndex(prod)
         Exit Sub
     End If
     For i = 1 To children.Count
-        TraverseProductForSourceIndex children.Item(i)
+        TraverseProductForSourceIndex children.Item(i), CLng(depth) + 1
         If AllNeededPartNumbersFound() Then Exit For
         If (i Mod 250) = 0 Then DoEvents
     Next
     Err.Clear
 End Sub
+
+Function ProductHasChildren(prod)
+    On Error Resume Next
+    ProductHasChildren = False
+    Dim children
+    Set children = prod.Products
+    If Err.Number = 0 And Not children Is Nothing Then ProductHasChildren = (children.Count > 0)
+    Err.Clear
+End Function
+
+Sub AddSourceCandidate(rawPn, normalizedPn, sourcePath, ext, isRoot, hasChildren, depth, productName)
+    On Error Resume Next
+    Dim recordText
+    Dim existingText
+    normalizedPn = NormalizePartNumber(normalizedPn)
+    If normalizedPn = "" Then Exit Sub
+    recordText = CandidateRecord(rawPn, normalizedPn, sourcePath, ext, isRoot, hasChildren, depth, productName)
+    If gSourceIndex.Exists(normalizedPn) Then
+        existingText = CStr(gSourceIndex.Item(normalizedPn))
+        gSourceIndex.Item(normalizedPn) = existingText & vbLf & recordText
+    Else
+        gSourceIndex.Item(normalizedPn) = recordText
+    End If
+    Err.Clear
+End Sub
+
+Function CandidateRecord(rawPn, normalizedPn, sourcePath, ext, isRoot, hasChildren, depth, productName)
+    CandidateRecord = Replace(CStr(rawPn), vbTab, " ") & vbTab & _
+                      Replace(CStr(normalizedPn), vbTab, " ") & vbTab & _
+                      Replace(CStr(sourcePath), vbTab, " ") & vbTab & _
+                      Replace(CStr(ext), vbTab, " ") & vbTab & _
+                      BoolToken(isRoot) & vbTab & _
+                      BoolToken(hasChildren) & vbTab & _
+                      CStr(depth) & vbTab & _
+                      Replace(CStr(productName), vbTab, " ")
+End Function
+
+Function BoolToken(value)
+    If CBool(value) Then
+        BoolToken = "1"
+    Else
+        BoolToken = "0"
+    End If
+End Function
 
 Function ShouldIndexPartNumber(normalizedPn)
     normalizedPn = NormalizePartNumber(normalizedPn)
@@ -778,9 +886,11 @@ End Function
 Sub MarkNeededPartNumberFound(normalizedPn, sourcePath)
     On Error Resume Next
     Dim matchedKey
-    matchedKey = MatchedNeededPartNumberKey(normalizedPn)
+    Dim ext
+    matchedKey = MatchedNeededPartNumberKeyExactOrNoRev(normalizedPn)
     If matchedKey <> "" Then
-        If Not gSourceIndex.Exists(matchedKey) Then gSourceIndex.Item(matchedKey) = sourcePath
+        ext = UCase(gFSO.GetExtensionName(sourcePath))
+        If PREFER_CATPART_OVER_CATPRODUCT And ext <> "CATPART" Then Exit Sub
         If Not gFoundNeededPartNumbers.Exists(matchedKey) Then gFoundNeededPartNumbers.Item(matchedKey) = True
         CATIA.StatusBar = "Indexing source files: found " & CStr(gFoundNeededPartNumbers.Count) & " / " & CStr(gNeededPartNumbers.Count)
     End If
@@ -808,6 +918,29 @@ Function MatchedNeededPartNumberKey(normalizedPn)
         End If
         If IsSafePartialPartNumberMatch(CStr(key), normalizedPn) Then
             MatchedNeededPartNumberKey = CStr(key)
+            Exit Function
+        End If
+    Next
+    Err.Clear
+End Function
+
+Function MatchedNeededPartNumberKeyExactOrNoRev(normalizedPn)
+    On Error Resume Next
+    MatchedNeededPartNumberKeyExactOrNoRev = ""
+    Dim key
+    Dim pnNoRev
+    Dim keyNoRev
+    normalizedPn = NormalizePartNumber(normalizedPn)
+    If normalizedPn = "" Then Exit Function
+    If gNeededPartNumbers.Exists(normalizedPn) Then
+        MatchedNeededPartNumberKeyExactOrNoRev = normalizedPn
+        Exit Function
+    End If
+    pnNoRev = PartNumberWithoutRevision(normalizedPn)
+    For Each key In gNeededPartNumbers.Keys
+        keyNoRev = PartNumberWithoutRevision(CStr(key))
+        If keyNoRev <> "" And keyNoRev = pnNoRev Then
+            MatchedNeededPartNumberKeyExactOrNoRev = CStr(key)
             Exit Function
         End If
     Next
@@ -873,10 +1006,16 @@ Function ProcessBomRowsForThumbnails()
                     sourcePath = SourcePathForPartNumber(rawPartNumber)
                     If sourcePath = "" Or Not gFSO.FileExists(sourcePath) Then
                         gSourceNotFoundRows = gSourceNotFoundRows + 1
-                        SetRowUtilityValues rowIndex, "", "SOURCE_FILE_NOT_FOUND", "Source CATPart/CATProduct not found for Part Number"
-                        WriteDebugPhase "SOURCE_FILE_NOT_FOUND", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, "Source not found."
+                        If gLastMatchBlockedReason = "ROOT_ASSEMBLY_MATCH_BLOCKED" Then
+                            SetRowUtilityValues rowIndex, "", "ROOT_ASSEMBLY_MATCH_BLOCKED", "Root assembly match blocked"
+                            WriteDebugPhase "ROOT_ASSEMBLY_MATCH_BLOCKED", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, "Root assembly match blocked; ALLOW_ROOT_ASSEMBLY_IMAGE=False"
+                        Else
+                            SetRowUtilityValues rowIndex, "", "SOURCE_FILE_NOT_FOUND", "Source file not found for Part Number"
+                            WriteDebugPhase "SOURCE_FILE_NOT_FOUND", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, "Source not found. BlockedReason=" & gLastMatchBlockedReason
+                        End If
                     Else
-                        WriteDebugPhase "SOURCE_FILE_FOUND", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, sourcePath
+                        WriteDebugPhase "SOURCE_FILE_FOUND", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, BuildSourceMatchLogMessage()
+                        If UCase(gLastMatchedSourceExtension) = "CATPRODUCT" Then WriteDebugPhase "WARNING_SOURCE_IS_CATPRODUCT", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, BuildSourceMatchLogMessage()
                         If CaptureStandaloneImage(rawPartNumber, normalizedPartNumber, sourcePath, imagePath, thumbPath, rowIndex) Then
                             SetRowUtilityValues rowIndex, imagePath, "OK", ""
                             CacheImage normalizedPartNumber, imagePath, thumbPath
@@ -1234,6 +1373,7 @@ End Function
 
 Function SourcePathForPartNumber(partNumber)
     On Error Resume Next
+    ResetLastSourceMatch
     SourcePathForPartNumber = ""
     Dim normalizedPn
     Dim noRevPn
@@ -1241,19 +1381,131 @@ Function SourcePathForPartNumber(partNumber)
     normalizedPn = NormalizePartNumber(partNumber)
     If normalizedPn = "" Then Exit Function
     If gSourceIndex.Exists(normalizedPn) Then
-        SourcePathForPartNumber = CStr(gSourceIndex.Item(normalizedPn))
+        SourcePathForPartNumber = SelectBestSourceCandidate(CStr(gSourceIndex.Item(normalizedPn)), "EXACT")
         Exit Function
     End If
     noRevPn = PartNumberWithoutRevision(normalizedPn)
     If noRevPn <> "" And noRevPn <> normalizedPn Then
         If gSourceIndex.Exists(noRevPn) Then
-            SourcePathForPartNumber = CStr(gSourceIndex.Item(noRevPn))
+            SourcePathForPartNumber = SelectBestSourceCandidate(CStr(gSourceIndex.Item(noRevPn)), "NO_REV")
             Exit Function
         End If
     End If
     candidateKey = FindUniqueSourceIndexCandidate(normalizedPn)
     If candidateKey = "" And noRevPn <> "" And noRevPn <> normalizedPn Then candidateKey = FindUniqueSourceIndexCandidate(noRevPn)
-    If candidateKey <> "" Then SourcePathForPartNumber = CStr(gSourceIndex.Item(candidateKey))
+    If candidateKey <> "" Then SourcePathForPartNumber = SelectBestSourceCandidate(CStr(gSourceIndex.Item(candidateKey)), "SAFE_UNIQUE_PARTIAL")
+    Err.Clear
+End Function
+
+Sub ResetLastSourceMatch()
+    gLastMatchMethod = ""
+    gLastMatchedRawPartNumber = ""
+    gLastMatchedNormalizedPartNumber = ""
+    gLastMatchedSourceExtension = ""
+    gLastMatchedIsRootAssembly = False
+    gLastMatchedHasChildren = False
+    gLastMatchedDepth = 0
+    gLastMatchedProductName = ""
+    gLastMatchedCandidateCount = 0
+    gLastMatchBlockedReason = ""
+End Sub
+
+Function BuildSourceMatchLogMessage()
+    BuildSourceMatchLogMessage = _
+        "Matched ProductTree Part Number=" & gLastMatchedRawPartNumber & _
+        "; Matched normalized Part Number=" & gLastMatchedNormalizedPartNumber & _
+        "; Source extension=" & gLastMatchedSourceExtension & _
+        "; Is CATPart=" & CStr(UCase(gLastMatchedSourceExtension) = "CATPART") & _
+        "; Is CATProduct=" & CStr(UCase(gLastMatchedSourceExtension) = "CATPRODUCT") & _
+        "; Is root assembly=" & CStr(gLastMatchedIsRootAssembly) & _
+        "; Has children=" & CStr(gLastMatchedHasChildren) & _
+        "; Product name=" & gLastMatchedProductName & _
+        "; Depth=" & CStr(gLastMatchedDepth) & _
+        "; Match method=" & gLastMatchMethod & _
+        "; Candidate count=" & CStr(gLastMatchedCandidateCount) & _
+        "; Note=" & gLastMatchBlockedReason
+End Function
+
+Function SelectBestSourceCandidate(candidateListText, matchMethod)
+    On Error Resume Next
+    SelectBestSourceCandidate = ""
+    Dim records
+    Dim i
+    Dim rec
+    Dim bestRecord
+    Dim firstValidRecord
+    Dim validCount
+    Dim catPartCount
+    records = Split(CStr(candidateListText), vbLf)
+    gLastMatchedCandidateCount = UBound(records) + 1
+    validCount = 0
+    catPartCount = 0
+    bestRecord = ""
+    firstValidRecord = ""
+
+    For i = 0 To UBound(records)
+        rec = CStr(records(i))
+        If IsSelectableCandidate(rec) Then
+            validCount = validCount + 1
+            If firstValidRecord = "" Then firstValidRecord = rec
+            If UCase(CandidateField(rec, 3)) = "CATPART" Then
+                catPartCount = catPartCount + 1
+                If PREFER_CATPART_OVER_CATPRODUCT And bestRecord = "" Then bestRecord = rec
+            End If
+        End If
+    Next
+
+    If bestRecord = "" Then bestRecord = firstValidRecord
+    If bestRecord = "" Then Exit Function
+
+    FillLastMatchFromRecord bestRecord, matchMethod, catPartCount
+    SelectBestSourceCandidate = CandidateField(bestRecord, 2)
+    Err.Clear
+End Function
+
+Function IsSelectableCandidate(candidateRecord)
+    On Error Resume Next
+    IsSelectableCandidate = False
+    Dim sourcePath
+    Dim ext
+    Dim isRoot
+    Dim hasChildren
+    sourcePath = CandidateField(candidateRecord, 2)
+    ext = UCase(CandidateField(candidateRecord, 3))
+    isRoot = (CandidateField(candidateRecord, 4) = "1")
+    hasChildren = (CandidateField(candidateRecord, 5) = "1")
+    If sourcePath = "" Or Not gFSO.FileExists(sourcePath) Then Exit Function
+    If ext <> "CATPART" And ext <> "CATPRODUCT" Then Exit Function
+    If isRoot And Not ALLOW_ROOT_ASSEMBLY_IMAGE Then
+        gLastMatchBlockedReason = "ROOT_ASSEMBLY_MATCH_BLOCKED"
+        Exit Function
+    End If
+    If ext = "CATPRODUCT" And hasChildren And Not ALLOW_SUBASSEMBLY_IMAGE Then Exit Function
+    IsSelectableCandidate = True
+    Err.Clear
+End Function
+
+Sub FillLastMatchFromRecord(candidateRecord, matchMethod, catPartCount)
+    gLastMatchMethod = matchMethod
+    gLastMatchedRawPartNumber = CandidateField(candidateRecord, 0)
+    gLastMatchedNormalizedPartNumber = CandidateField(candidateRecord, 1)
+    gLastMatchedSourceExtension = UCase(CandidateField(candidateRecord, 3))
+    gLastMatchedIsRootAssembly = (CandidateField(candidateRecord, 4) = "1")
+    gLastMatchedHasChildren = (CandidateField(candidateRecord, 5) = "1")
+    gLastMatchedDepth = CLng(Val(CandidateField(candidateRecord, 6)))
+    gLastMatchedProductName = CandidateField(candidateRecord, 7)
+    If catPartCount > 1 Then gLastMatchBlockedReason = "DUPLICATE_CATPART_CANDIDATES"
+End Sub
+
+Function CandidateField(candidateRecord, fieldIndex)
+    On Error Resume Next
+    Dim parts
+    parts = Split(CStr(candidateRecord), vbTab)
+    If UBound(parts) >= CLng(fieldIndex) Then
+        CandidateField = CStr(parts(CLng(fieldIndex)))
+    Else
+        CandidateField = ""
+    End If
     Err.Clear
 End Function
 
@@ -1476,20 +1728,21 @@ Function FindUniqueSourceIndexCandidate(normalizedPartNumber)
     wantedNoRev = PartNumberWithoutRevision(normalizedPartNumber)
     matchCount = 0
     matchKey = ""
+    If Len(normalizedPartNumber) < 5 Then Exit Function
     For Each key In gSourceIndex.Keys
         keyNoRev = PartNumberWithoutRevision(CStr(key))
-        If keyNoRev = wantedNoRev Then
+        If (keyNoRev = wantedNoRev Or IsSafePartialPartNumberMatch(normalizedPartNumber, CStr(key))) Then
+            If SelectBestSourceCandidate(CStr(gSourceIndex.Item(CStr(key))), "SAFE_UNIQUE_PARTIAL") <> "" Then
             matchCount = matchCount + 1
             matchKey = CStr(key)
-        ElseIf IsSafePartialPartNumberMatch(normalizedPartNumber, CStr(key)) Then
-            matchCount = matchCount + 1
-            matchKey = CStr(key)
+            End If
         End If
         If matchCount > 1 Then
             matchKey = ""
             Exit For
         End If
     Next
+    ResetLastSourceMatch
     FindUniqueSourceIndexCandidate = matchKey
     Err.Clear
 End Function
@@ -1498,7 +1751,7 @@ Function IsSafePartialPartNumberMatch(a, b)
     a = NormalizePartNumber(a)
     b = NormalizePartNumber(b)
     If a = "" Or b = "" Then Exit Function
-    If Len(a) < 6 Or Len(b) < 6 Then Exit Function
+    If Len(a) < 5 Or Len(b) < 5 Then Exit Function
     If Len(a) < Len(b) Then
         If Left(b, Len(a)) = a Then IsSafePartialPartNumberMatch = IsPartNumberBoundary(Mid(b, Len(a) + 1, 1))
     ElseIf Len(b) < Len(a) Then
@@ -1512,17 +1765,28 @@ End Function
 
 Function NormalizeHeaderName(valueText)
     Dim s
-    s = LCase(Trim(CStr(valueText)))
-    s = Replace(s, ChrW(&H10D), "c")
-    s = Replace(s, ChrW(&H107), "c")
-    s = Replace(s, ChrW(&H161), "s")
-    s = Replace(s, ChrW(&H111), "d")
-    s = Replace(s, ChrW(&H17E), "z")
-    s = Replace(s, ".", "")
-    s = Replace(s, " ", "")
-    s = Replace(s, "_", "")
-    s = Replace(s, "-", "")
-    NormalizeHeaderName = s
+    Dim i
+    Dim ch
+    Dim code
+    Dim outText
+    s = UCase(Trim(CStr(valueText)))
+    s = Replace(s, ChrW(&H10C), "C")
+    s = Replace(s, ChrW(&H10D), "C")
+    s = Replace(s, ChrW(&H106), "C")
+    s = Replace(s, ChrW(&H107), "C")
+    s = Replace(s, ChrW(&H160), "S")
+    s = Replace(s, ChrW(&H161), "S")
+    s = Replace(s, ChrW(&H110), "D")
+    s = Replace(s, ChrW(&H111), "D")
+    s = Replace(s, ChrW(&H17D), "Z")
+    s = Replace(s, ChrW(&H17E), "Z")
+    outText = ""
+    For i = 1 To Len(s)
+        ch = Mid(s, i, 1)
+        code = Asc(ch)
+        If (code >= 48 And code <= 57) Or (code >= 65 And code <= 90) Then outText = outText & ch
+    Next
+    NormalizeHeaderName = outText
 End Function
 
 Function LastUsedRow(ws)

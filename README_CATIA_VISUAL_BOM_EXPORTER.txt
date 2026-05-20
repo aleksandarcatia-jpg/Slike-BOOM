@@ -23,8 +23,10 @@ Osnovni tok:
    - Image Skip Reason
 6. Product Tree se koristi samo za indeks:
    Part Number -> source CATPart/CATProduct path.
-7. Slike se prave samo otvaranjem CATPart/CATProduct fajla kao standalone dokument/prozor.
-8. Makro zatvara samo dokumente koje je sam otvorio za slikanje i nikada ih ne snima.
+7. Part Number lookup se radi preko normalizovane vrednosti: skidaju se navodnici, TAB/CR/LF, zavrsni separatori kao zarez/semicolon/colon/pipe i visestruki razmaci.
+8. Ako exact match ne uspe, makro pokusava match bez REV nastavka i zatim jedinstveni safe partial match.
+9. Slike se prave samo otvaranjem CATPart/CATProduct fajla kao standalone dokument/prozor.
+10. Makro zatvara samo dokumente koje je sam otvorio za slikanje i nikada ih ne snima.
 
 Izlazni folder:
 ROOT_PARTNUMBER_VISUAL_BOM_EXPORT

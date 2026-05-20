@@ -539,13 +539,15 @@ Private Function ProcessBomRowsForThumbnails()
     Dim imagePath
     Dim thumbPath
     Dim shouldMakeImage
+    Dim normalizedPartNumber
 
     For i = 1 To ListCount(gBomRows)
         Set rec = ListObject(gBomRows, i)
         excelRow = CLng(rec.Item("ExcelRow"))
         partNumber = GetPartNumberFromRow(rec)
+        normalizedPartNumber = NormalizePartNumber(partNumber)
         CATIA.StatusBar = "BOM thumbnail row " & CStr(i) & " / " & CStr(ListCount(gBomRows)) & " - " & partNumber
-        WriteDebugPhase "ROW_START", excelRow, partNumber, ""
+        WriteDebugPhase "ROW_START", excelRow, partNumber, "Raw BOM Part Number=" & partNumber & "; Normalized BOM Part Number=" & normalizedPartNumber
         shouldMakeImage = True
 
         If SKIP_FASTENER_IMAGES And IsFastenerBomRow(rec) Then
@@ -580,8 +582,8 @@ Private Function ProcessBomRowsForThumbnails()
                 sourcePath = SourcePathForPartNumber(partNumber)
                 If sourcePath = "" Or Not gFSO.FileExists(sourcePath) Then
                     SetBomUtilityValues rec, "", "", "SOURCE_FILE_NOT_FOUND", "Source file not found"
-                    WriteExportLog excelRow, partNumber, "SOURCE_FILE_NOT_FOUND", "SOURCE_FILE_NOT_FOUND", "Source file not found for Part Number: " & partNumber, "", ""
-                    WriteDebugPhase "SOURCE_FILE_NOT_FOUND", excelRow, partNumber, "Source file not found for Part Number: " & partNumber
+                    WriteExportLog excelRow, partNumber, "SOURCE_FILE_NOT_FOUND", "SOURCE_FILE_NOT_FOUND", "Source file not found for Part Number: " & partNumber & "; normalized=" & normalizedPartNumber, "", ""
+                    WriteDebugPhase "SOURCE_FILE_NOT_FOUND", excelRow, partNumber, "Source file not found for Part Number: " & partNumber & "; normalized=" & normalizedPartNumber
                     AbortWithMessage "Source file not found for Part Number: " & partNumber, "SOURCE_FILE_NOT_FOUND", excelRow, partNumber
                     Exit Function
                 End If
@@ -594,7 +596,7 @@ Private Function ProcessBomRowsForThumbnails()
                     Exit Function
                 End If
 
-                WriteDebugPhase "SOURCE_FILE_FOUND", excelRow, partNumber, sourcePath
+                WriteDebugPhase "SOURCE_FILE_FOUND", excelRow, partNumber, "Normalized BOM Part Number=" & normalizedPartNumber & "; Source=" & sourcePath
                 If Not CaptureStandaloneImage(partNumber, sourcePath, imagePath, thumbPath, excelRow) Then
                     SetBomUtilityValues rec, imagePath, thumbPath, "STANDALONE_CAPTURE_FAILED", "Standalone open/capture failed"
                     AbortWithMessage "Standalone capture failed for Part Number: " & partNumber, "STANDALONE_CAPTURE_FAILED", excelRow, partNumber
@@ -629,12 +631,15 @@ End Sub
 Private Sub TraverseProductForSourceIndex(prod)
     On Error Resume Next
     Dim pn
+    Dim normalizedPn
     Dim sourcePath
     pn = GetProductPartNumber(prod)
+    normalizedPn = NormalizePartNumber(pn)
     sourcePath = GetProductSourceFilePath(prod)
+    If pn <> "" Then WriteDebugPhase "CATIA_FILE_INDEX_ITEM", 0, pn, "Raw ProductTree Part Number=" & pn & "; Normalized ProductTree Part Number=" & normalizedPn & "; Source=" & sourcePath
     If pn <> "" And sourcePath <> "" Then
-        If Not SamePath(sourcePath, gMainDocumentFullName) Or NormalizePartNumber(pn) = NormalizePartNumber(GetProductPartNumber(gRootProduct)) Then
-            If Not gSourceIndex.Exists(NormalizePartNumber(pn)) Then gSourceIndex.Item(NormalizePartNumber(pn)) = sourcePath
+        If Not SamePath(sourcePath, gMainDocumentFullName) Or normalizedPn = NormalizePartNumber(GetProductPartNumber(gRootProduct)) Then
+            If Not gSourceIndex.Exists(normalizedPn) Then gSourceIndex.Item(normalizedPn) = sourcePath
         End If
     End If
 
@@ -963,8 +968,32 @@ Private Sub UpdateSummarySheet()
 End Sub
 
 Private Function SourcePathForPartNumber(partNumber)
+    On Error Resume Next
     SourcePathForPartNumber = ""
-    If gSourceIndex.Exists(NormalizePartNumber(partNumber)) Then SourcePathForPartNumber = CStr(gSourceIndex.Item(NormalizePartNumber(partNumber)))
+    Dim normalizedPn
+    Dim noRevPn
+    Dim candidateKey
+
+    normalizedPn = NormalizePartNumber(partNumber)
+    If normalizedPn = "" Then Exit Function
+
+    If gSourceIndex.Exists(normalizedPn) Then
+        SourcePathForPartNumber = CStr(gSourceIndex.Item(normalizedPn))
+        Exit Function
+    End If
+
+    noRevPn = PartNumberWithoutRevision(normalizedPn)
+    If noRevPn <> "" And noRevPn <> normalizedPn Then
+        If gSourceIndex.Exists(noRevPn) Then
+            SourcePathForPartNumber = CStr(gSourceIndex.Item(noRevPn))
+            Exit Function
+        End If
+    End If
+
+    candidateKey = FindUniqueSourceIndexCandidate(normalizedPn)
+    If candidateKey = "" And noRevPn <> "" And noRevPn <> normalizedPn Then candidateKey = FindUniqueSourceIndexCandidate(noRevPn)
+    If candidateKey <> "" Then SourcePathForPartNumber = CStr(gSourceIndex.Item(candidateKey))
+    Err.Clear
 End Function
 
 Private Function ReuseExistingOrCachedImage(partNumber, imagePath, thumbPath, rec)
@@ -1199,8 +1228,93 @@ Private Function SamePath(pathA, pathB)
     SamePath = (UCase(Trim(CStr(pathA))) = UCase(Trim(CStr(pathB))) And Trim(CStr(pathA)) <> "")
 End Function
 
-Private Function NormalizePartNumber(partNumber)
-    NormalizePartNumber = UCase(Trim(CStr(partNumber)))
+Private Function NormalizePartNumber(value)
+    Dim s
+    s = CStr(value)
+    s = Replace(s, """", "")
+    s = Replace(s, "'", "")
+    s = Replace(s, vbTab, " ")
+    s = Replace(s, vbCr, " ")
+    s = Replace(s, vbLf, " ")
+    s = Trim(s)
+
+    Do While Len(s) > 0 And IsTrailingPartNumberSeparator(Right(s, 1))
+        s = Left(s, Len(s) - 1)
+        s = Trim(s)
+    Loop
+
+    Do While InStr(1, s, "  ", vbTextCompare) > 0
+        s = Replace(s, "  ", " ")
+    Loop
+
+    NormalizePartNumber = UCase(s)
+End Function
+
+Private Function IsTrailingPartNumberSeparator(ch)
+    IsTrailingPartNumberSeparator = (ch = "," Or ch = ";" Or ch = ":" Or ch = "|")
+End Function
+
+Private Function PartNumberWithoutRevision(normalizedPartNumber)
+    On Error Resume Next
+    Dim s
+    Dim re
+    s = NormalizePartNumber(normalizedPartNumber)
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = False
+    re.IgnoreCase = True
+    re.Pattern = "([\s_\-\.\/]+)(REV|REVISION|R)[\s_\-\.]*[A-Z0-9]+$"
+    If re.Test(s) Then s = re.Replace(s, "")
+    PartNumberWithoutRevision = NormalizePartNumber(s)
+    Err.Clear
+End Function
+
+Private Function FindUniqueSourceIndexCandidate(normalizedPartNumber)
+    On Error Resume Next
+    Dim key
+    Dim keyNoRev
+    Dim wantedNoRev
+    Dim matchCount
+    Dim matchKey
+
+    normalizedPartNumber = NormalizePartNumber(normalizedPartNumber)
+    wantedNoRev = PartNumberWithoutRevision(normalizedPartNumber)
+    matchCount = 0
+    matchKey = ""
+
+    For Each key In gSourceIndex.Keys
+        keyNoRev = PartNumberWithoutRevision(CStr(key))
+        If keyNoRev = wantedNoRev Then
+            matchCount = matchCount + 1
+            matchKey = CStr(key)
+        ElseIf IsSafePartialPartNumberMatch(normalizedPartNumber, CStr(key)) Then
+            matchCount = matchCount + 1
+            matchKey = CStr(key)
+        End If
+        If matchCount > 1 Then
+            matchKey = ""
+            Exit For
+        End If
+    Next
+
+    FindUniqueSourceIndexCandidate = matchKey
+    Err.Clear
+End Function
+
+Private Function IsSafePartialPartNumberMatch(a, b)
+    a = NormalizePartNumber(a)
+    b = NormalizePartNumber(b)
+    If a = "" Or b = "" Then Exit Function
+    If Len(a) < 6 Or Len(b) < 6 Then Exit Function
+
+    If Len(a) < Len(b) Then
+        If Left(b, Len(a)) = a Then IsSafePartialPartNumberMatch = IsPartNumberBoundary(Mid(b, Len(a) + 1, 1))
+    ElseIf Len(b) < Len(a) Then
+        If Left(a, Len(b)) = b Then IsSafePartialPartNumberMatch = IsPartNumberBoundary(Mid(a, Len(b) + 1, 1))
+    End If
+End Function
+
+Private Function IsPartNumberBoundary(ch)
+    IsPartNumberBoundary = (ch = "" Or ch = " " Or ch = "_" Or ch = "-" Or ch = "." Or ch = "/" Or ch = "," Or ch = ";" Or ch = ":" Or ch = "|")
 End Function
 
 Private Function DetectDelimiter(lineText)

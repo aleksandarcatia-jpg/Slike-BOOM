@@ -26,16 +26,23 @@ Const THUMBNAIL_HEIGHT = 120
 Const CREATE_THUMBNAIL_FILES = True
 Const INSERT_THUMBNAIL_FILE_IN_EXCEL = True
 Const INSERT_IMAGES_IN_EXCEL = True
+Const FORCE_DEFAULT_BOM_COLUMNS = False
+Const SMOKE_TEST_BOM_ONLY = False
+Const DEBUG_FORCE_RECORDER_STYLE_PATH = False
+Const STOP_ON_SOURCE_NOT_FOUND = False
 Const TEST_MODE = True
 Const TEST_MAX_ROWS = 20
 Const TEST_PHASE_TIMEOUT_SECONDS = 30
 Const SAVE_EVERY_N_ROWS = 25
 Const RESUME_MODE = True
 Const SKIP_EXISTING_IMAGES = True
+Const USE_AUTO_CROP_WHITE_BACKGROUND = True
+Const CROP_PADDING_PERCENT = 0.1
+Const MIN_CROP_PADDING_PIXELS = 25
 Const USE_SHADED_WITH_EDGES = True
 Const USE_WHITE_BACKGROUND = True
 Const USE_PARALLEL_PROJECTION = True
-Const IMAGE_CAPTURE_DELAY_SECONDS = 0.15
+Const IMAGE_CAPTURE_DELAY_SECONDS = 0.2
 
 ' CATIA constants used late-bound.
 Const CAT_CAPTURE_FORMAT_JPEG = 2
@@ -62,6 +69,7 @@ Dim gMainDocumentFullName
 Dim gExcelPath
 Dim gOutputFolder
 Dim gImageFolder
+Dim gCroppedFolder
 Dim gThumbnailFolder
 Dim gDebugLogPath
 Dim gExcelApp
@@ -73,6 +81,7 @@ Dim gHeaderRow
 Dim gPartNumberColumnIndex
 Dim gThumbnailColumnIndex
 Dim gImagePathColumnIndex
+Dim gCroppedImagePathColumnIndex
 Dim gThumbnailPathColumnIndex
 Dim gExportStatusColumnIndex
 Dim gImageSkipReasonColumnIndex
@@ -83,6 +92,8 @@ Dim gNextLogRow
 Dim gProcessedImageRows
 Dim gSuccessfulImageRows
 Dim gSkippedFastenerRows
+Dim gRowsWithoutPartNumber
+Dim gSourceNotFoundRows
 Dim gErrorCount
 Dim gCurrentStandaloneDoc
 Dim gCurrentStandaloneOpened
@@ -99,9 +110,16 @@ Sub CATIA_VISUAL_BOM_EXPORTER()
 
     WriteDebugPhase "START", 0, "", "", "", "CATIA_VISUAL_BOM_EXPORTER started."
 
-    If Not ExportBomWithBillOfMaterialPrintXls(gExcelPath) Then
+    If Not PrintBomToXls(gExcelPath) Then
         If gAbortAlreadyHandled Then Exit Sub
         AbortWithMessage "CATIA BillOfMaterial Print XLS nije uspeo.", "CATIA_BOM_PRINT_XLS_START", 0, "", "", ""
+        Exit Sub
+    End If
+
+    If SMOKE_TEST_BOM_ONLY Then
+        WriteDebugPhase "SMOKE_TEST_BOM_ONLY", 0, "", "", gExcelPath, "BOM XLS export successful; stopping before Excel image workflow."
+        CleanupCatiaSession
+        MsgBox "BOM XLS export uspesan" & vbCrLf & vbCrLf & gExcelPath, vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
         Exit Sub
     End If
 
@@ -146,6 +164,7 @@ Sub InitializeRuntime()
     gPartNumberColumnIndex = 0
     gThumbnailColumnIndex = 0
     gImagePathColumnIndex = 0
+    gCroppedImagePathColumnIndex = 0
     gThumbnailPathColumnIndex = 0
     gExportStatusColumnIndex = 0
     gImageSkipReasonColumnIndex = 0
@@ -154,6 +173,8 @@ Sub InitializeRuntime()
     gProcessedImageRows = 0
     gSuccessfulImageRows = 0
     gSkippedFastenerRows = 0
+    gRowsWithoutPartNumber = 0
+    gSourceNotFoundRows = 0
     gErrorCount = 0
     gAbortAlreadyHandled = False
     gFirstImageStatusShown = False
@@ -193,6 +214,24 @@ Function SelectExportPathAndPrepareFolders()
     rootPartNumber = GetProductPartNumber(gProduct)
     defaultFolder = GetDefaultOutputFolder()
 
+    If DEBUG_FORCE_RECORDER_STYLE_PATH Then
+        If Not gFSO.FolderExists("C:\Temp") Then gFSO.CreateFolder "C:\Temp"
+        gExcelPath = "C:\Temp\CATIA_BOM_TEST.xls"
+        PrepareFoldersNextToExcel gExcelPath
+        If gFSO.FileExists(gExcelPath) Then
+            Err.Clear
+            gFSO.DeleteFile gExcelPath, True
+            If Err.Number <> 0 Then
+                AbortWithMessage "Ne mogu da obrisem DEBUG XLS fajl. Zatvorite fajl ako je otvoren u Excelu: " & gExcelPath, "OUTPUT_XLS_OVERWRITE", 0, "", "", gExcelPath
+                Err.Clear
+                Exit Function
+            End If
+        End If
+        WriteDebugPhase "OUTPUT_XLS_PATH_PREPARED", 0, "", "", gExcelPath, "DEBUG_FORCE_RECORDER_STYLE_PATH=True"
+        SelectExportPathAndPrepareFolders = True
+        Exit Function
+    End If
+
     CATIA.StatusBar = ChrW(&H10C) & "ekam izbor foldera za Excel export..."
     WriteDebugPhase "USER_FOLDER_DIALOG_OPENED", 0, "", "", "", "Waiting for user folder selection - no timeout."
     selectedFolder = AskUserForOutputFolder(defaultFolder)
@@ -208,8 +247,10 @@ Function SelectExportPathAndPrepareFolders()
     gExcelPath = ResolveExistingOutputFile(gExcelPath)
     If gExcelPath = "" Then
         CATIA.StatusBar = ""
-        WriteDebugPhase "OUTPUT_XLS_CANCELLED", 0, "", "", "", "User cancelled existing file decision."
-        MsgBox "Export je otkazan od strane korisnika.", vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
+        If Not gAbortAlreadyHandled Then
+            WriteDebugPhase "OUTPUT_XLS_CANCELLED", 0, "", "", "", "User cancelled existing file decision."
+            MsgBox "Export je otkazan od strane korisnika.", vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
+        End If
         Exit Function
     End If
 
@@ -226,13 +267,42 @@ Function AskUserForOutputFolder(defaultFolder)
     Dim folder
     Dim folderPath
     Set shellApp = CreateObject("Shell.Application")
+    If Err.Number <> 0 Or shellApp Is Nothing Then
+        Err.Clear
+        AskUserForOutputFolder = AskUserForOutputFolderInputBox(defaultFolder)
+        Exit Function
+    End If
+    Err.Clear
     Set folder = shellApp.BrowseForFolder(0, "Izaberite folder gde zelite da sacuvate CATIA BOM Excel export", 0, defaultFolder)
+    If Err.Number <> 0 Then
+        Err.Clear
+        AskUserForOutputFolder = AskUserForOutputFolderInputBox(defaultFolder)
+        Exit Function
+    End If
     If folder Is Nothing Then
         Err.Clear
         Exit Function
     End If
     folderPath = folder.Self.Path
     AskUserForOutputFolder = CStr(folderPath)
+    Err.Clear
+End Function
+
+Function AskUserForOutputFolderInputBox(defaultFolder)
+    On Error Resume Next
+    Dim folderPath
+    folderPath = InputBox("Unesite/potvrdite folder za CATIA BOM Excel export:", "CATIA_VISUAL_BOM_EXPORTER", defaultFolder)
+    folderPath = Trim(CStr(folderPath))
+    If folderPath <> "" Then
+        If gFSO.FolderExists(folderPath) Then
+            AskUserForOutputFolderInputBox = folderPath
+        Else
+            MsgBox "Folder ne postoji: " & folderPath, vbExclamation, "CATIA_VISUAL_BOM_EXPORTER"
+            AskUserForOutputFolderInputBox = ""
+        End If
+    Else
+        AskUserForOutputFolderInputBox = ""
+    End If
     Err.Clear
 End Function
 
@@ -248,11 +318,12 @@ Function BuildBomExcelPath(selectedFolder, rootPartNumber)
     baseName = SafeFileName(rootPartNumber)
     If baseName = "" Then baseName = SafeFileName(gProduct.Name)
     If baseName = "" Then baseName = "CATIA_BOM"
-    BuildBomExcelPath = JoinPath(selectedFolder, baseName & "_VISUAL_BOM_EXPORT.xls")
+    BuildBomExcelPath = EnsureXlsExtension(JoinPath(selectedFolder, baseName & "_VISUAL_BOM_EXPORT.xls"))
 End Function
 
 Function ResolveExistingOutputFile(xlsPath)
     On Error Resume Next
+    xlsPath = EnsureXlsExtension(xlsPath)
     ResolveExistingOutputFile = xlsPath
     If Not gFSO.FileExists(xlsPath) Then Exit Function
 
@@ -265,11 +336,19 @@ Function ResolveExistingOutputFile(xlsPath)
                     vbYesNoCancel + vbQuestion, "CATIA_VISUAL_BOM_EXPORTER")
 
     If answer = vbYes Then
+        Err.Clear
         gFSO.DeleteFile xlsPath, True
+        If Err.Number <> 0 Then
+            PrepareFoldersNextToExcel xlsPath
+            AbortWithMessage "Ne mogu da obrisem postojeci XLS. Zatvorite fajl ako je otvoren u Excelu: " & xlsPath, "OUTPUT_XLS_OVERWRITE", 0, "", "", xlsPath
+            Err.Clear
+            ResolveExistingOutputFile = ""
+            Exit Function
+        End If
         WriteDebugPhase "OUTPUT_XLS_OVERWRITE_CONFIRMED", 0, "", "", xlsPath, xlsPath
         ResolveExistingOutputFile = xlsPath
     ElseIf answer = vbNo Then
-        ResolveExistingOutputFile = Replace(xlsPath, ".xls", "_" & TimestampForFile() & ".xls")
+        ResolveExistingOutputFile = Replace(EnsureXlsExtension(xlsPath), ".xls", "_" & TimestampForFile() & ".xls")
         WriteDebugPhase "OUTPUT_XLS_TIMESTAMP_CREATED", 0, "", "", ResolveExistingOutputFile, ResolveExistingOutputFile
     Else
         ResolveExistingOutputFile = ""
@@ -280,21 +359,44 @@ End Function
 Sub PrepareFoldersNextToExcel(bomExcelPath)
     gOutputFolder = JoinPath(gFSO.GetParentFolderName(bomExcelPath), gFSO.GetBaseName(bomExcelPath) & "_FILES")
     gImageFolder = JoinPath(gOutputFolder, "IMAGES")
+    gCroppedFolder = JoinPath(gOutputFolder, "CROPPED")
     gThumbnailFolder = JoinPath(gOutputFolder, "THUMBNAILS")
     gDebugLogPath = JoinPath(gOutputFolder, "DEBUG_PHASE_LOG.txt")
     EnsureFolder gOutputFolder
     EnsureFolder gImageFolder
+    EnsureFolder gCroppedFolder
     EnsureFolder gThumbnailFolder
 End Sub
 
-Function ExportBomWithBillOfMaterialPrintXls(bomExcelPath)
+Function PrintBomToXls(bomExcelPath)
     On Error Resume Next
-    ExportBomWithBillOfMaterialPrintXls = False
+    PrintBomToXls = False
     Dim productDocument1
     Dim product1
     Dim assemblyConvertor1
     Dim arrayOfVariantOfBSTR1(6)
+    Dim parentFolder
     Dim phaseStart
+
+    bomExcelPath = EnsureXlsExtension(bomExcelPath)
+    gExcelPath = bomExcelPath
+    parentFolder = gFSO.GetParentFolderName(bomExcelPath)
+    WriteDebugPhase "BOM_PRINT_PATH_CHECK", 0, "", "", bomExcelPath, _
+                    "Path=" & bomExcelPath & _
+                    "; ParentFolder=" & parentFolder & _
+                    "; FolderExists=" & CStr(gFSO.FolderExists(parentFolder)) & _
+                    "; FileExistsBeforePrint=" & CStr(gFSO.FileExists(bomExcelPath)) & _
+                    "; IsLocalWindowsPath=" & CStr(IsLocalWindowsPath(bomExcelPath))
+
+    If parentFolder = "" Or Not gFSO.FolderExists(parentFolder) Then
+        AbortWithMessage "Folder za XLS export ne postoji: " & parentFolder, "BOM_PRINT_PATH_CHECK", 0, "", "", bomExcelPath
+        Exit Function
+    End If
+
+    If gFSO.FileExists(bomExcelPath) Then
+        AbortWithMessage "XLS fajl i dalje postoji pre CATIA Print komande. Zatvorite ga ako je otvoren u Excelu: " & bomExcelPath, "BOM_PRINT_PATH_CHECK", 0, "", "", bomExcelPath
+        Exit Function
+    End If
 
     Set productDocument1 = CATIA.ActiveDocument
     Set product1 = productDocument1.Product
@@ -302,26 +404,37 @@ Function ExportBomWithBillOfMaterialPrintXls(bomExcelPath)
     Set gAssemblyConvertor = assemblyConvertor1
 
     If Err.Number <> 0 Or assemblyConvertor1 Is Nothing Then
+        WriteDebugPhase "ERROR", 0, "", "", bomExcelPath, "GetItem(""BillOfMaterial"") failed. Err.Number=" & CStr(Err.Number) & "; Err.Description=" & Err.Description
         AbortWithMessage "CATIA BillOfMaterial objekat nije dostupan preko product.GetItem(""BillOfMaterial"").", "BOM_FORMAT_SET", 0, "", "", bomExcelPath
         Err.Clear
         Exit Function
     End If
 
-    arrayOfVariantOfBSTR1(0) = "Nomenclature"
-    arrayOfVariantOfBSTR1(1) = "Quantity"
-    arrayOfVariantOfBSTR1(2) = "Part Number"
-    arrayOfVariantOfBSTR1(3) = "Dimenzija"
-    arrayOfVariantOfBSTR1(4) = "Material"
-    arrayOfVariantOfBSTR1(5) = "Mass"
-    arrayOfVariantOfBSTR1(6) = "Standard"
+    If FORCE_DEFAULT_BOM_COLUMNS Then
+        arrayOfVariantOfBSTR1(0) = "Nomenclature"
+        arrayOfVariantOfBSTR1(1) = "Quantity"
+        arrayOfVariantOfBSTR1(2) = "Part Number"
+        arrayOfVariantOfBSTR1(3) = "Dimenzija"
+        arrayOfVariantOfBSTR1(4) = "Material"
+        arrayOfVariantOfBSTR1(5) = "Mass"
+        arrayOfVariantOfBSTR1(6) = "Standard"
 
-    WriteDebugPhase "BOM_FORMAT_SET", 0, "", "", "", "Setting CATIA BOM secondary format."
-    Err.Clear
-    assemblyConvertor1.SetSecondaryFormat arrayOfVariantOfBSTR1
-    If Err.Number <> 0 Then
-        AbortWithMessage "CATIA SetSecondaryFormat nije uspeo: " & Err.Description, "BOM_FORMAT_SET", 0, "", "", bomExcelPath
         Err.Clear
-        Exit Function
+        WriteDebugPhase "BOM_FORMAT_SET_START", 0, "", "", bomExcelPath, "SetSecondaryFormat start because FORCE_DEFAULT_BOM_COLUMNS=True."
+        assemblyConvertor1.SetSecondaryFormat arrayOfVariantOfBSTR1
+        If Err.Number <> 0 Then
+            WriteDebugPhase "ERROR", 0, "", "", bomExcelPath, "SetSecondaryFormat failed. Err.Number=" & CStr(Err.Number) & "; Err.Description=" & Err.Description
+            AbortWithMessage "CATIA BillOfMaterial.SetSecondaryFormat nije uspeo: " & Err.Description, "BOM_FORMAT_SET", 0, "", "", bomExcelPath
+            Err.Clear
+            Exit Function
+        End If
+        WriteDebugPhase "BOM_FORMAT_SET_DONE", 0, "", "", bomExcelPath, "SetSecondaryFormat OK."
+    Else
+        WriteDebugPhase "BOM_FORMAT_USER_DEFINED", 0, "", "", bomExcelPath, "Using CATIA user-defined BOM format; SetSecondaryFormat not called."
+    End If
+
+    If SMOKE_TEST_BOM_ONLY Then
+        WriteDebugPhase "SMOKE_TEST_BOM_ONLY", 0, "", "", bomExcelPath, "Smoke test enabled; only BOM XLS export will run."
     End If
 
     WriteDebugPhase "CATIA_BOM_PRINT_XLS_START", 0, "", "", bomExcelPath, bomExcelPath
@@ -330,12 +443,21 @@ Function ExportBomWithBillOfMaterialPrintXls(bomExcelPath)
     Err.Clear
     assemblyConvertor1.Print "XLS", bomExcelPath, product1
     If Err.Number <> 0 Then
-        AbortWithMessage "CATIA BillOfMaterial.Print XLS nije uspeo: " & Err.Description, "CATIA_BOM_PRINT_XLS_START", 0, "", "", bomExcelPath
+        WriteDebugPhase "CATIA_BOM_PRINT_XLS_FAILED", 0, "", "", bomExcelPath, _
+                        "Err.Number=" & CStr(Err.Number) & _
+                        "; Err.Description=" & Err.Description & _
+                        "; Path=" & bomExcelPath
+        AbortWithMessage "CATIA BillOfMaterial.Print XLS nije uspeo." & vbCrLf & _
+                         "Proverite da li je XLS fajl zatvoren i da li folder postoji." & vbCrLf & _
+                         "Putanja: " & bomExcelPath & vbCrLf & _
+                         "Detalji su u DEBUG_PHASE_LOG.txt.", _
+                         "CATIA_BOM_PRINT_XLS_START", 0, "", "", bomExcelPath
         Err.Clear
         Exit Function
     End If
 
     If Not gFSO.FileExists(bomExcelPath) Then
+        WriteDebugPhase "CATIA_BOM_PRINT_XLS_FAILED", 0, "", "", bomExcelPath, "Print returned no error, but XLS file does not exist: " & bomExcelPath
         AbortWithMessage "CATIA nije napravila XLS fajl: " & bomExcelPath, "CATIA_BOM_PRINT_XLS_DONE", 0, "", "", bomExcelPath
         Exit Function
     End If
@@ -343,7 +465,7 @@ Function ExportBomWithBillOfMaterialPrintXls(bomExcelPath)
     CATIA.StatusBar = "3/6 BOM Excel napravljen."
     WriteDebugPhase "CATIA_BOM_PRINT_XLS_DONE", 0, "", "", bomExcelPath, bomExcelPath
     If Not CheckTimedPhase("CATIA_BOM_PRINT_XLS", phaseStart, 0, "", "", bomExcelPath) Then Exit Function
-    ExportBomWithBillOfMaterialPrintXls = True
+    PrintBomToXls = True
     Err.Clear
 End Function
 
@@ -429,6 +551,7 @@ Sub EnsureHelperColumns()
     End If
 
     gImagePathColumnIndex = EnsureEndHelperColumn("Image Path")
+    gCroppedImagePathColumnIndex = EnsureEndHelperColumn("Cropped Image Path")
     gThumbnailPathColumnIndex = EnsureEndHelperColumn("Thumbnail Path")
     gExportStatusColumnIndex = EnsureEndHelperColumn("Export Status")
     gImageSkipReasonColumnIndex = EnsureEndHelperColumn("Image Skip Reason")
@@ -436,10 +559,12 @@ Sub EnsureHelperColumns()
     gWsBom.Rows(gHeaderRow).Font.Bold = True
     gWsBom.Columns(gThumbnailColumnIndex).ColumnWidth = 24
     gWsBom.Columns(gImagePathColumnIndex).ColumnWidth = 45
+    gWsBom.Columns(gCroppedImagePathColumnIndex).ColumnWidth = 45
     gWsBom.Columns(gThumbnailPathColumnIndex).ColumnWidth = 45
     gWsBom.Columns(gExportStatusColumnIndex).ColumnWidth = 22
     gWsBom.Columns(gImageSkipReasonColumnIndex).ColumnWidth = 42
     ApplyBomBorders
+    WriteDebugPhase "HELPER_COLUMNS_ADDED", gHeaderRow, "", "", "", "Thumbnail/Image/Cropped/Status helper columns prepared."
     Err.Clear
 End Sub
 
@@ -497,10 +622,11 @@ Sub PrepareLogSheet()
     gWsLog.Cells(1, 7).Value = "Phase"
     gWsLog.Cells(1, 8).Value = "Message"
     gWsLog.Cells(1, 9).Value = "Image Path"
-    gWsLog.Cells(1, 10).Value = "Thumbnail Path"
-    gWsLog.Cells(1, 11).Value = "Source Path"
+    gWsLog.Cells(1, 10).Value = "Cropped Image Path"
+    gWsLog.Cells(1, 11).Value = "Thumbnail Path"
+    gWsLog.Cells(1, 12).Value = "Source Path"
     gWsLog.Rows(1).Font.Bold = True
-    gWsLog.Columns("A:K").ColumnWidth = 24
+    gWsLog.Columns("A:L").ColumnWidth = 24
 End Sub
 
 Sub PrepareSummarySheet()
@@ -510,12 +636,17 @@ Sub PrepareSummarySheet()
     gWsSummary.Cells(5, 1).Value = "Excel path"
     gWsSummary.Cells(6, 1).Value = "Output folder"
     gWsSummary.Cells(7, 1).Value = "Total BOM rows"
-    gWsSummary.Cells(8, 1).Value = "Images processed"
-    gWsSummary.Cells(9, 1).Value = "Successful images"
-    gWsSummary.Cells(10, 1).Value = "Skipped fasteners"
-    gWsSummary.Cells(11, 1).Value = "Errors"
-    gWsSummary.Cells(12, 1).Value = "Mode"
-    gWsSummary.Cells(13, 1).Value = "Debug log path"
+    gWsSummary.Cells(8, 1).Value = "Rows without Part Number"
+    gWsSummary.Cells(9, 1).Value = "Images processed"
+    gWsSummary.Cells(10, 1).Value = "Successful images"
+    gWsSummary.Cells(11, 1).Value = "Skipped fasteners"
+    gWsSummary.Cells(12, 1).Value = "Source files not found"
+    gWsSummary.Cells(13, 1).Value = "Errors"
+    gWsSummary.Cells(14, 1).Value = "Mode"
+    gWsSummary.Cells(15, 1).Value = "Debug log path"
+    gWsSummary.Cells(16, 1).Value = "FORCE_DEFAULT_BOM_COLUMNS"
+    gWsSummary.Cells(17, 1).Value = "SMOKE_TEST_BOM_ONLY"
+    gWsSummary.Cells(18, 1).Value = "TEST_MODE"
     gWsSummary.Range("A1:B1").Font.Bold = True
     gWsSummary.Columns("A").ColumnWidth = 28
     gWsSummary.Columns("B").ColumnWidth = 95
@@ -530,6 +661,7 @@ Function ProcessBomRowsForThumbnails()
     Dim normalizedPartNumber
     Dim sourcePath
     Dim imagePath
+    Dim croppedPath
     Dim thumbPath
     Dim reason
     Dim firstImagePhaseStart
@@ -546,54 +678,55 @@ Function ProcessBomRowsForThumbnails()
             If SKIP_FASTENER_IMAGES And IsFastenerExcelRow(rowIndex) Then
                 gSkippedFastenerRows = gSkippedFastenerRows + 1
                 reason = "Standard fastener - retained in BOM, image skipped"
-                SetRowUtilityValues rowIndex, "", "", "SKIPPED_IMAGE_ONLY", reason
-                WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "SKIPPED_IMAGE_ONLY", "FASTENER_SKIPPED_IMAGE", reason, "", "", ""
+                SetRowUtilityValues rowIndex, "", "", "", "SKIPPED_IMAGE_ONLY", reason
+                WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "SKIPPED_IMAGE_ONLY", "FASTENER_SKIPPED_IMAGE", reason, "", "", "", ""
                 WriteDebugPhase "FASTENER_SKIPPED_IMAGE", rowIndex, rawPartNumber, normalizedPartNumber, "", reason
-            ElseIf TEST_MODE And gProcessedImageRows >= TEST_MAX_ROWS Then
-                SetRowUtilityValues rowIndex, "", "", "NOT_PROCESSED_TEST_LIMIT", "TEST_MODE limit reached"
-                WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "NOT_PROCESSED_TEST_LIMIT", "ROW_START", "TEST_MODE limit reached.", "", "", ""
             Else
-                gProcessedImageRows = gProcessedImageRows + 1
                 imagePath = BuildImagePath(normalizedPartNumber, rowIndex)
+                croppedPath = CroppedPathForImage(imagePath)
                 thumbPath = ThumbnailPathForImage(imagePath)
 
-                If ReuseExistingOrCachedImage(normalizedPartNumber, imagePath, thumbPath) Then
-                    SetRowUtilityValues rowIndex, imagePath, thumbPath, "EXISTING_REUSED", ""
+                sourcePath = SourcePathForPartNumber(rawPartNumber)
+                If sourcePath = "" Or Not gFSO.FileExists(sourcePath) Then
+                    gSourceNotFoundRows = gSourceNotFoundRows + 1
+                    reason = "Source CATPart/CATProduct not found for Part Number"
+                    SetRowUtilityValues rowIndex, "", "", "", "SOURCE_FILE_NOT_FOUND", reason
+                    WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "SOURCE_FILE_NOT_FOUND", "SOURCE_FILE_NOT_FOUND", reason, "", "", "", sourcePath
+                    WriteDebugPhase "SOURCE_FILE_NOT_FOUND", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, reason
+                    If STOP_ON_SOURCE_NOT_FOUND Then
+                        AbortWithMessage "Source file not found for Part Number: " & rawPartNumber, "SOURCE_FILE_NOT_FOUND", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath
+                        Exit Function
+                    End If
+                ElseIf Not IsSupportedCatiaSourceFile(sourcePath) Then
+                    reason = "Unsupported source file: " & sourcePath
+                    SetRowUtilityValues rowIndex, "", "", "", "UNSUPPORTED_SOURCE_FILE", reason
+                    WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "UNSUPPORTED_SOURCE_FILE", "UNSUPPORTED_SOURCE_FILE", reason, "", "", "", sourcePath
+                    WriteDebugPhase "UNSUPPORTED_SOURCE_FILE", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, reason
+                ElseIf TEST_MODE And gProcessedImageRows >= TEST_MAX_ROWS Then
+                    SetRowUtilityValues rowIndex, "", "", "", "NOT_PROCESSED_TEST_LIMIT", "TEST_MODE limit reached"
+                    WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "NOT_PROCESSED_TEST_LIMIT", "ROW_START", "TEST_MODE limit reached.", "", "", "", sourcePath
+                ElseIf ReuseExistingOrCachedImage(normalizedPartNumber, imagePath, croppedPath, thumbPath) Then
+                    SetRowUtilityValues rowIndex, imagePath, croppedPath, thumbPath, "EXISTING_REUSED", ""
                     If Not InsertThumbnailForRow(rowIndex, thumbPath) Then
                         AbortWithMessage "Excel ne moze da ubaci thumbnail za Part Number: " & rawPartNumber, "EXCEL_THUMBNAIL_INSERTED", rowIndex, rawPartNumber, normalizedPartNumber, ""
                         Exit Function
                     End If
+                    gProcessedImageRows = gProcessedImageRows + 1
                     gSuccessfulImageRows = gSuccessfulImageRows + 1
-                    WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "EXISTING_REUSED", "EXCEL_THUMBNAIL_INSERTED", "Existing image/thumbnail reused.", imagePath, thumbPath, ""
+                    WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "EXISTING_REUSED", "EXCEL_THUMBNAIL_INSERTED", "Existing image/cropped/thumbnail reused.", imagePath, croppedPath, thumbPath, sourcePath
                     MaybeSaveByProgress rowIndex, rawPartNumber, normalizedPartNumber
                 Else
-                    sourcePath = SourcePathForPartNumber(rawPartNumber)
-                    If sourcePath = "" Or Not gFSO.FileExists(sourcePath) Then
-                        SetRowUtilityValues rowIndex, "", "", "SOURCE_FILE_NOT_FOUND", "Source file not found"
-                        WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "SOURCE_FILE_NOT_FOUND", "SOURCE_FILE_NOT_FOUND", "Source file not found for Part Number: " & rawPartNumber, "", "", sourcePath
-                        WriteDebugPhase "SOURCE_FILE_NOT_FOUND", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, "Source file not found."
-                        AbortWithMessage "Source file not found for Part Number: " & rawPartNumber, "SOURCE_FILE_NOT_FOUND", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath
-                        Exit Function
-                    End If
-
-                    If Not IsSupportedCatiaSourceFile(sourcePath) Then
-                        SetRowUtilityValues rowIndex, "", "", "UNSUPPORTED_SOURCE_FILE", sourcePath
-                        WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "UNSUPPORTED_SOURCE_FILE", "UNSUPPORTED_SOURCE_FILE", sourcePath, "", "", sourcePath
-                        AbortWithMessage "Unsupported source file for Part Number: " & rawPartNumber & vbCrLf & sourcePath, "UNSUPPORTED_SOURCE_FILE", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath
-                        Exit Function
-                    End If
-
                     WriteDebugPhase "SOURCE_FILE_FOUND", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, sourcePath
                     If Not gFirstImageStatusShown Then
                         firstImagePhaseStart = StartTimedPhase("FIRST_IMAGE_STANDALONE_CAPTURE", "5/6 Otvaram prvi part za sliku...")
                         gFirstImageStatusShown = True
                         watchFirstImagePhase = True
                     End If
-                    If Not CaptureStandaloneImage(rawPartNumber, normalizedPartNumber, sourcePath, imagePath, thumbPath, rowIndex) Then
+                    If Not CaptureStandaloneImage(rawPartNumber, normalizedPartNumber, sourcePath, imagePath, croppedPath, thumbPath, rowIndex) Then
                         If watchFirstImagePhase Then
                             If Not CheckTimedPhase("FIRST_IMAGE_STANDALONE_CAPTURE", firstImagePhaseStart, rowIndex, rawPartNumber, normalizedPartNumber, sourcePath) Then Exit Function
                         End If
-                        SetRowUtilityValues rowIndex, imagePath, thumbPath, "STANDALONE_CAPTURE_FAILED", "Standalone open/capture failed"
+                        SetRowUtilityValues rowIndex, imagePath, croppedPath, thumbPath, "STANDALONE_CAPTURE_FAILED", "Standalone open/capture failed"
                         AbortWithMessage "Standalone capture failed for Part Number: " & rawPartNumber, "STANDALONE_CAPTURE_FAILED", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath
                         Exit Function
                     End If
@@ -601,17 +734,24 @@ Function ProcessBomRowsForThumbnails()
                         If Not CheckTimedPhase("FIRST_IMAGE_STANDALONE_CAPTURE", firstImagePhaseStart, rowIndex, rawPartNumber, normalizedPartNumber, sourcePath) Then Exit Function
                     End If
 
-                    SetRowUtilityValues rowIndex, imagePath, thumbPath, "OK", ""
-                    CacheImage normalizedPartNumber, imagePath, thumbPath
+                    SetRowUtilityValues rowIndex, imagePath, croppedPath, thumbPath, "OK", ""
+                    CacheImage normalizedPartNumber, imagePath, croppedPath, thumbPath
                     If Not InsertThumbnailForRow(rowIndex, thumbPath) Then
                         AbortWithMessage "Excel ne moze da ubaci thumbnail za Part Number: " & rawPartNumber, "EXCEL_THUMBNAIL_INSERTED", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath
                         Exit Function
                     End If
+                    gProcessedImageRows = gProcessedImageRows + 1
                     gSuccessfulImageRows = gSuccessfulImageRows + 1
-                    WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "OK", "EXCEL_THUMBNAIL_INSERTED", "Thumbnail inserted.", imagePath, thumbPath, sourcePath
+                    WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "OK", "EXCEL_THUMBNAIL_INSERTED", "Thumbnail inserted.", imagePath, croppedPath, thumbPath, sourcePath
                     MaybeSaveByProgress rowIndex, rawPartNumber, normalizedPartNumber
                 End If
             End If
+        ElseIf RowHasAnyData(rowIndex) Then
+            gRowsWithoutPartNumber = gRowsWithoutPartNumber + 1
+            reason = "No Part Number in BOM row"
+            SetRowUtilityValues rowIndex, "", "", "", "NO_PART_NUMBER", reason
+            WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "NO_PART_NUMBER", "NO_PART_NUMBER", reason, "", "", "", ""
+            WriteDebugPhase "NO_PART_NUMBER", rowIndex, rawPartNumber, normalizedPartNumber, "", reason
         End If
         DoEvents
     Next
@@ -655,15 +795,16 @@ Sub TraverseProductForSourceIndex(prod)
     Err.Clear
 End Sub
 
-Function CaptureStandaloneImage(rawPartNumber, normalizedPartNumber, sourcePath, imagePath, thumbPath, excelRow)
+Function CaptureStandaloneImage(rawPartNumber, normalizedPartNumber, sourcePath, imagePath, croppedPath, thumbPath, excelRow)
     On Error Resume Next
     CaptureStandaloneImage = False
     If gFSO.FileExists(imagePath) Then gFSO.DeleteFile imagePath, True
+    If gFSO.FileExists(croppedPath) Then gFSO.DeleteFile croppedPath, True
     If gFSO.FileExists(thumbPath) Then gFSO.DeleteFile thumbPath, True
 
     WriteDebugPhase "STANDALONE_OPEN_START", excelRow, rawPartNumber, normalizedPartNumber, sourcePath, sourcePath
     If Not OpenStandaloneDocument(sourcePath) Then
-        WriteExportLog excelRow, rawPartNumber, normalizedPartNumber, "STANDALONE_OPEN_FAILED", "STANDALONE_OPEN_START", "Cannot open source file.", imagePath, thumbPath, sourcePath
+        WriteExportLog excelRow, rawPartNumber, normalizedPartNumber, "STANDALONE_OPEN_FAILED", "STANDALONE_OPEN_START", "Cannot open source file.", imagePath, croppedPath, thumbPath, sourcePath
         CloseCurrentStandaloneDocument
         ActivateMainDocument
         Exit Function
@@ -672,15 +813,17 @@ Function CaptureStandaloneImage(rawPartNumber, normalizedPartNumber, sourcePath,
 
     WriteDebugPhase "STANDALONE_CAPTURE_START", excelRow, rawPartNumber, normalizedPartNumber, sourcePath, imagePath
     If Not CaptureActiveStandaloneViewer(imagePath) Then
-        WriteExportLog excelRow, rawPartNumber, normalizedPartNumber, "STANDALONE_CAPTURE_FAILED", "STANDALONE_CAPTURE_START", "CaptureToFile failed.", imagePath, thumbPath, sourcePath
+        WriteExportLog excelRow, rawPartNumber, normalizedPartNumber, "STANDALONE_CAPTURE_FAILED", "STANDALONE_CAPTURE_START", "CaptureToFile failed.", imagePath, croppedPath, thumbPath, sourcePath
         CloseCurrentStandaloneDocument
         ActivateMainDocument
         Exit Function
     End If
     WriteDebugPhase "STANDALONE_CAPTURE_DONE", excelRow, rawPartNumber, normalizedPartNumber, sourcePath, imagePath
 
-    If Not CreateThumbnailFile(imagePath, thumbPath, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT) Then
-        WriteExportLog excelRow, rawPartNumber, normalizedPartNumber, "THUMBNAIL_FAILED", "THUMBNAIL_CREATED", "Thumbnail creation failed.", imagePath, thumbPath, sourcePath
+    If Not CreateCroppedImageFile(imagePath, croppedPath, excelRow, rawPartNumber, normalizedPartNumber, sourcePath) Then croppedPath = imagePath
+
+    If Not CreateThumbnailFile(croppedPath, thumbPath, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT) Then
+        WriteExportLog excelRow, rawPartNumber, normalizedPartNumber, "THUMBNAIL_FAILED", "THUMBNAIL_CREATED", "Thumbnail creation failed.", imagePath, croppedPath, thumbPath, sourcePath
         CloseCurrentStandaloneDocument
         ActivateMainDocument
         Exit Function
@@ -815,6 +958,25 @@ Function CreateThumbnailFile(sourcePath, thumbPath, maxWidth, maxHeight)
     Err.Clear
 End Function
 
+Function CreateCroppedImageFile(imagePath, croppedPath, excelRow, rawPartNumber, normalizedPartNumber, sourcePath)
+    On Error Resume Next
+    CreateCroppedImageFile = False
+    If imagePath = "" Or Not gFSO.FileExists(imagePath) Then Exit Function
+
+    ' CATScript/VBScript has no stable built-in pixel scanner. Keep a safe cropped-file
+    ' placeholder by copying the original, then create the Excel thumbnail from it.
+    If gFSO.FileExists(croppedPath) Then gFSO.DeleteFile croppedPath, True
+    gFSO.CopyFile imagePath, croppedPath, True
+    If Err.Number = 0 And gFSO.FileExists(croppedPath) Then
+        WriteDebugPhase "AUTO_CROP_FAILED_OR_SKIPPED", excelRow, rawPartNumber, normalizedPartNumber, sourcePath, "Auto-crop pixel scan not available in CATScript; original image copied to CROPPED."
+        CreateCroppedImageFile = True
+    Else
+        WriteExportLog excelRow, rawPartNumber, normalizedPartNumber, "AUTO_CROP_FAILED_OR_SKIPPED", "AUTO_CROP_FAILED_OR_SKIPPED", "Could not create cropped fallback file.", imagePath, croppedPath, "", sourcePath
+        WriteDebugPhase "AUTO_CROP_FAILED_OR_SKIPPED", excelRow, rawPartNumber, normalizedPartNumber, sourcePath, "Could not create cropped fallback file."
+        Err.Clear
+    End If
+End Function
+
 Function InsertThumbnailForRow(rowIndex, thumbPath)
     On Error Resume Next
     InsertThumbnailForRow = False
@@ -851,16 +1013,17 @@ Sub DeletePicturesInCell(ws, cell)
     Err.Clear
 End Sub
 
-Sub SetRowUtilityValues(rowIndex, imagePath, thumbPath, statusText, skipReason)
+Sub SetRowUtilityValues(rowIndex, imagePath, croppedPath, thumbPath, statusText, skipReason)
     On Error Resume Next
     gWsBom.Cells(rowIndex, gImagePathColumnIndex).Value = imagePath
+    gWsBom.Cells(rowIndex, gCroppedImagePathColumnIndex).Value = croppedPath
     gWsBom.Cells(rowIndex, gThumbnailPathColumnIndex).Value = thumbPath
     gWsBom.Cells(rowIndex, gExportStatusColumnIndex).Value = statusText
     gWsBom.Cells(rowIndex, gImageSkipReasonColumnIndex).Value = skipReason
     Err.Clear
 End Sub
 
-Sub WriteExportLog(rowIndex, rawPartNumber, normalizedPartNumber, statusText, phase, messageText, imagePath, thumbPath, sourcePath)
+Sub WriteExportLog(rowIndex, rawPartNumber, normalizedPartNumber, statusText, phase, messageText, imagePath, croppedPath, thumbPath, sourcePath)
     On Error Resume Next
     gWsLog.Cells(gNextLogRow, 1).Value = gNextLogRow - 1
     gWsLog.Cells(gNextLogRow, 2).Value = Now
@@ -871,10 +1034,11 @@ Sub WriteExportLog(rowIndex, rawPartNumber, normalizedPartNumber, statusText, ph
     gWsLog.Cells(gNextLogRow, 7).Value = phase
     gWsLog.Cells(gNextLogRow, 8).Value = messageText
     gWsLog.Cells(gNextLogRow, 9).Value = imagePath
-    gWsLog.Cells(gNextLogRow, 10).Value = thumbPath
-    gWsLog.Cells(gNextLogRow, 11).Value = sourcePath
+    gWsLog.Cells(gNextLogRow, 10).Value = croppedPath
+    gWsLog.Cells(gNextLogRow, 11).Value = thumbPath
+    gWsLog.Cells(gNextLogRow, 12).Value = sourcePath
     gNextLogRow = gNextLogRow + 1
-    If statusText = "SOURCE_FILE_NOT_FOUND" Or statusText = "UNSUPPORTED_SOURCE_FILE" Or statusText = "STANDALONE_OPEN_FAILED" Or statusText = "STANDALONE_CAPTURE_FAILED" Or statusText = "THUMBNAIL_FAILED" Or statusText = "TIMEOUT" Or statusText = "ERROR" Then gErrorCount = gErrorCount + 1
+    If statusText = "UNSUPPORTED_SOURCE_FILE" Or statusText = "STANDALONE_OPEN_FAILED" Or statusText = "STANDALONE_CAPTURE_FAILED" Or statusText = "THUMBNAIL_FAILED" Or statusText = "TIMEOUT" Or statusText = "ERROR" Then gErrorCount = gErrorCount + 1
     Err.Clear
 End Sub
 
@@ -953,7 +1117,7 @@ Sub HandlePhaseTimeout(phaseName, elapsedSeconds, rowIndex, rawPartNumber, norma
     gAbortAlreadyHandled = True
     messageText = "TIMEOUT: faza '" & phaseName & "' traje duze od " & CStr(TEST_PHASE_TIMEOUT_SECONDS) & " sekundi. Proteklo: " & CStr(Round(elapsedSeconds, 1)) & " s."
     WriteDebugPhase "TIMEOUT", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, messageText
-    If Not (gWsLog Is Nothing) Then WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "TIMEOUT", phaseName, messageText, "", "", sourcePath
+    If Not (gWsLog Is Nothing) Then WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "TIMEOUT", phaseName, messageText, "", "", "", sourcePath
     SaveExcelCheckpoint phaseName, rowIndex, rawPartNumber, normalizedPartNumber
     CleanupCatiaSession
     MsgBox messageText, vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
@@ -971,7 +1135,7 @@ Sub AbortWithMessage(messageText, phase, rowIndex, rawPartNumber, normalizedPart
     On Error Resume Next
     gAbortAlreadyHandled = True
     WriteDebugPhase "ERROR", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, phase & ": " & messageText
-    WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "ERROR", phase, messageText, "", "", sourcePath
+    WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "ERROR", phase, messageText, "", "", "", sourcePath
     SaveExcelCheckpoint phase, rowIndex, rawPartNumber, normalizedPartNumber
     CleanupCatiaSession
     MsgBox messageText, vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
@@ -1008,12 +1172,17 @@ Sub UpdateSummarySheet()
     gWsSummary.Cells(5, 2).Value = gExcelPath
     gWsSummary.Cells(6, 2).Value = gOutputFolder
     gWsSummary.Cells(7, 2).Value = gLastBomRow - gHeaderRow
-    gWsSummary.Cells(8, 2).Value = gProcessedImageRows
-    gWsSummary.Cells(9, 2).Value = gSuccessfulImageRows
-    gWsSummary.Cells(10, 2).Value = gSkippedFastenerRows
-    gWsSummary.Cells(11, 2).Value = gErrorCount
-    gWsSummary.Cells(12, 2).Value = "TEST_MODE=" & CStr(TEST_MODE) & "; TEST_MAX_ROWS=" & CStr(TEST_MAX_ROWS) & "; STANDALONE_CAPTURE_ONLY=" & CStr(STANDALONE_CAPTURE_ONLY)
-    gWsSummary.Cells(13, 2).Value = gDebugLogPath
+    gWsSummary.Cells(8, 2).Value = gRowsWithoutPartNumber
+    gWsSummary.Cells(9, 2).Value = gProcessedImageRows
+    gWsSummary.Cells(10, 2).Value = gSuccessfulImageRows
+    gWsSummary.Cells(11, 2).Value = gSkippedFastenerRows
+    gWsSummary.Cells(12, 2).Value = gSourceNotFoundRows
+    gWsSummary.Cells(13, 2).Value = gErrorCount
+    gWsSummary.Cells(14, 2).Value = "TEST_MODE=" & CStr(TEST_MODE) & "; TEST_MAX_ROWS=" & CStr(TEST_MAX_ROWS) & "; STANDALONE_CAPTURE_ONLY=" & CStr(STANDALONE_CAPTURE_ONLY)
+    gWsSummary.Cells(15, 2).Value = gDebugLogPath
+    gWsSummary.Cells(16, 2).Value = FORCE_DEFAULT_BOM_COLUMNS
+    gWsSummary.Cells(17, 2).Value = SMOKE_TEST_BOM_ONLY
+    gWsSummary.Cells(18, 2).Value = TEST_MODE
     Err.Clear
 End Sub
 
@@ -1042,7 +1211,7 @@ Function SourcePathForPartNumber(partNumber)
     Err.Clear
 End Function
 
-Function ReuseExistingOrCachedImage(normalizedPartNumber, imagePath, thumbPath)
+Function ReuseExistingOrCachedImage(normalizedPartNumber, imagePath, croppedPath, thumbPath)
     On Error Resume Next
     ReuseExistingOrCachedImage = False
     Dim payload
@@ -1050,23 +1219,29 @@ Function ReuseExistingOrCachedImage(normalizedPartNumber, imagePath, thumbPath)
     If gImageCache.Exists(normalizedPartNumber) Then
         payload = CStr(gImageCache.Item(normalizedPartNumber))
         parts = Split(payload, "|")
-        If UBound(parts) >= 1 Then
+        If UBound(parts) >= 2 Then
             imagePath = CStr(parts(0))
-            thumbPath = CStr(parts(1))
+            croppedPath = CStr(parts(1))
+            thumbPath = CStr(parts(2))
         End If
     End If
     If SKIP_EXISTING_IMAGES And gFSO.FileExists(imagePath) Then
-        If Not gFSO.FileExists(thumbPath) Then CreateThumbnailFile imagePath, thumbPath, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT
+        If Not gFSO.FileExists(croppedPath) Then
+            Err.Clear
+            gFSO.CopyFile imagePath, croppedPath, True
+            Err.Clear
+        End If
+        If Not gFSO.FileExists(thumbPath) Then CreateThumbnailFile croppedPath, thumbPath, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT
         If gFSO.FileExists(thumbPath) Then
-            CacheImage normalizedPartNumber, imagePath, thumbPath
+            CacheImage normalizedPartNumber, imagePath, croppedPath, thumbPath
             ReuseExistingOrCachedImage = True
         End If
     End If
     Err.Clear
 End Function
 
-Sub CacheImage(normalizedPartNumber, imagePath, thumbPath)
-    If normalizedPartNumber <> "" Then gImageCache.Item(normalizedPartNumber) = imagePath & "|" & thumbPath
+Sub CacheImage(normalizedPartNumber, imagePath, croppedPath, thumbPath)
+    If normalizedPartNumber <> "" Then gImageCache.Item(normalizedPartNumber) = imagePath & "|" & croppedPath & "|" & thumbPath
 End Sub
 
 Function BuildImagePath(normalizedPartNumber, rowIndex)
@@ -1079,6 +1254,10 @@ End Function
 
 Function ThumbnailPathForImage(imagePath)
     ThumbnailPathForImage = JoinPath(gThumbnailFolder, gFSO.GetBaseName(imagePath) & ".jpg")
+End Function
+
+Function CroppedPathForImage(imagePath)
+    CroppedPathForImage = JoinPath(gCroppedFolder, gFSO.GetBaseName(imagePath) & ".jpg")
 End Function
 
 Function IsFastenerExcelRow(rowIndex)
@@ -1095,7 +1274,7 @@ Function IsFastenerExcelRow(rowIndex)
     maxCol = used.Column + used.Columns.Count - 1
     scanText = ""
     For c = 1 To maxCol
-        If c <> gThumbnailColumnIndex And c <> gImagePathColumnIndex And c <> gThumbnailPathColumnIndex And c <> gExportStatusColumnIndex And c <> gImageSkipReasonColumnIndex Then
+        If c <> gThumbnailColumnIndex And c <> gImagePathColumnIndex And c <> gCroppedImagePathColumnIndex And c <> gThumbnailPathColumnIndex And c <> gExportStatusColumnIndex And c <> gImageSkipReasonColumnIndex Then
             scanText = scanText & " " & CStr(gWsBom.Cells(rowIndex, c).Value)
         End If
     Next
@@ -1371,6 +1550,25 @@ Function LastUsedColumn(ws)
     Err.Clear
 End Function
 
+Function RowHasAnyData(rowIndex)
+    On Error Resume Next
+    RowHasAnyData = False
+    Dim used
+    Dim maxCol
+    Dim c
+    Set used = gWsBom.UsedRange
+    maxCol = used.Column + used.Columns.Count - 1
+    For c = 1 To maxCol
+        If c <> gThumbnailColumnIndex And c <> gImagePathColumnIndex And c <> gCroppedImagePathColumnIndex And c <> gThumbnailPathColumnIndex And c <> gExportStatusColumnIndex And c <> gImageSkipReasonColumnIndex Then
+            If Trim(CStr(gWsBom.Cells(rowIndex, c).Value)) <> "" Then
+                RowHasAnyData = True
+                Exit Function
+            End If
+        End If
+    Next
+    Err.Clear
+End Function
+
 Sub ApplyBomBorders()
     On Error Resume Next
     Dim used
@@ -1387,6 +1585,20 @@ Function JoinPath(folderPath, fileName)
     Else
         JoinPath = CStr(folderPath) & "\" & CStr(fileName)
     End If
+End Function
+
+Function EnsureXlsExtension(pathText)
+    If LCase(Right(CStr(pathText), 4)) <> ".xls" Then
+        EnsureXlsExtension = CStr(pathText) & ".xls"
+    Else
+        EnsureXlsExtension = CStr(pathText)
+    End If
+End Function
+
+Function IsLocalWindowsPath(pathText)
+    Dim s
+    s = Trim(CStr(pathText))
+    IsLocalWindowsPath = (Len(s) >= 3 And Mid(s, 2, 1) = ":" And (Mid(s, 3, 1) = "\" Or Mid(s, 3, 1) = "/"))
 End Function
 
 Sub EnsureFolder(folderPath)

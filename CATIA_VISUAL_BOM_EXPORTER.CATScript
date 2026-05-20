@@ -28,6 +28,7 @@ Const INSERT_THUMBNAIL_FILE_IN_EXCEL = True
 Const INSERT_IMAGES_IN_EXCEL = True
 Const TEST_MODE = True
 Const TEST_MAX_ROWS = 20
+Const TEST_PHASE_TIMEOUT_SECONDS = 30
 Const SAVE_EVERY_N_ROWS = 25
 Const RESUME_MODE = True
 Const SKIP_EXISTING_IMAGES = True
@@ -86,6 +87,8 @@ Dim gSkippedFastenerRows
 Dim gErrorCount
 Dim gCurrentStandaloneDoc
 Dim gCurrentStandaloneOpened
+Dim gAbortAlreadyHandled
+Dim gFirstImageStatusShown
 
 Sub CATIA_VISUAL_BOM_EXPORTER()
     On Error Resume Next
@@ -99,23 +102,29 @@ Sub CATIA_VISUAL_BOM_EXPORTER()
     WriteDebugPhase "USER_SAVE_PATH_SELECTED", 0, "", "", gExcelPath, gExcelPath
 
     If Not PrintCatiaBomToXls() Then
+        If gAbortAlreadyHandled Then Exit Sub
         AbortWithMessage "CATIA BillOfMaterial Print XLS nije uspeo.", "CATIA_BOM_PRINT_XLS_START", 0, "", "", ""
         Exit Sub
     End If
 
     If Not OpenBomWorkbookAndPrepareSheets() Then
+        If gAbortAlreadyHandled Then Exit Sub
         AbortWithMessage "Ne mogu da otvorim Excel BOM fajl: " & gExcelPath, "EXCEL_OPENED", 0, "", "", ""
         Exit Sub
     End If
 
+    Dim indexPhaseStart
+    indexPhaseStart = StartTimedPhase("CATIA_FILE_INDEX", "4/6 Indeksiram CATIA partove...")
     WriteDebugPhase "CATIA_FILE_INDEX_START", 0, "", "", "", "Building Part Number -> source file path index."
     BuildCatiaFileIndex
     WriteDebugPhase "CATIA_FILE_INDEX_DONE", 0, "", "", "", "Indexed source files: " & CStr(gSourceIndex.Count)
+    If Not CheckTimedPhase("CATIA_FILE_INDEX", indexPhaseStart, 0, "", "", "") Then Exit Sub
 
     If Not ProcessBomRowsForThumbnails() Then Exit Sub
 
     SaveExcelCheckpoint "FINISH", 0, "", ""
     CleanupCatiaSession
+    CATIA.StatusBar = "6/6 Gotovo."
     WriteDebugPhase "FINISH", 0, "", "", "", "Macro finished."
     MsgBox "CATIA BOM Excel export je zavrsen." & vbCrLf & vbCrLf & _
            "Excel:" & vbCrLf & gExcelPath, vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
@@ -148,6 +157,8 @@ Sub InitializeRuntime()
     gSuccessfulImageRows = 0
     gSkippedFastenerRows = 0
     gErrorCount = 0
+    gAbortAlreadyHandled = False
+    gFirstImageStatusShown = False
     Randomize
 End Sub
 
@@ -205,6 +216,7 @@ End Function
 Function SelectExportPathAndPrepareFolders()
     On Error Resume Next
     SelectExportPathAndPrepareFolders = False
+    Dim phaseStart
 
     Dim defaultFolder
     Dim defaultName
@@ -216,6 +228,9 @@ Function SelectExportPathAndPrepareFolders()
     If defaultName = "" Then defaultName = "CATIA_BOM"
     defaultPath = JoinPath(defaultFolder, defaultName & "_VISUAL_BOM_EXPORT.xls")
 
+    CATIA.StatusBar = "1/6 Biranje Excel lokacije..."
+    MsgBox "Izaberi lokaciju za BOM Excel.", vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
+    phaseStart = Timer
     gExcelPath = AskUserForBomExcelSavePath(defaultPath)
     If gExcelPath = "" Then
         MsgBox "Export je otkazan od strane korisnika.", vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
@@ -229,6 +244,7 @@ Function SelectExportPathAndPrepareFolders()
     EnsureFolder gOutputFolder
     EnsureFolder gImageFolder
     EnsureFolder gThumbnailFolder
+    If Not CheckTimedPhase("USER_SAVE_PATH_SELECTED", phaseStart, 0, "", "", gExcelPath) Then Exit Function
     SelectExportPathAndPrepareFolders = True
     Err.Clear
 End Function
@@ -262,14 +278,19 @@ End Function
 Function PrintCatiaBomToXls()
     On Error Resume Next
     PrintCatiaBomToXls = False
+    Dim phaseStart
     WriteDebugPhase "BOM_FORMAT_SET", 0, "", "", "", "Secondary BOM format set: Nomenclature|Quantity|Part Number|Dimenzija|Material|Mass|Standard"
     WriteDebugPhase "CATIA_BOM_PRINT_XLS_START", 0, "", "", gExcelPath, "assemblyConvertor.Print ""XLS"""
 
+    CATIA.StatusBar = "2/6 Exportujem CATIA BOM u Excel..."
+    phaseStart = Timer
     If gFSO.FileExists(gExcelPath) Then gFSO.DeleteFile gExcelPath, True
     Err.Clear
     gAssemblyConvertor.Print "XLS", gExcelPath, gProduct
     If Err.Number = 0 And gFSO.FileExists(gExcelPath) Then
+        CATIA.StatusBar = "3/6 BOM Excel napravljen."
         WriteDebugPhase "CATIA_BOM_PRINT_XLS_DONE", 0, "", "", gExcelPath, "CATIA BOM XLS created."
+        If Not CheckTimedPhase("CATIA_BOM_PRINT_XLS", phaseStart, 0, "", "", gExcelPath) Then Exit Function
         PrintCatiaBomToXls = True
     End If
     Err.Clear
@@ -460,8 +481,11 @@ Function ProcessBomRowsForThumbnails()
     Dim imagePath
     Dim thumbPath
     Dim reason
+    Dim firstImagePhaseStart
+    Dim watchFirstImagePhase
 
     For rowIndex = gHeaderRow + 1 To gLastBomRow
+        watchFirstImagePhase = False
         rawPartNumber = CStr(gWsBom.Cells(rowIndex, gPartNumberColumnIndex).Value)
         normalizedPartNumber = NormalizePartNumber(rawPartNumber)
         If Trim(rawPartNumber) <> "" Then
@@ -509,10 +533,21 @@ Function ProcessBomRowsForThumbnails()
                     End If
 
                     WriteDebugPhase "SOURCE_FILE_FOUND", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, sourcePath
+                    If Not gFirstImageStatusShown Then
+                        firstImagePhaseStart = StartTimedPhase("FIRST_IMAGE_STANDALONE_CAPTURE", "5/6 Otvaram prvi part za sliku...")
+                        gFirstImageStatusShown = True
+                        watchFirstImagePhase = True
+                    End If
                     If Not CaptureStandaloneImage(rawPartNumber, normalizedPartNumber, sourcePath, imagePath, thumbPath, rowIndex) Then
+                        If watchFirstImagePhase Then
+                            If Not CheckTimedPhase("FIRST_IMAGE_STANDALONE_CAPTURE", firstImagePhaseStart, rowIndex, rawPartNumber, normalizedPartNumber, sourcePath) Then Exit Function
+                        End If
                         SetRowUtilityValues rowIndex, imagePath, thumbPath, "STANDALONE_CAPTURE_FAILED", "Standalone open/capture failed"
                         AbortWithMessage "Standalone capture failed for Part Number: " & rawPartNumber, "STANDALONE_CAPTURE_FAILED", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath
                         Exit Function
+                    End If
+                    If watchFirstImagePhase Then
+                        If Not CheckTimedPhase("FIRST_IMAGE_STANDALONE_CAPTURE", firstImagePhaseStart, rowIndex, rawPartNumber, normalizedPartNumber, sourcePath) Then Exit Function
                     End If
 
                     SetRowUtilityValues rowIndex, imagePath, thumbPath, "OK", ""
@@ -788,7 +823,7 @@ Sub WriteExportLog(rowIndex, rawPartNumber, normalizedPartNumber, statusText, ph
     gWsLog.Cells(gNextLogRow, 10).Value = thumbPath
     gWsLog.Cells(gNextLogRow, 11).Value = sourcePath
     gNextLogRow = gNextLogRow + 1
-    If statusText = "SOURCE_FILE_NOT_FOUND" Or statusText = "UNSUPPORTED_SOURCE_FILE" Or statusText = "STANDALONE_OPEN_FAILED" Or statusText = "STANDALONE_CAPTURE_FAILED" Or statusText = "THUMBNAIL_FAILED" Or statusText = "ERROR" Then gErrorCount = gErrorCount + 1
+    If statusText = "SOURCE_FILE_NOT_FOUND" Or statusText = "UNSUPPORTED_SOURCE_FILE" Or statusText = "STANDALONE_OPEN_FAILED" Or statusText = "STANDALONE_CAPTURE_FAILED" Or statusText = "THUMBNAIL_FAILED" Or statusText = "TIMEOUT" Or statusText = "ERROR" Then gErrorCount = gErrorCount + 1
     Err.Clear
 End Sub
 
@@ -825,8 +860,52 @@ Sub MaybeSaveByProgress(rowIndex, rawPartNumber, normalizedPartNumber)
     End If
 End Sub
 
+Function StartTimedPhase(phaseName, statusText)
+    On Error Resume Next
+    CATIA.StatusBar = statusText
+    WriteDebugPhase phaseName, 0, "", "", "", "Phase started: " & statusText
+    StartTimedPhase = Timer
+    Err.Clear
+End Function
+
+Function CheckTimedPhase(phaseName, phaseStart, rowIndex, rawPartNumber, normalizedPartNumber, sourcePath)
+    On Error Resume Next
+    CheckTimedPhase = True
+    If Not TEST_MODE Then Exit Function
+    If CLng(TEST_PHASE_TIMEOUT_SECONDS) <= 0 Then Exit Function
+
+    Dim elapsedSeconds
+    elapsedSeconds = SecondsSince(phaseStart)
+    If elapsedSeconds > CDbl(TEST_PHASE_TIMEOUT_SECONDS) Then
+        HandlePhaseTimeout phaseName, elapsedSeconds, rowIndex, rawPartNumber, normalizedPartNumber, sourcePath
+        CheckTimedPhase = False
+    End If
+    Err.Clear
+End Function
+
+Sub HandlePhaseTimeout(phaseName, elapsedSeconds, rowIndex, rawPartNumber, normalizedPartNumber, sourcePath)
+    On Error Resume Next
+    Dim messageText
+    gAbortAlreadyHandled = True
+    messageText = "TIMEOUT: faza '" & phaseName & "' traje duze od " & CStr(TEST_PHASE_TIMEOUT_SECONDS) & " sekundi. Proteklo: " & CStr(Round(elapsedSeconds, 1)) & " s."
+    WriteDebugPhase "TIMEOUT", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, messageText
+    If Not (gWsLog Is Nothing) Then WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "TIMEOUT", phaseName, messageText, "", "", sourcePath
+    SaveExcelCheckpoint phaseName, rowIndex, rawPartNumber, normalizedPartNumber
+    CleanupCatiaSession
+    MsgBox messageText, vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
+    Err.Clear
+End Sub
+
+Function SecondsSince(startValue)
+    Dim nowValue
+    nowValue = Timer
+    If nowValue < CDbl(startValue) Then nowValue = nowValue + 86400
+    SecondsSince = nowValue - CDbl(startValue)
+End Function
+
 Sub AbortWithMessage(messageText, phase, rowIndex, rawPartNumber, normalizedPartNumber, sourcePath)
     On Error Resume Next
+    gAbortAlreadyHandled = True
     WriteDebugPhase "ERROR", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, phase & ": " & messageText
     WriteExportLog rowIndex, rawPartNumber, normalizedPartNumber, "ERROR", phase, messageText, "", "", sourcePath
     SaveExcelCheckpoint phase, rowIndex, rawPartNumber, normalizedPartNumber

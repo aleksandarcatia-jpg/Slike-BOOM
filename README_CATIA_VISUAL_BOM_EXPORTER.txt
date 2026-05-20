@@ -100,6 +100,7 @@ Fastener elementi:
 Default konfiguracija:
 - TEST_MODE=True
 - TEST_MAX_ROWS=20
+- TEST_PHASE_TIMEOUT_SECONDS=30
 - STANDALONE_CAPTURE_ONLY=True
 - PREFER_STANDALONE_PART_CAPTURE=True
 - FALLBACK_TO_ASSEMBLY_HIDE_SHOW=False
@@ -122,6 +123,16 @@ TEST_MODE:
 - Makro dodaje slike samo za prvih TEST_MAX_ROWS ne-fastener redova.
 - Ostali neobradjeni redovi dobijaju:
   NOT_PROCESSED_TEST_LIMIT
+- U TEST_MODE faze imaju watchdog od TEST_PHASE_TIMEOUT_SECONDS sekundi.
+- Ako faza predje limit, DEBUG_PHASE_LOG.txt dobija TIMEOUT i makro prikazuje fazu koja je predugo trajala.
+
+StatusBar kontrolne tacke:
+- 1/6 Biranje Excel lokacije...
+- 2/6 Exportujem CATIA BOM u Excel...
+- 3/6 BOM Excel napravljen.
+- 4/6 Indeksiram CATIA partove...
+- 5/6 Otvaram prvi part za sliku...
+- 6/6 Gotovo.
 
 FULL MODE:
 - Podesiti:
@@ -152,6 +163,7 @@ EXCEL_THUMBNAIL_INSERTED
 STANDALONE_CLOSE_DONE
 SAVE_CHECKPOINT
 ERROR
+TIMEOUT
 FINISH
 
 Kako pokrenuti CATScript:

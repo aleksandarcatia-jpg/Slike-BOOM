@@ -43,6 +43,7 @@ Save As:
   <RootPartNumber>_VISUAL_BOM_EXPORT.xls
 - Default folder je folder aktivnog CATProduct-a, ako postoji.
 - Ako aktivni CATProduct nema folder, default je Desktop.
+- Save As dialog ceka korisnika neograniceno dugo i nije deo timeout merenja.
 - Ako korisnik klikne Cancel, makro prekida rad i prikazuje:
   Export je otkazan od strane korisnika.
 
@@ -142,7 +143,9 @@ FULL MODE:
 DEBUG_PHASE_LOG.txt belezi:
 START
 BOM_FORMAT_SET
+USER_SAVE_PATH_DIALOG_OPENED
 USER_SAVE_PATH_SELECTED
+USER_SAVE_CANCELLED
 CATIA_BOM_PRINT_XLS_START
 CATIA_BOM_PRINT_XLS_DONE
 EXCEL_OPENED

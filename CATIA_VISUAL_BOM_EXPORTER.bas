@@ -83,6 +83,7 @@ Dim gCurrentStandaloneDoc
 Dim gCurrentStandaloneOpened
 Dim gAbortAlreadyHandled
 Dim gFirstImageStatusShown
+Dim gPendingDebugText
 
 Public Sub CATIA_VISUAL_BOM_EXPORTER()
     On Error Resume Next
@@ -93,7 +94,6 @@ Public Sub CATIA_VISUAL_BOM_EXPORTER()
     If Not SelectExportPathAndPrepareFolders() Then Exit Sub
 
     WriteDebugPhase "START", 0, "", "", "", "CATIA_VISUAL_BOM_EXPORTER started."
-    WriteDebugPhase "USER_SAVE_PATH_SELECTED", 0, "", "", gExcelPath, gExcelPath
 
     If Not PrintCatiaBomToXls() Then
         If gAbortAlreadyHandled Then Exit Sub
@@ -153,6 +153,7 @@ Sub InitializeRuntime()
     gErrorCount = 0
     gAbortAlreadyHandled = False
     gFirstImageStatusShown = False
+    gPendingDebugText = ""
     Randomize
 End Sub
 
@@ -210,7 +211,6 @@ End Function
 Function SelectExportPathAndPrepareFolders()
     On Error Resume Next
     SelectExportPathAndPrepareFolders = False
-    Dim phaseStart
 
     Dim defaultFolder
     Dim defaultName
@@ -224,9 +224,11 @@ Function SelectExportPathAndPrepareFolders()
 
     CATIA.StatusBar = "1/6 Biranje Excel lokacije..."
     MsgBox "Izaberi lokaciju za BOM Excel.", vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
-    phaseStart = Timer
+    CATIA.StatusBar = ChrW(&H10C) & "ekam da korisnik izabere lokaciju za Excel..."
+    WriteDebugPhase "USER_SAVE_PATH_DIALOG_OPENED", 0, "", "", "", "Waiting for user input - no timeout."
     gExcelPath = AskUserForBomExcelSavePath(defaultPath)
     If gExcelPath = "" Then
+        WriteDebugPhase "USER_SAVE_CANCELLED", 0, "", "", "", "User cancelled Save As dialog."
         MsgBox "Export je otkazan od strane korisnika.", vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
         Exit Function
     End If
@@ -238,7 +240,7 @@ Function SelectExportPathAndPrepareFolders()
     EnsureFolder gOutputFolder
     EnsureFolder gImageFolder
     EnsureFolder gThumbnailFolder
-    If Not CheckTimedPhase("USER_SAVE_PATH_SELECTED", phaseStart, 0, "", "", gExcelPath) Then Exit Function
+    WriteDebugPhase "USER_SAVE_PATH_SELECTED", 0, "", "", gExcelPath, gExcelPath
     SelectExportPathAndPrepareFolders = True
     Err.Clear
 End Function
@@ -824,18 +826,31 @@ End Sub
 Sub WriteDebugPhase(phase, rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, messageText)
     On Error Resume Next
     Dim ts
-    If gDebugLogPath = "" Then Exit Sub
+    Dim lineText
+    lineText = BuildDebugLine(phase, rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, messageText)
+    If gDebugLogPath = "" Then
+        gPendingDebugText = gPendingDebugText & lineText & vbCrLf
+        Exit Sub
+    End If
     Set ts = gFSO.OpenTextFile(gDebugLogPath, 8, True)
-    ts.WriteLine FormatDateTime(Now, 2) & " " & FormatDateTime(Now, 3) & _
-                 " | " & phase & _
-                 " | ExcelRow=" & CStr(rowIndex) & _
-                 " | Raw Part Number=" & CStr(rawPartNumber) & _
-                 " | Normalized Part Number=" & CStr(normalizedPartNumber) & _
-                 " | Source Path=" & CStr(sourcePath) & _
-                 " | " & CStr(messageText)
+    If gPendingDebugText <> "" Then
+        ts.Write gPendingDebugText
+        gPendingDebugText = ""
+    End If
+    ts.WriteLine lineText
     ts.Close
     Err.Clear
 End Sub
+
+Function BuildDebugLine(phase, rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, messageText)
+    BuildDebugLine = FormatDateTime(Now, 2) & " " & FormatDateTime(Now, 3) & _
+                     " | " & phase & _
+                     " | ExcelRow=" & CStr(rowIndex) & _
+                     " | Raw Part Number=" & CStr(rawPartNumber) & _
+                     " | Normalized Part Number=" & CStr(normalizedPartNumber) & _
+                     " | Source Path=" & CStr(sourcePath) & _
+                     " | " & CStr(messageText)
+End Function
 
 Sub SaveExcelCheckpoint(phase, rowIndex, rawPartNumber, normalizedPartNumber)
     On Error Resume Next

@@ -6,8 +6,8 @@ End Sub
 
 ' ================================================================
 ' CATIA_BOM_IMAGE_PROPERTY_PATCH
-' Automatically creates/updates String user property "Slika" on
-' unique CATPart/CATProduct references from the active CATProduct.
+' Creates/updates String user property "Slika" using CATIA recorder
+' style Product.ReferenceProduct.UserRefProperties methods.
 ' ================================================================
 
 Const IMAGE_PROPERTY_NAME = "Slika"
@@ -37,20 +37,23 @@ Dim gReadbackOkCount
 Dim gFastenerCount
 Dim gDuplicateSkippedCount
 Dim gRootSkippedCount
+Dim gSourceOpenFallbackCount
 Dim gWriteFailedCount
 Dim gSaveFailedCount
 Dim gLastWriteMethod
+Dim gLastWriteStatus
 Dim gLastWriteErrNumber
 Dim gLastWriteErrDescription
+Dim gLastReadbackOk
 
 Sub CATIA_BOM_IMAGE_PROPERTY_PATCH()
     On Error Resume Next
     InitializePatchRuntime
-    WritePatchEvent "START", "", "", "", "", "", "", "START", 0, "CATIA_BOM_IMAGE_PROPERTY_PATCH started."
+    WritePatchEvent "START", "", "", "", "", "", "", "", "START", 0, "CATIA_BOM_IMAGE_PROPERTY_PATCH started."
 
     If Not ValidateActiveProduct() Then Exit Sub
-    WritePatchEvent "ACTIVE_PRODUCT_VALIDATED", gRootProduct.Name, GetProductPartNumber(gRootProduct), "", "", "", "", "OK", 0, "Active CATProduct OK."
-    WritePatchEvent "ROOT_PRODUCT", gRootProduct.Name, GetProductPartNumber(gRootProduct), gRootFullName, "", "", "", "OK", 0, "Root product."
+    WritePatchEvent "ACTIVE_PRODUCT_VALIDATED", gRootProduct.Name, GetProductPartNumber(gRootProduct), "", "", "", "", "", "OK", 0, "Active CATProduct OK."
+    WritePatchEvent "ROOT_PRODUCT", gRootProduct.Name, GetProductPartNumber(gRootProduct), "", gRootFullName, "", "", "", "OK", 0, "Root product."
 
     TraversePatchProduct gRootProduct, True
 
@@ -61,28 +64,8 @@ Sub CATIA_BOM_IMAGE_PROPERTY_PATCH()
     End If
 
     CATIA.StatusBar = ""
-    WritePatchEvent "FINISH", "", "", "", "", "", "", "FINISH", 0, BuildSummaryText()
-
-    Dim summaryText
-    summaryText = "Patch zavrsen." & vbCrLf & _
-                  "Poseceno product objekata: " & CStr(gVisitedCount) & vbCrLf & _
-                  "Jedinstvenih referenci: " & CStr(gUniqueReferenceCount) & vbCrLf & _
-                  "Dodato Slika property: " & CStr(gCreatedCount) & vbCrLf & _
-                  "Azurirano Slika property: " & CStr(gUpdatedCount) & vbCrLf & _
-                  "Readback OK: " & CStr(gReadbackOkCount) & vbCrLf & _
-                  "Fasteneri oznaceni: " & CStr(gFastenerCount) & vbCrLf & _
-                  "Duplikati preskoceni: " & CStr(gDuplicateSkippedCount) & vbCrLf & _
-                  "Root preskocen: " & CStr(gRootSkippedCount) & vbCrLf & _
-                  "Property write failed: " & CStr(gWriteFailedCount)
-
-    If (gCreatedCount + gUpdatedCount) = 0 Then
-        MsgBox summaryText & vbCrLf & vbCrLf & "UPOZORENJE: Nijedan Slika property nije dodat. Pogledajte log fajl:" & vbCrLf & gLogPath, _
-               vbExclamation, "CATIA_BOM_IMAGE_PROPERTY_PATCH"
-    Else
-        MsgBox summaryText & vbCrLf & vbCrLf & _
-               "Sada otvorite Analyze -> Bill of Material -> Define Bill of Material i dodajte kolonu Slika.", _
-               vbInformation, "CATIA_BOM_IMAGE_PROPERTY_PATCH"
-    End If
+    WritePatchEvent "FINISH", "", "", "", "", "", "", "", "FINISH", 0, BuildSummaryText()
+    ShowSummary
     Err.Clear
 End Sub
 
@@ -102,6 +85,7 @@ Sub InitializePatchRuntime()
     gFastenerCount = 0
     gDuplicateSkippedCount = 0
     gRootSkippedCount = 0
+    gSourceOpenFallbackCount = 0
     gWriteFailedCount = 0
     gSaveFailedCount = 0
     ResetLastWriteInfo
@@ -113,14 +97,14 @@ Function ValidateActiveProduct()
     ValidateActiveProduct = False
     If CATIA.Documents.Count = 0 Then
         MsgBox "Nema otvorenog CATIA dokumenta. Otvorite glavni CATProduct.", vbExclamation, "CATIA_BOM_IMAGE_PROPERTY_PATCH"
-        WritePatchEvent "ERROR", "", "", "", "", "", "", "ERROR", 0, "No open CATIA document."
+        WritePatchEvent "ERROR", "", "", "", "", "", "", "", "ERROR", 0, "No open CATIA document."
         Exit Function
     End If
 
     Set gProductDocument = CATIA.ActiveDocument
     Set gRootProduct = gProductDocument.Product
     If Err.Number <> 0 Or gRootProduct Is Nothing Then
-        WritePatchEvent "ERROR", "", "", "", "", "", "", "ERROR", Err.Number, "Active document is not CATProduct. " & Err.Description
+        WritePatchEvent "ERROR", "", "", "", "", "", "", "", "ERROR", Err.Number, "Active document is not CATProduct. " & Err.Description
         MsgBox "Aktivni dokument mora biti CATProduct.", vbExclamation, "CATIA_BOM_IMAGE_PROPERTY_PATCH"
         Err.Clear
         Exit Function
@@ -147,46 +131,43 @@ Sub TraversePatchProduct(prod, isRoot)
     referenceKey = ProductPatchKey(prod, sourcePath)
     CATIA.StatusBar = "Patching Slika property: " & CStr(gVisitedCount) & " - " & rawPn
 
-    WritePatchEvent "PRODUCT_VISITED", productName, rawPn, referenceKey, "", IMAGE_PROPERTY_NAME, "", "PRODUCT_VISITED", 0, "SourcePath=" & sourcePath & "; IsRoot=" & CStr(isRoot)
+    WritePatchEvent "PRODUCT_VISITED", productName, rawPn, referenceKey, sourcePath, "", IMAGE_PROPERTY_NAME, "", "PRODUCT_VISITED", 0, "IsRoot=" & CStr(isRoot)
 
     If isRoot And Not WRITE_ROOT_ASSEMBLY_IMAGE_PROPERTY Then
         gRootSkippedCount = gRootSkippedCount + 1
-        WritePatchEvent "ROOT_ASSEMBLY_SKIPPED", productName, rawPn, referenceKey, "", IMAGE_PROPERTY_NAME, "", "ROOT_ASSEMBLY_SKIPPED", 0, "Root assembly skipped by configuration."
+        WritePatchEvent "ROOT_ASSEMBLY_SKIPPED", productName, rawPn, referenceKey, sourcePath, "", IMAGE_PROPERTY_NAME, "", "ROOT_ASSEMBLY_SKIPPED", 0, "Root assembly skipped by configuration."
     ElseIf ShouldPatchProduct(prod, sourcePath) Then
         If gProcessedReferences.Exists(referenceKey) Then
             gDuplicateSkippedCount = gDuplicateSkippedCount + 1
-            WritePatchEvent "DUPLICATE_REFERENCE_SKIPPED", productName, rawPn, referenceKey, "", IMAGE_PROPERTY_NAME, "", "DUPLICATE_REFERENCE_SKIPPED", 0, "Reference already processed."
+            WritePatchEvent "DUPLICATE_REFERENCE_SKIPPED", productName, rawPn, referenceKey, sourcePath, "", IMAGE_PROPERTY_NAME, "", "DUPLICATE_REFERENCE_SKIPPED", 0, "Reference already processed."
         Else
             gProcessedReferences.Item(referenceKey) = True
             gUniqueReferenceCount = gUniqueReferenceCount + 1
             propertyValue = INITIAL_IMAGE_PROPERTY_VALUE
-            If MARK_FASTENERS_FOR_SKIP And IsFastenerProduct(prod) Then
-                propertyValue = FASTENER_IMAGE_PROPERTY_VALUE
-            End If
+            If MARK_FASTENERS_FOR_SKIP And IsFastenerProduct(prod) Then propertyValue = FASTENER_IMAGE_PROPERTY_VALUE
 
-            resultStatus = SetOrCreateStringUserProperty(prod, IMAGE_PROPERTY_NAME, propertyValue, productName, rawPn, referenceKey)
+            resultStatus = WriteSlikaPropertyForProduct(prod, sourcePath, IMAGE_PROPERTY_NAME, propertyValue, productName, rawPn, referenceKey)
             If resultStatus = "CREATED" Then
                 gCreatedCount = gCreatedCount + 1
-                WritePatchEvent "PROPERTY_CREATED", productName, rawPn, referenceKey, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "PROPERTY_CREATED", 0, ""
+                WritePatchEvent "PROPERTY_CREATED", productName, rawPn, referenceKey, sourcePath, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "PROPERTY_CREATED", 0, ""
             ElseIf resultStatus = "UPDATED" Then
                 gUpdatedCount = gUpdatedCount + 1
-                WritePatchEvent "PROPERTY_UPDATED", productName, rawPn, referenceKey, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "PROPERTY_UPDATED", 0, ""
-            ElseIf resultStatus = "NO_USERREFPROPERTIES" Then
-                gWriteFailedCount = gWriteFailedCount + 1
-                WritePatchEvent "NO_USERREFPROPERTIES", productName, rawPn, referenceKey, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "NO_USERREFPROPERTIES", gLastWriteErrNumber, gLastWriteErrDescription
+                WritePatchEvent "PROPERTY_UPDATED", productName, rawPn, referenceKey, sourcePath, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "PROPERTY_UPDATED", 0, ""
             Else
                 gWriteFailedCount = gWriteFailedCount + 1
-                WritePatchEvent "PROPERTY_WRITE_FAILED", productName, rawPn, referenceKey, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "PROPERTY_WRITE_FAILED", gLastWriteErrNumber, gLastWriteErrDescription
+                WritePatchEvent "PROPERTY_WRITE_FAILED_ALL_METHODS", productName, rawPn, referenceKey, sourcePath, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "PROPERTY_WRITE_FAILED_ALL_METHODS", gLastWriteErrNumber, gLastWriteErrDescription
             End If
 
             If resultStatus = "CREATED" Or resultStatus = "UPDATED" Then
-                If VerifyPropertyReadback(prod, IMAGE_PROPERTY_NAME, propertyValue, productName, rawPn, referenceKey) Then
+                If gLastReadbackOk Then
                     gReadbackOkCount = gReadbackOkCount + 1
-                    WritePatchEvent "PROPERTY_READBACK_OK", productName, rawPn, referenceKey, "props.Item", IMAGE_PROPERTY_NAME, propertyValue, "PROPERTY_READBACK_OK", 0, ""
+                    WritePatchEvent "PROPERTY_READBACK_OK", productName, rawPn, referenceKey, sourcePath, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "PROPERTY_READBACK_OK", 0, ""
+                Else
+                    WritePatchEvent "PROPERTY_READBACK_FAILED", productName, rawPn, referenceKey, sourcePath, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "PROPERTY_READBACK_FAILED", gLastWriteErrNumber, gLastWriteErrDescription
                 End If
                 If propertyValue = FASTENER_IMAGE_PROPERTY_VALUE Then
                     gFastenerCount = gFastenerCount + 1
-                    WritePatchEvent "FASTENER_MARKED_SKIP", productName, rawPn, referenceKey, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "FASTENER_MARKED_SKIP", 0, ""
+                    WritePatchEvent "FASTENER_MARKED_SKIP", productName, rawPn, referenceKey, sourcePath, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "FASTENER_MARKED_SKIP", 0, ""
                 End If
             End If
         End If
@@ -218,161 +199,410 @@ Function ShouldPatchProduct(prod, sourcePath)
     Err.Clear
 End Function
 
-Function SetOrCreateStringUserProperty(prod, propertyName, propertyValue, productName, partNumber, referenceKey)
+Function WriteSlikaPropertyForProduct(prod, sourcePath, propertyName, propertyValue, productName, partNumber, referenceKey)
     On Error Resume Next
-    SetOrCreateStringUserProperty = "FAILED"
+    WriteSlikaPropertyForProduct = "FAILED"
     ResetLastWriteInfo
 
-    Dim props
-    Dim param
-    Set props = GetUserRefPropertiesForProduct(prod, productName, partNumber, referenceKey)
-    If props Is Nothing Then
-        gLastWriteMethod = "GetUserRefProperties"
-        SetOrCreateStringUserProperty = "NO_USERREFPROPERTIES"
+    If TryWriteFromTreeReferenceProduct(prod, sourcePath, propertyName, propertyValue, productName, partNumber, referenceKey) Then
+        WriteSlikaPropertyForProduct = gLastWriteStatus
         Exit Function
     End If
 
-    Err.Clear
-    Set param = props.Item(CStr(propertyName))
-    If Err.Number = 0 And Not param Is Nothing Then
-        If TrySetParameterStringValue(param, propertyValue, "UpdateExisting.Value") Then
-            gLastWriteMethod = "UpdateExisting.Value"
-            SetOrCreateStringUserProperty = "UPDATED"
-        ElseIf TryValuateParameterStringValue(param, propertyValue, "UpdateExisting.ValuateFromString") Then
-            gLastWriteMethod = "UpdateExisting.ValuateFromString"
-            SetOrCreateStringUserProperty = "UPDATED"
-        End If
-        Err.Clear
+    If TryWriteFromTreeInstance(prod, sourcePath, propertyName, propertyValue, productName, partNumber, referenceKey) Then
+        WriteSlikaPropertyForProduct = gLastWriteStatus
         Exit Function
     End If
 
-    Err.Clear
-    Set param = Nothing
-    gLastWriteMethod = "CreateStringWithValue"
-    Set param = props.CreateString(CStr(propertyName), CStr(propertyValue))
-    If Err.Number = 0 And Not param Is Nothing Then
-        SetOrCreateStringUserProperty = "CREATED"
+    If TryWriteFromRecorderDereference(prod, sourcePath, propertyName, propertyValue, productName, partNumber, referenceKey) Then
+        WriteSlikaPropertyForProduct = gLastWriteStatus
         Exit Function
     End If
-    CaptureLastErr "CreateStringWithValue"
 
-    Err.Clear
-    Set param = Nothing
-    gLastWriteMethod = "CreateStringEmpty"
-    Set param = props.CreateString(CStr(propertyName), "")
-    If Err.Number = 0 And Not param Is Nothing Then
-        If TryValuateParameterStringValue(param, propertyValue, "CreateStringEmpty.ValuateFromString") Then
-            gLastWriteMethod = "CreateStringEmpty.ValuateFromString"
-            SetOrCreateStringUserProperty = "CREATED"
+    If Trim(CStr(sourcePath)) = "" Then
+        gLastWriteMethod = "SOURCE_PATH_LOOKUP"
+        gLastWriteErrNumber = 0
+        gLastWriteErrDescription = "Source path not found after Product Tree UserRefProperties attempts."
+        WritePatchEvent "SOURCE_PATH_NOT_FOUND_FOR_PROPERTY_WRITE", productName, partNumber, referenceKey, sourcePath, gLastWriteMethod, propertyName, propertyValue, "SOURCE_PATH_NOT_FOUND_FOR_PROPERTY_WRITE", 0, gLastWriteErrDescription
+        Exit Function
+    End If
+
+    If Not gFSO.FileExists(CStr(sourcePath)) Then
+        gLastWriteMethod = "SOURCE_FILE_CHECK"
+        gLastWriteErrNumber = 0
+        gLastWriteErrDescription = "Source file does not exist."
+        WritePatchEvent "SOURCE_FILE_NOT_FOUND_FOR_PROPERTY_WRITE", productName, partNumber, referenceKey, sourcePath, gLastWriteMethod, propertyName, propertyValue, "SOURCE_FILE_NOT_FOUND_FOR_PROPERTY_WRITE", 0, gLastWriteErrDescription
+        Exit Function
+    End If
+
+    Dim ext
+    ext = UCase(gFSO.GetExtensionName(CStr(sourcePath)))
+    If ext = "CATPART" Then
+        If TryWriteSlikaToOpenedCatPart(sourcePath, partNumber, propertyName, propertyValue, productName, referenceKey) Then
+            WriteSlikaPropertyForProduct = gLastWriteStatus
             Exit Function
         End If
-        If TrySetParameterStringValue(param, propertyValue, "CreateStringEmpty.Value") Then
-            gLastWriteMethod = "CreateStringEmpty.Value"
-            SetOrCreateStringUserProperty = "CREATED"
+    ElseIf ext = "CATPRODUCT" Then
+        If TryWriteSlikaToOpenedCatProduct(sourcePath, partNumber, propertyName, propertyValue, productName, referenceKey) Then
+            WriteSlikaPropertyForProduct = gLastWriteStatus
             Exit Function
         End If
     End If
-    CaptureLastErr "CreateStringEmpty"
     Err.Clear
 End Function
 
-Function GetUserRefPropertiesForProduct(prod, productName, partNumber, referenceKey)
+Function TryWriteFromTreeReferenceProduct(prod, sourcePath, propertyName, propertyValue, productName, partNumber, referenceKey)
     On Error Resume Next
+    TryWriteFromTreeReferenceProduct = False
     Dim refProd
     Dim props
-    Set props = Nothing
-
     Err.Clear
     Set refProd = prod.ReferenceProduct
-    If Err.Number = 0 And Not refProd Is Nothing Then
+    If Err.Number <> 0 Or refProd Is Nothing Then
+        LogMethodFailure "TREE_REFERENCE_PRODUCT_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, Err.Description
         Err.Clear
-        Set props = refProd.UserRefProperties
-        If Err.Number = 0 And Not props Is Nothing Then
-            WritePatchEvent "USERREFPROPERTIES_FOUND", productName, partNumber, referenceKey, "ReferenceProduct.UserRefProperties", IMAGE_PROPERTY_NAME, "", "OK", 0, ""
-            Set GetUserRefPropertiesForProduct = props
-            Exit Function
+        Exit Function
+    End If
+    Err.Clear
+    Set props = refProd.UserRefProperties
+    If Err.Number <> 0 Or props Is Nothing Then
+        LogMethodFailure "TREE_REFERENCE_PRODUCT_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, Err.Description
+        Err.Clear
+        Exit Function
+    End If
+    TryWriteFromTreeReferenceProduct = TryCreateOrUpdateInProperties(props, "TREE_REFERENCE_PRODUCT_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue)
+    Err.Clear
+End Function
+
+Function TryWriteFromTreeInstance(prod, sourcePath, propertyName, propertyValue, productName, partNumber, referenceKey)
+    On Error Resume Next
+    TryWriteFromTreeInstance = False
+    Dim props
+    Err.Clear
+    Set props = prod.UserRefProperties
+    If Err.Number <> 0 Or props Is Nothing Then
+        LogMethodFailure "TREE_INSTANCE_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, Err.Description
+        Err.Clear
+        Exit Function
+    End If
+    TryWriteFromTreeInstance = TryCreateOrUpdateInProperties(props, "TREE_INSTANCE_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue)
+    Err.Clear
+End Function
+
+Function TryWriteFromRecorderDereference(prod, sourcePath, propertyName, propertyValue, productName, partNumber, referenceKey)
+    On Error Resume Next
+    TryWriteFromRecorderDereference = False
+    Dim refProd
+    Dim props
+    Set refProd = GetRecorderStyleReferenceProduct(prod)
+    If refProd Is Nothing Then
+        LogMethodFailure "RECORDER_DEREFERENCE_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, 0, "Recorder-style ReferenceProduct dereference returned Nothing."
+        Exit Function
+    End If
+    Err.Clear
+    Set props = refProd.UserRefProperties
+    If Err.Number <> 0 Or props Is Nothing Then
+        LogMethodFailure "RECORDER_DEREFERENCE_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, Err.Description
+        Err.Clear
+        Exit Function
+    End If
+    TryWriteFromRecorderDereference = TryCreateOrUpdateInProperties(props, "RECORDER_DEREFERENCE_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue)
+    Err.Clear
+End Function
+
+Function GetRecorderStyleReferenceProduct(prod)
+    On Error Resume Next
+    Set GetRecorderStyleReferenceProduct = Nothing
+    Dim current
+    Dim nextProd
+    Dim i
+    Set current = prod
+    For i = 1 To 10
+        If current Is Nothing Then Exit For
+        Err.Clear
+        Set nextProd = current.ReferenceProduct
+        If Err.Number <> 0 Or nextProd Is Nothing Then
+            Err.Clear
+            Exit For
         End If
-        CaptureLastErr "ReferenceProduct.UserRefProperties"
+        If nextProd Is current Then Exit For
+        Set current = nextProd
+    Next
+    If Not current Is Nothing Then Set GetRecorderStyleReferenceProduct = current
+    Err.Clear
+End Function
+
+Function TryWriteSlikaToOpenedCatPart(sourcePath, partNumber, propertyName, propertyValue, productName, referenceKey)
+    On Error Resume Next
+    TryWriteSlikaToOpenedCatPart = False
+    Dim doc
+    Dim prod
+    Dim props
+    Dim baseName
+    gSourceOpenFallbackCount = gSourceOpenFallbackCount + 1
+    Set doc = OpenDocumentForPropertyWrite(sourcePath, productName, partNumber, referenceKey, "OPENED_CATPART_GETITEM_USERREFPROPERTIES")
+    If doc Is Nothing Then Exit Function
+
+    Err.Clear
+    Set prod = Nothing
+    If Trim(CStr(partNumber)) <> "" Then Set prod = doc.GetItem(CStr(partNumber))
+    If Err.Number <> 0 Or prod Is Nothing Then
+        Err.Clear
+        baseName = gFSO.GetBaseName(CStr(sourcePath))
+        Set prod = doc.GetItem(baseName)
+    End If
+    If Err.Number <> 0 Or prod Is Nothing Then
+        Err.Clear
+        Set prod = doc.Product
+    End If
+    If Err.Number <> 0 Or prod Is Nothing Then
+        LogMethodFailure "OPENED_CATPART_GETITEM_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, "Could not get CATPart Product through GetItem/Product."
+        Err.Clear
+        Exit Function
     End If
 
+    Set prod = GetRecorderStyleReferenceProduct(prod)
+    If prod Is Nothing Then
+        LogMethodFailure "OPENED_CATPART_GETITEM_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, 0, "Recorder dereference on opened CATPart returned Nothing."
+        Exit Function
+    End If
     Err.Clear
     Set props = prod.UserRefProperties
     If Err.Number = 0 And Not props Is Nothing Then
-        WritePatchEvent "USERREFPROPERTIES_FOUND", productName, partNumber, referenceKey, "Product.UserRefProperties", IMAGE_PROPERTY_NAME, "", "OK", 0, ""
-        Set GetUserRefPropertiesForProduct = props
-        Exit Function
-    End If
-    CaptureLastErr "Product.UserRefProperties"
-    Set GetUserRefPropertiesForProduct = Nothing
-    Err.Clear
-End Function
-
-Function TrySetParameterStringValue(param, valueText, methodName)
-    On Error Resume Next
-    TrySetParameterStringValue = False
-    Err.Clear
-    param.Value = CStr(valueText)
-    If Err.Number = 0 Then
-        TrySetParameterStringValue = True
+        TryWriteSlikaToOpenedCatPart = TryCreateOrUpdateInProperties(props, "OPENED_CATPART_GETITEM_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue)
+        If TryWriteSlikaToOpenedCatPart Then Exit Function
     Else
-        CaptureLastErr methodName
+        LogMethodFailure "OPENED_CATPART_GETITEM_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, Err.Description
+        Err.Clear
     End If
+
+    TryWriteSlikaToOpenedCatPart = TryWriteToPartParametersFallback(doc, sourcePath, partNumber, propertyName, propertyValue, productName, referenceKey)
     Err.Clear
 End Function
 
-Function TryValuateParameterStringValue(param, valueText, methodName)
+Function TryWriteSlikaToOpenedCatProduct(sourcePath, partNumber, propertyName, propertyValue, productName, referenceKey)
     On Error Resume Next
-    TryValuateParameterStringValue = False
-    Err.Clear
-    param.ValuateFromString CStr(valueText)
-    If Err.Number = 0 Then
-        TryValuateParameterStringValue = True
-    Else
-        CaptureLastErr methodName
-    End If
-    Err.Clear
-End Function
-
-Function VerifyPropertyReadback(prod, propertyName, expectedValue, productName, partNumber, referenceKey)
-    On Error Resume Next
-    VerifyPropertyReadback = False
+    TryWriteSlikaToOpenedCatProduct = False
+    Dim doc
+    Dim prod
     Dim props
-    Dim param
-    Set props = GetUserRefPropertiesForProduct(prod, productName, partNumber, referenceKey)
-    If props Is Nothing Then
-        WritePatchEvent "PROPERTY_READBACK_FAILED", productName, partNumber, referenceKey, "props.Item", propertyName, expectedValue, "PROPERTY_READBACK_FAILED", gLastWriteErrNumber, "No UserRefProperties for readback."
+    gSourceOpenFallbackCount = gSourceOpenFallbackCount + 1
+    Set doc = OpenDocumentForPropertyWrite(sourcePath, productName, partNumber, referenceKey, "OPENED_CATPRODUCT_PRODUCT_USERREFPROPERTIES")
+    If doc Is Nothing Then Exit Function
+
+    Err.Clear
+    Set prod = doc.Product
+    If Err.Number <> 0 Or prod Is Nothing Then
+        LogMethodFailure "OPENED_CATPRODUCT_PRODUCT_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, Err.Description
+        Err.Clear
         Exit Function
     End If
+    Set prod = GetRecorderStyleReferenceProduct(prod)
+    If prod Is Nothing Then
+        LogMethodFailure "OPENED_CATPRODUCT_PRODUCT_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, 0, "Recorder dereference on opened CATProduct returned Nothing."
+        Exit Function
+    End If
+    Err.Clear
+    Set props = prod.UserRefProperties
+    If Err.Number <> 0 Or props Is Nothing Then
+        LogMethodFailure "OPENED_CATPRODUCT_PRODUCT_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, Err.Description
+        Err.Clear
+        Exit Function
+    End If
+    TryWriteSlikaToOpenedCatProduct = TryCreateOrUpdateInProperties(props, "OPENED_CATPRODUCT_PRODUCT_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue)
+    Err.Clear
+End Function
+
+Function OpenDocumentForPropertyWrite(sourcePath, productName, partNumber, referenceKey, methodName)
+    On Error Resume Next
+    Set OpenDocumentForPropertyWrite = Nothing
+    Dim doc
+    If FindOpenDocumentByFullName(sourcePath, doc) Then
+        Set OpenDocumentForPropertyWrite = doc
+        Exit Function
+    End If
+    Err.Clear
+    CATIA.DisplayFileAlerts = False
+    Set doc = CATIA.Documents.Open(sourcePath)
+    CATIA.DisplayFileAlerts = True
+    If Err.Number = 0 And Not doc Is Nothing Then
+        Set OpenDocumentForPropertyWrite = doc
+    Else
+        LogMethodFailure methodName, productName, partNumber, referenceKey, sourcePath, IMAGE_PROPERTY_NAME, "", Err.Number, Err.Description
+        Err.Clear
+    End If
+End Function
+
+Function TryWriteToPartParametersFallback(doc, sourcePath, partNumber, propertyName, propertyValue, productName, referenceKey)
+    On Error Resume Next
+    TryWriteToPartParametersFallback = False
+    Dim partObj
+    Dim params
+    Err.Clear
+    Set partObj = doc.Part
+    If Err.Number <> 0 Or partObj Is Nothing Then
+        LogMethodFailure "PARAMETER_FALLBACK", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, "Part.Parameters fallback could not get Part object."
+        Err.Clear
+        Exit Function
+    End If
+    Err.Clear
+    Set params = partObj.Parameters
+    If Err.Number <> 0 Or params Is Nothing Then
+        LogMethodFailure "PARAMETER_FALLBACK", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, "Part.Parameters fallback could not get Parameters."
+        Err.Clear
+        Exit Function
+    End If
+    WritePatchEvent "PARAMETER_FALLBACK_USED", productName, partNumber, referenceKey, sourcePath, "PARAMETER_FALLBACK", propertyName, propertyValue, "PARAMETER_FALLBACK_USED", 0, "Using Part.Parameters as last fallback."
+    TryWriteToPartParametersFallback = TryCreateOrUpdateInProperties(params, "PARAMETER_FALLBACK", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue)
+    Err.Clear
+End Function
+
+Function TryCreateOrUpdateInProperties(props, methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue)
+    On Error Resume Next
+    TryCreateOrUpdateInProperties = False
+    Dim param
+    Dim localStatus
+    ResetLastWriteInfo
+    gLastWriteMethod = methodName
 
     Err.Clear
     Set param = props.Item(CStr(propertyName))
     If Err.Number = 0 And Not param Is Nothing Then
-        VerifyPropertyReadback = True
+        If SetExistingParameterValue(param, propertyValue, methodName, productName, partNumber, referenceKey, sourcePath, propertyName) Then
+            gLastWriteStatus = "UPDATED"
+            gLastReadbackOk = ReadbackFromProperties(props, methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue)
+            TryCreateOrUpdateInProperties = True
+        End If
+        Err.Clear
+        Exit Function
+    End If
+
+    Err.Clear
+    Set param = Nothing
+    Set param = props.CreateString(CStr(propertyName), CStr(propertyValue))
+    If Err.Number = 0 And Not param Is Nothing Then
+        SetParameterValueAfterCreate param, propertyValue, methodName, productName, partNumber, referenceKey, sourcePath, propertyName
+        gLastWriteStatus = "CREATED"
+        gLastReadbackOk = ReadbackFromProperties(props, methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue)
+        TryCreateOrUpdateInProperties = True
+        Exit Function
+    End If
+    LogMethodFailure methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, "CreateString(propertyName, propertyValue) failed. " & Err.Description
+
+    Err.Clear
+    Set param = Nothing
+    Set param = props.CreateString(CStr(propertyName), "")
+    If Err.Number = 0 And Not param Is Nothing Then
+        If SetParameterValueAfterCreate(param, propertyValue, methodName, productName, partNumber, referenceKey, sourcePath, propertyName) Then
+            gLastWriteStatus = "CREATED"
+            gLastReadbackOk = ReadbackFromProperties(props, methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue)
+            TryCreateOrUpdateInProperties = True
+            Exit Function
+        End If
     Else
-        WritePatchEvent "PROPERTY_READBACK_FAILED", productName, partNumber, referenceKey, "props.Item", propertyName, expectedValue, "PROPERTY_READBACK_FAILED", Err.Number, Err.Description
+        LogMethodFailure methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, "CreateString(propertyName, empty) failed. " & Err.Description
+    End If
+    Err.Clear
+End Function
+
+Function SetExistingParameterValue(param, propertyValue, methodName, productName, partNumber, referenceKey, sourcePath, propertyName)
+    On Error Resume Next
+    SetExistingParameterValue = False
+    Err.Clear
+    param.ValuateFromString CStr(propertyValue)
+    If Err.Number = 0 Then
+        SetExistingParameterValue = True
+        Exit Function
+    End If
+    LogMethodFailure methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, "Existing.ValuateFromString failed. " & Err.Description
+
+    Err.Clear
+    param.Value = CStr(propertyValue)
+    If Err.Number = 0 Then
+        SetExistingParameterValue = True
+    Else
+        LogMethodFailure methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, "Existing.Value failed. " & Err.Description
+    End If
+    Err.Clear
+End Function
+
+Function SetParameterValueAfterCreate(param, propertyValue, methodName, productName, partNumber, referenceKey, sourcePath, propertyName)
+    On Error Resume Next
+    SetParameterValueAfterCreate = False
+    Err.Clear
+    param.ValuateFromString CStr(propertyValue)
+    If Err.Number = 0 Then
+        SetParameterValueAfterCreate = True
+        Exit Function
+    End If
+    LogMethodFailure methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, "Created.ValuateFromString failed. " & Err.Description
+
+    Err.Clear
+    param.Value = CStr(propertyValue)
+    If Err.Number = 0 Then
+        SetParameterValueAfterCreate = True
+    Else
+        LogMethodFailure methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, "Created.Value failed. " & Err.Description
+    End If
+    Err.Clear
+End Function
+
+Function ReadbackFromProperties(props, methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue)
+    On Error Resume Next
+    ReadbackFromProperties = False
+    Dim checkParam
+    Err.Clear
+    Set checkParam = props.Item(CStr(propertyName))
+    If Err.Number = 0 And Not checkParam Is Nothing Then
+        ReadbackFromProperties = True
+    Else
+        gLastWriteErrNumber = Err.Number
+        gLastWriteErrDescription = Err.Description
+        WritePatchEvent "PROPERTY_READBACK_FAILED", productName, partNumber, referenceKey, sourcePath, methodName, propertyName, propertyValue, "PROPERTY_READBACK_FAILED", Err.Number, Err.Description
         Err.Clear
     End If
 End Function
+
+Sub LogMethodFailure(methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, errNumber, errDescription)
+    gLastWriteMethod = methodName
+    gLastWriteErrNumber = CLng(Val(errNumber))
+    gLastWriteErrDescription = CStr(errDescription)
+    If methodName = "TREE_REFERENCE_PRODUCT_USERREFPROPERTIES" Or methodName = "TREE_INSTANCE_USERREFPROPERTIES" Or methodName = "RECORDER_DEREFERENCE_USERREFPROPERTIES" Then
+        WritePatchEvent "NO_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, methodName, propertyName, propertyValue, "NO_USERREFPROPERTIES", gLastWriteErrNumber, gLastWriteErrDescription
+    Else
+        WritePatchEvent "PROPERTY_WRITE_FAILED", productName, partNumber, referenceKey, sourcePath, methodName, propertyName, propertyValue, "PROPERTY_WRITE_FAILED", gLastWriteErrNumber, gLastWriteErrDescription
+    End If
+End Sub
 
 Sub ResetLastWriteInfo()
     gLastWriteMethod = ""
     gLastWriteErrNumber = 0
     gLastWriteErrDescription = ""
+    gLastReadbackOk = False
+    gLastWriteStatus = ""
 End Sub
 
-Sub CaptureLastErr(methodName)
-    If Err.Number <> 0 Then
-        gLastWriteMethod = methodName
-        gLastWriteErrNumber = Err.Number
-        gLastWriteErrDescription = Err.Description
-    End If
-End Sub
+Function FindOpenDocumentByFullName(fullName, ByRef foundDoc)
+    On Error Resume Next
+    FindOpenDocumentByFullName = False
+    Dim i
+    Dim doc
+    For i = 1 To CATIA.Documents.Count
+        Set doc = CATIA.Documents.Item(i)
+        If SamePath(GetDocumentFullName(doc), fullName) Then
+            Set foundDoc = doc
+            FindOpenDocumentByFullName = True
+            Exit Function
+        End If
+    Next
+    Err.Clear
+End Function
 
 Sub AskToSaveOpenCatiaDocuments()
     On Error Resume Next
     Dim answer
-    answer = MsgBox("Patch je dodao/azurirao property 'Slika'. Da li zelite da sacuvate otvorene CATIA dokumente?" & vbCrLf & vbCrLf & _
-                    "YES = sacuvaj otvorene dokumente ako je moguce" & vbCrLf & _
+    answer = MsgBox("Patch je dodao/azurirao property 'Slika'. Da li zelite da sacuvate izmenjene CATIA dokumente?" & vbCrLf & vbCrLf & _
+                    "YES = sacuvaj izmenjene dokumente ako je moguce" & vbCrLf & _
                     "NO = ne snimaj" & vbCrLf & _
                     "CANCEL = ne snimaj i zavrsi", _
                     vbYesNoCancel + vbQuestion, "CATIA_BOM_IMAGE_PROPERTY_PATCH")
@@ -394,7 +624,7 @@ Sub SaveOpenCatiaDocuments()
         doc.Save
         If Err.Number <> 0 Then
             gSaveFailedCount = gSaveFailedCount + 1
-            WritePatchEvent "SAVE_FAILED", docName, "", docPath, "Document.Save", "", "", "SAVE_FAILED", Err.Number, Err.Description
+            WritePatchEvent "SAVE_FAILED", docName, "", "", docPath, "Document.Save", "", "", "SAVE_FAILED", Err.Number, Err.Description
             Err.Clear
         End If
     Next
@@ -545,6 +775,10 @@ Function GetDocumentFullName(doc)
     End If
 End Function
 
+Function SamePath(pathA, pathB)
+    SamePath = (UCase(Trim(CStr(pathA))) = UCase(Trim(CStr(pathB))) And Trim(CStr(pathA)) <> "")
+End Function
+
 Function NormalizePartNumber(valueText)
     Dim s
     s = Trim(CStr(valueText))
@@ -576,11 +810,32 @@ Function BuildSummaryText()
                        "; Fasteners=" & CStr(gFastenerCount) & _
                        "; Duplicates=" & CStr(gDuplicateSkippedCount) & _
                        "; RootSkipped=" & CStr(gRootSkippedCount) & _
+                       "; SourceOpenFallbackUsed=" & CStr(gSourceOpenFallbackCount) & _
                        "; WriteFailed=" & CStr(gWriteFailedCount) & _
                        "; SaveFailed=" & CStr(gSaveFailedCount)
 End Function
 
-Sub WritePatchEvent(phase, productName, partNumber, referenceKey, methodName, propertyName, propertyValue, status, errNumber, errDescription)
+Sub ShowSummary()
+    Dim summaryText
+    summaryText = "Patch zavrsen." & vbCrLf & _
+                  "Poseceno product objekata: " & CStr(gVisitedCount) & vbCrLf & _
+                  "Jedinstvenih referenci: " & CStr(gUniqueReferenceCount) & vbCrLf & _
+                  "Dodato Slika property: " & CStr(gCreatedCount) & vbCrLf & _
+                  "Azurirano Slika property: " & CStr(gUpdatedCount) & vbCrLf & _
+                  "Readback OK: " & CStr(gReadbackOkCount) & vbCrLf & _
+                  "Fasteneri oznaceni: " & CStr(gFastenerCount) & vbCrLf & _
+                  "Duplikati preskoceni: " & CStr(gDuplicateSkippedCount) & vbCrLf & _
+                  "Root preskocen: " & CStr(gRootSkippedCount) & vbCrLf & _
+                  "Source open fallback used: " & CStr(gSourceOpenFallbackCount) & vbCrLf & _
+                  "Property write failed: " & CStr(gWriteFailedCount)
+    If (gCreatedCount + gUpdatedCount) = 0 Then
+        MsgBox summaryText & vbCrLf & vbCrLf & "Nijedan Slika property nije dodat. Pogledajte log:" & vbCrLf & gLogPath, vbExclamation, "CATIA_BOM_IMAGE_PROPERTY_PATCH"
+    Else
+        MsgBox summaryText & vbCrLf & vbCrLf & "Sada otvorite Bill of Material -> Define formats i dodajte kolonu Slika.", vbInformation, "CATIA_BOM_IMAGE_PROPERTY_PATCH"
+    End If
+End Sub
+
+Sub WritePatchEvent(phase, productName, partNumber, referenceKey, sourcePath, methodName, propertyName, propertyValue, status, errNumber, errDescription)
     On Error Resume Next
     Dim ts
     Set ts = gFSO.OpenTextFile(gLogPath, 8, True)
@@ -588,6 +843,7 @@ Sub WritePatchEvent(phase, productName, partNumber, referenceKey, methodName, pr
                  "Product.Name=" & CStr(productName) & vbTab & _
                  "Product.PartNumber=" & CStr(partNumber) & vbTab & _
                  "referenceKey=" & CStr(referenceKey) & vbTab & _
+                 "sourcePath=" & CStr(sourcePath) & vbTab & _
                  "methodName=" & CStr(methodName) & vbTab & _
                  "propertyName=" & CStr(propertyName) & vbTab & _
                  "propertyValue=" & CStr(propertyValue) & vbTab & _

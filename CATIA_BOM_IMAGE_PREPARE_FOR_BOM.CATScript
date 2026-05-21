@@ -24,6 +24,7 @@ Const SKIP_EXISTING_IMAGES = True
 Const ASK_BEFORE_SAVING_CATIA_DOCUMENTS = True
 Const AUTO_SAVE_CATIA_DOCUMENTS = False
 Const IMAGE_CAPTURE_DELAY_SECONDS = 0.2
+Const USE_WHITE_BACKGROUND = True
 Const FASTENER_KEYWORDS = "vijak|vijci|zavrtanj|zavrtnji|screw|bolt|hex bolt|hexagon bolt|imbus|allen screw|navrtka|matica|nut|hex nut|podloska|podloska|washer|plain washer|spring washer|lock washer|DIN 125|DIN125|DIN 127|DIN127|DIN 933|DIN933|DIN 931|DIN931|DIN 934|DIN934|ISO 4014|ISO 4017|ISO 4032|ISO 7089|ISO 7090"
 
 Const CAT_CAPTURE_FORMAT_JPEG = 2
@@ -304,6 +305,7 @@ Function CaptureActiveStandaloneViewer(imagePath, sourcePath, prod)
     If viewer Is Nothing Then Exit Function
     viewer.Activate
     WritePrepareLog "CAPTURE_VIEWER_CONTEXT", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, ActiveCaptureContextText()
+    If USE_WHITE_BACKGROUND Then ApplyWhiteBackground viewer, prod, sourcePath, imagePath
     ApplyIsoView viewer
     WaitSeconds IMAGE_CAPTURE_DELAY_SECONDS
     Err.Clear
@@ -351,6 +353,22 @@ Function GetWindowLabel(windowObj)
     End If
     Err.Clear
 End Function
+
+Sub ApplyWhiteBackground(viewer, prod, sourcePath, imagePath)
+    On Error Resume Next
+    Dim rgb(2)
+    rgb(0) = 1
+    rgb(1) = 1
+    rgb(2) = 1
+    Err.Clear
+    viewer.PutBackgroundColor rgb
+    If Err.Number = 0 Then
+        WritePrepareLog "WHITE_BACKGROUND_SET", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "Viewer background set to white."
+    Else
+        WritePrepareLog "WHITE_BACKGROUND_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "Could not set white viewer background. Err=" & Err.Description
+        Err.Clear
+    End If
+End Sub
 
 Sub ApplyIsoView(viewer)
     On Error Resume Next

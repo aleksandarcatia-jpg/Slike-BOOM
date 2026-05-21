@@ -14,6 +14,7 @@ Const IMAGE_COLUMN_WIDTH = 20
 Const IMAGE_ROW_HEIGHT = 90
 Const MAX_IMAGE_WIDTH = 140
 Const MAX_IMAGE_HEIGHT = 80
+Const CELL_IMAGE_PADDING_POINTS = 3
 Const XL_UP = -4162
 Const XL_TO_LEFT = -4159
 Const XL_OPENXML_WORKBOOK = 51
@@ -291,6 +292,10 @@ Function InsertImageIntoCell(rowIndex, imagePath)
     InsertImageIntoCell = False
     Dim cell
     Dim pic
+    Dim availableWidth
+    Dim availableHeight
+    Dim scaleByWidth
+    Dim scaleByHeight
     Set cell = gWs.Cells(rowIndex, gImageColumnIndex)
     gWs.Rows(rowIndex).RowHeight = IMAGE_ROW_HEIGHT
     gWs.Columns(gImageColumnIndex).ColumnWidth = IMAGE_COLUMN_WIDTH
@@ -302,8 +307,24 @@ Function InsertImageIntoCell(rowIndex, imagePath)
         Exit Function
     End If
     pic.LockAspectRatio = MSO_TRUE
-    If pic.Width > MAX_IMAGE_WIDTH Then pic.Width = MAX_IMAGE_WIDTH
-    If pic.Height > MAX_IMAGE_HEIGHT Then pic.Height = MAX_IMAGE_HEIGHT
+
+    availableWidth = cell.Width - (2 * CELL_IMAGE_PADDING_POINTS)
+    availableHeight = cell.Height - (2 * CELL_IMAGE_PADDING_POINTS)
+    If availableWidth > MAX_IMAGE_WIDTH Then availableWidth = MAX_IMAGE_WIDTH
+    If availableHeight > MAX_IMAGE_HEIGHT Then availableHeight = MAX_IMAGE_HEIGHT
+    If availableWidth < 4 Then availableWidth = 4
+    If availableHeight < 4 Then availableHeight = 4
+
+    scaleByWidth = availableWidth / pic.Width
+    scaleByHeight = availableHeight / pic.Height
+    If scaleByWidth < scaleByHeight Then
+        pic.Width = pic.Width * scaleByWidth
+    Else
+        pic.Height = pic.Height * scaleByHeight
+    End If
+
+    If pic.Width > availableWidth Then pic.Width = availableWidth
+    If pic.Height > availableHeight Then pic.Height = availableHeight
     pic.Left = cell.Left + ((cell.Width - pic.Width) / 2)
     pic.Top = cell.Top + ((cell.Height - pic.Height) / 2)
     pic.Placement = MSO_PLACEMENT_MOVE_AND_SIZE

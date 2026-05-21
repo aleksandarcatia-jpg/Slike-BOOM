@@ -6,8 +6,8 @@ End Sub
 
 ' ================================================================
 ' CATIA_BOM_IMAGE_PROPERTY_PATCH
-' Adds/updates the "Slika" user property so it can be selected in
-' CATIA Analyze > Bill of Material > Define Bill of Material.
+' Automatically creates/updates String user property "Slika" on
+' unique CATPart/CATProduct references from the active CATProduct.
 ' ================================================================
 
 Const IMAGE_PROPERTY_NAME = "Slika"
@@ -28,21 +28,29 @@ Dim gProductDocument
 Dim gRootProduct
 Dim gRootFullName
 Dim gLogPath
-Dim gPatchedKeys
-Dim gUpdatedCount
-Dim gFastenerCount
-Dim gRootSkippedCount
-Dim gErrorCount
+Dim gProcessedReferences
 Dim gVisitedCount
+Dim gUniqueReferenceCount
+Dim gCreatedCount
+Dim gUpdatedCount
+Dim gReadbackOkCount
+Dim gFastenerCount
+Dim gDuplicateSkippedCount
+Dim gRootSkippedCount
+Dim gWriteFailedCount
+Dim gSaveFailedCount
+Dim gLastWriteMethod
+Dim gLastWriteErrNumber
+Dim gLastWriteErrDescription
 
 Sub CATIA_BOM_IMAGE_PROPERTY_PATCH()
     On Error Resume Next
     InitializePatchRuntime
-    WritePatchLog "START", "", "", "", "CATIA_BOM_IMAGE_PROPERTY_PATCH started."
+    WritePatchEvent "START", "", "", "", "", "", "", "START", 0, "CATIA_BOM_IMAGE_PROPERTY_PATCH started."
 
     If Not ValidateActiveProduct() Then Exit Sub
-    WritePatchLog "ACTIVE_PRODUCT_VALIDATED", gRootProduct.Name, GetProductPartNumber(gRootProduct), "", "Active CATProduct OK."
-    WritePatchLog "ROOT_PRODUCT", gRootProduct.Name, GetProductPartNumber(gRootProduct), gRootFullName, "Root product."
+    WritePatchEvent "ACTIVE_PRODUCT_VALIDATED", gRootProduct.Name, GetProductPartNumber(gRootProduct), "", "", "", "", "OK", 0, "Active CATProduct OK."
+    WritePatchEvent "ROOT_PRODUCT", gRootProduct.Name, GetProductPartNumber(gRootProduct), gRootFullName, "", "", "", "OK", 0, "Root product."
 
     TraversePatchProduct gRootProduct, True
 
@@ -53,15 +61,28 @@ Sub CATIA_BOM_IMAGE_PROPERTY_PATCH()
     End If
 
     CATIA.StatusBar = ""
-    WritePatchLog "FINISH", "", "", "", "Updated=" & CStr(gUpdatedCount) & "; Fasteners=" & CStr(gFastenerCount) & "; RootSkipped=" & CStr(gRootSkippedCount) & "; Errors=" & CStr(gErrorCount)
+    WritePatchEvent "FINISH", "", "", "", "", "", "", "FINISH", 0, BuildSummaryText()
 
-    MsgBox "Patch zavrsen." & vbCrLf & _
-           "Dodato/azurirano Slika property: " & CStr(gUpdatedCount) & vbCrLf & _
-           "Preskoceno fastenera: " & CStr(gFastenerCount) & vbCrLf & _
-           "Preskocen root assembly: " & CStr(gRootSkippedCount) & vbCrLf & _
-           "Greske: " & CStr(gErrorCount) & vbCrLf & vbCrLf & _
-           "Sada otvorite Analyze -> Bill of Material -> Define Bill of Material i dodajte kolonu Slika.", _
-           vbInformation, "CATIA_BOM_IMAGE_PROPERTY_PATCH"
+    Dim summaryText
+    summaryText = "Patch zavrsen." & vbCrLf & _
+                  "Poseceno product objekata: " & CStr(gVisitedCount) & vbCrLf & _
+                  "Jedinstvenih referenci: " & CStr(gUniqueReferenceCount) & vbCrLf & _
+                  "Dodato Slika property: " & CStr(gCreatedCount) & vbCrLf & _
+                  "Azurirano Slika property: " & CStr(gUpdatedCount) & vbCrLf & _
+                  "Readback OK: " & CStr(gReadbackOkCount) & vbCrLf & _
+                  "Fasteneri oznaceni: " & CStr(gFastenerCount) & vbCrLf & _
+                  "Duplikati preskoceni: " & CStr(gDuplicateSkippedCount) & vbCrLf & _
+                  "Root preskocen: " & CStr(gRootSkippedCount) & vbCrLf & _
+                  "Property write failed: " & CStr(gWriteFailedCount)
+
+    If (gCreatedCount + gUpdatedCount) = 0 Then
+        MsgBox summaryText & vbCrLf & vbCrLf & "UPOZORENJE: Nijedan Slika property nije dodat. Pogledajte log fajl:" & vbCrLf & gLogPath, _
+               vbExclamation, "CATIA_BOM_IMAGE_PROPERTY_PATCH"
+    Else
+        MsgBox summaryText & vbCrLf & vbCrLf & _
+               "Sada otvorite Analyze -> Bill of Material -> Define Bill of Material i dodajte kolonu Slika.", _
+               vbInformation, "CATIA_BOM_IMAGE_PROPERTY_PATCH"
+    End If
     Err.Clear
 End Sub
 
@@ -71,13 +92,19 @@ Sub InitializePatchRuntime()
     EnsureFolder "C:\Temp"
     EnsureFolder WORK_ROOT
     gLogPath = JoinPath(WORK_ROOT, LOG_FILE_NAME)
-    Set gPatchedKeys = CreateObject("Scripting.Dictionary")
-    gPatchedKeys.CompareMode = 1
-    gUpdatedCount = 0
-    gFastenerCount = 0
-    gRootSkippedCount = 0
-    gErrorCount = 0
+    Set gProcessedReferences = CreateObject("Scripting.Dictionary")
+    gProcessedReferences.CompareMode = 1
     gVisitedCount = 0
+    gUniqueReferenceCount = 0
+    gCreatedCount = 0
+    gUpdatedCount = 0
+    gReadbackOkCount = 0
+    gFastenerCount = 0
+    gDuplicateSkippedCount = 0
+    gRootSkippedCount = 0
+    gWriteFailedCount = 0
+    gSaveFailedCount = 0
+    ResetLastWriteInfo
     Err.Clear
 End Sub
 
@@ -86,17 +113,19 @@ Function ValidateActiveProduct()
     ValidateActiveProduct = False
     If CATIA.Documents.Count = 0 Then
         MsgBox "Nema otvorenog CATIA dokumenta. Otvorite glavni CATProduct.", vbExclamation, "CATIA_BOM_IMAGE_PROPERTY_PATCH"
-        WritePatchLog "ERROR", "", "", "", "No open CATIA document."
+        WritePatchEvent "ERROR", "", "", "", "", "", "", "ERROR", 0, "No open CATIA document."
         Exit Function
     End If
+
     Set gProductDocument = CATIA.ActiveDocument
     Set gRootProduct = gProductDocument.Product
     If Err.Number <> 0 Or gRootProduct Is Nothing Then
-        WritePatchLog "ERROR", "", "", "", "Active document is not CATProduct. Err=" & Err.Description
+        WritePatchEvent "ERROR", "", "", "", "", "", "", "ERROR", Err.Number, "Active document is not CATProduct. " & Err.Description
         MsgBox "Aktivni dokument mora biti CATProduct.", vbExclamation, "CATIA_BOM_IMAGE_PROPERTY_PATCH"
         Err.Clear
         Exit Function
     End If
+
     gRootFullName = GetDocumentFullName(gProductDocument)
     ValidateActiveProduct = True
     Err.Clear
@@ -104,38 +133,61 @@ End Function
 
 Sub TraversePatchProduct(prod, isRoot)
     On Error Resume Next
+    Dim productName
     Dim rawPn
     Dim sourcePath
+    Dim referenceKey
     Dim propertyValue
-    Dim status
-    Dim key
+    Dim resultStatus
+
     gVisitedCount = gVisitedCount + 1
+    productName = CStr(prod.Name)
     rawPn = GetProductPartNumber(prod)
     sourcePath = GetProductSourceFilePath(prod)
+    referenceKey = ProductPatchKey(prod, sourcePath)
     CATIA.StatusBar = "Patching Slika property: " & CStr(gVisitedCount) & " - " & rawPn
-    WritePatchLog "PRODUCT_VISITED", prod.Name, rawPn, sourcePath, "IsRoot=" & CStr(isRoot)
+
+    WritePatchEvent "PRODUCT_VISITED", productName, rawPn, referenceKey, "", IMAGE_PROPERTY_NAME, "", "PRODUCT_VISITED", 0, "SourcePath=" & sourcePath & "; IsRoot=" & CStr(isRoot)
 
     If isRoot And Not WRITE_ROOT_ASSEMBLY_IMAGE_PROPERTY Then
         gRootSkippedCount = gRootSkippedCount + 1
-        WritePatchLog "ROOT_ASSEMBLY_SKIPPED", prod.Name, rawPn, sourcePath, "Root assembly skipped by configuration."
-    ElseIf ShouldPatchProduct(prod, isRoot, sourcePath) Then
-        key = ProductPatchKey(prod, sourcePath)
-        If Not gPatchedKeys.Exists(key) Then
-            gPatchedKeys.Item(key) = True
+        WritePatchEvent "ROOT_ASSEMBLY_SKIPPED", productName, rawPn, referenceKey, "", IMAGE_PROPERTY_NAME, "", "ROOT_ASSEMBLY_SKIPPED", 0, "Root assembly skipped by configuration."
+    ElseIf ShouldPatchProduct(prod, sourcePath) Then
+        If gProcessedReferences.Exists(referenceKey) Then
+            gDuplicateSkippedCount = gDuplicateSkippedCount + 1
+            WritePatchEvent "DUPLICATE_REFERENCE_SKIPPED", productName, rawPn, referenceKey, "", IMAGE_PROPERTY_NAME, "", "DUPLICATE_REFERENCE_SKIPPED", 0, "Reference already processed."
+        Else
+            gProcessedReferences.Item(referenceKey) = True
+            gUniqueReferenceCount = gUniqueReferenceCount + 1
             propertyValue = INITIAL_IMAGE_PROPERTY_VALUE
             If MARK_FASTENERS_FOR_SKIP And IsFastenerProduct(prod) Then
                 propertyValue = FASTENER_IMAGE_PROPERTY_VALUE
-                gFastenerCount = gFastenerCount + 1
-                WritePatchLog "FASTENER_MARKED_SKIP", prod.Name, rawPn, sourcePath, propertyValue
             End If
 
-            status = SetOrCreateStringUserProperty(prod, IMAGE_PROPERTY_NAME, propertyValue)
-            If status = "CREATED" Or status = "UPDATED" Then
+            resultStatus = SetOrCreateStringUserProperty(prod, IMAGE_PROPERTY_NAME, propertyValue, productName, rawPn, referenceKey)
+            If resultStatus = "CREATED" Then
+                gCreatedCount = gCreatedCount + 1
+                WritePatchEvent "PROPERTY_CREATED", productName, rawPn, referenceKey, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "PROPERTY_CREATED", 0, ""
+            ElseIf resultStatus = "UPDATED" Then
                 gUpdatedCount = gUpdatedCount + 1
-                WritePatchLog "PROPERTY_" & status, prod.Name, rawPn, propertyValue, "Property " & IMAGE_PROPERTY_NAME & "=" & propertyValue
+                WritePatchEvent "PROPERTY_UPDATED", productName, rawPn, referenceKey, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "PROPERTY_UPDATED", 0, ""
+            ElseIf resultStatus = "NO_USERREFPROPERTIES" Then
+                gWriteFailedCount = gWriteFailedCount + 1
+                WritePatchEvent "NO_USERREFPROPERTIES", productName, rawPn, referenceKey, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "NO_USERREFPROPERTIES", gLastWriteErrNumber, gLastWriteErrDescription
             Else
-                gErrorCount = gErrorCount + 1
-                WritePatchLog "PROPERTY_WRITE_FAILED", prod.Name, rawPn, propertyValue, "Could not write property."
+                gWriteFailedCount = gWriteFailedCount + 1
+                WritePatchEvent "PROPERTY_WRITE_FAILED", productName, rawPn, referenceKey, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "PROPERTY_WRITE_FAILED", gLastWriteErrNumber, gLastWriteErrDescription
+            End If
+
+            If resultStatus = "CREATED" Or resultStatus = "UPDATED" Then
+                If VerifyPropertyReadback(prod, IMAGE_PROPERTY_NAME, propertyValue, productName, rawPn, referenceKey) Then
+                    gReadbackOkCount = gReadbackOkCount + 1
+                    WritePatchEvent "PROPERTY_READBACK_OK", productName, rawPn, referenceKey, "props.Item", IMAGE_PROPERTY_NAME, propertyValue, "PROPERTY_READBACK_OK", 0, ""
+                End If
+                If propertyValue = FASTENER_IMAGE_PROPERTY_VALUE Then
+                    gFastenerCount = gFastenerCount + 1
+                    WritePatchEvent "FASTENER_MARKED_SKIP", productName, rawPn, referenceKey, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "FASTENER_MARKED_SKIP", 0, ""
+                End If
             End If
         End If
     End If
@@ -152,7 +204,7 @@ Sub TraversePatchProduct(prod, isRoot)
     Err.Clear
 End Sub
 
-Function ShouldPatchProduct(prod, isRoot, sourcePath)
+Function ShouldPatchProduct(prod, sourcePath)
     On Error Resume Next
     Dim ext
     Dim hasChildren
@@ -166,18 +218,28 @@ Function ShouldPatchProduct(prod, isRoot, sourcePath)
     Err.Clear
 End Function
 
-Function SetOrCreateStringUserProperty(prod, propertyName, propertyValue)
+Function SetOrCreateStringUserProperty(prod, propertyName, propertyValue, productName, partNumber, referenceKey)
     On Error Resume Next
     SetOrCreateStringUserProperty = "FAILED"
+    ResetLastWriteInfo
+
     Dim props
     Dim param
-    Set props = GetUserRefPropertiesForProduct(prod)
-    If props Is Nothing Then Exit Function
+    Set props = GetUserRefPropertiesForProduct(prod, productName, partNumber, referenceKey)
+    If props Is Nothing Then
+        gLastWriteMethod = "GetUserRefProperties"
+        SetOrCreateStringUserProperty = "NO_USERREFPROPERTIES"
+        Exit Function
+    End If
 
     Err.Clear
     Set param = props.Item(CStr(propertyName))
     If Err.Number = 0 And Not param Is Nothing Then
-        If TrySetParameterStringValue(param, propertyValue) Then
+        If TrySetParameterStringValue(param, propertyValue, "UpdateExisting.Value") Then
+            gLastWriteMethod = "UpdateExisting.Value"
+            SetOrCreateStringUserProperty = "UPDATED"
+        ElseIf TryValuateParameterStringValue(param, propertyValue, "UpdateExisting.ValuateFromString") Then
+            gLastWriteMethod = "UpdateExisting.ValuateFromString"
             SetOrCreateStringUserProperty = "UPDATED"
         End If
         Err.Clear
@@ -185,51 +247,132 @@ Function SetOrCreateStringUserProperty(prod, propertyName, propertyValue)
     End If
 
     Err.Clear
+    Set param = Nothing
+    gLastWriteMethod = "CreateStringWithValue"
     Set param = props.CreateString(CStr(propertyName), CStr(propertyValue))
     If Err.Number = 0 And Not param Is Nothing Then
         SetOrCreateStringUserProperty = "CREATED"
+        Exit Function
     End If
+    CaptureLastErr "CreateStringWithValue"
+
+    Err.Clear
+    Set param = Nothing
+    gLastWriteMethod = "CreateStringEmpty"
+    Set param = props.CreateString(CStr(propertyName), "")
+    If Err.Number = 0 And Not param Is Nothing Then
+        If TryValuateParameterStringValue(param, propertyValue, "CreateStringEmpty.ValuateFromString") Then
+            gLastWriteMethod = "CreateStringEmpty.ValuateFromString"
+            SetOrCreateStringUserProperty = "CREATED"
+            Exit Function
+        End If
+        If TrySetParameterStringValue(param, propertyValue, "CreateStringEmpty.Value") Then
+            gLastWriteMethod = "CreateStringEmpty.Value"
+            SetOrCreateStringUserProperty = "CREATED"
+            Exit Function
+        End If
+    End If
+    CaptureLastErr "CreateStringEmpty"
     Err.Clear
 End Function
 
-Function GetUserRefPropertiesForProduct(prod)
+Function GetUserRefPropertiesForProduct(prod, productName, partNumber, referenceKey)
     On Error Resume Next
     Dim refProd
     Dim props
     Set props = Nothing
+
+    Err.Clear
     Set refProd = prod.ReferenceProduct
     If Err.Number = 0 And Not refProd Is Nothing Then
         Err.Clear
         Set props = refProd.UserRefProperties
+        If Err.Number = 0 And Not props Is Nothing Then
+            WritePatchEvent "USERREFPROPERTIES_FOUND", productName, partNumber, referenceKey, "ReferenceProduct.UserRefProperties", IMAGE_PROPERTY_NAME, "", "OK", 0, ""
+            Set GetUserRefPropertiesForProduct = props
+            Exit Function
+        End If
+        CaptureLastErr "ReferenceProduct.UserRefProperties"
     End If
-    If props Is Nothing Then
-        Err.Clear
-        Set props = prod.UserRefProperties
+
+    Err.Clear
+    Set props = prod.UserRefProperties
+    If Err.Number = 0 And Not props Is Nothing Then
+        WritePatchEvent "USERREFPROPERTIES_FOUND", productName, partNumber, referenceKey, "Product.UserRefProperties", IMAGE_PROPERTY_NAME, "", "OK", 0, ""
+        Set GetUserRefPropertiesForProduct = props
+        Exit Function
     End If
-    Set GetUserRefPropertiesForProduct = props
+    CaptureLastErr "Product.UserRefProperties"
+    Set GetUserRefPropertiesForProduct = Nothing
     Err.Clear
 End Function
 
-Function TrySetParameterStringValue(param, valueText)
+Function TrySetParameterStringValue(param, valueText, methodName)
     On Error Resume Next
     TrySetParameterStringValue = False
     Err.Clear
     param.Value = CStr(valueText)
     If Err.Number = 0 Then
         TrySetParameterStringValue = True
-        Exit Function
+    Else
+        CaptureLastErr methodName
     End If
     Err.Clear
+End Function
+
+Function TryValuateParameterStringValue(param, valueText, methodName)
+    On Error Resume Next
+    TryValuateParameterStringValue = False
+    Err.Clear
     param.ValuateFromString CStr(valueText)
-    If Err.Number = 0 Then TrySetParameterStringValue = True
+    If Err.Number = 0 Then
+        TryValuateParameterStringValue = True
+    Else
+        CaptureLastErr methodName
+    End If
     Err.Clear
 End Function
+
+Function VerifyPropertyReadback(prod, propertyName, expectedValue, productName, partNumber, referenceKey)
+    On Error Resume Next
+    VerifyPropertyReadback = False
+    Dim props
+    Dim param
+    Set props = GetUserRefPropertiesForProduct(prod, productName, partNumber, referenceKey)
+    If props Is Nothing Then
+        WritePatchEvent "PROPERTY_READBACK_FAILED", productName, partNumber, referenceKey, "props.Item", propertyName, expectedValue, "PROPERTY_READBACK_FAILED", gLastWriteErrNumber, "No UserRefProperties for readback."
+        Exit Function
+    End If
+
+    Err.Clear
+    Set param = props.Item(CStr(propertyName))
+    If Err.Number = 0 And Not param Is Nothing Then
+        VerifyPropertyReadback = True
+    Else
+        WritePatchEvent "PROPERTY_READBACK_FAILED", productName, partNumber, referenceKey, "props.Item", propertyName, expectedValue, "PROPERTY_READBACK_FAILED", Err.Number, Err.Description
+        Err.Clear
+    End If
+End Function
+
+Sub ResetLastWriteInfo()
+    gLastWriteMethod = ""
+    gLastWriteErrNumber = 0
+    gLastWriteErrDescription = ""
+End Sub
+
+Sub CaptureLastErr(methodName)
+    If Err.Number <> 0 Then
+        gLastWriteMethod = methodName
+        gLastWriteErrNumber = Err.Number
+        gLastWriteErrDescription = Err.Description
+    End If
+End Sub
 
 Sub AskToSaveOpenCatiaDocuments()
     On Error Resume Next
     Dim answer
     answer = MsgBox("Patch je dodao/azurirao property 'Slika'. Da li zelite da sacuvate otvorene CATIA dokumente?" & vbCrLf & vbCrLf & _
-                    "YES = sacuvaj otvorene dokumente" & vbCrLf & _
+                    "YES = sacuvaj otvorene dokumente ako je moguce" & vbCrLf & _
                     "NO = ne snimaj" & vbCrLf & _
                     "CANCEL = ne snimaj i zavrsi", _
                     vbYesNoCancel + vbQuestion, "CATIA_BOM_IMAGE_PROPERTY_PATCH")
@@ -241,13 +384,17 @@ Sub SaveOpenCatiaDocuments()
     On Error Resume Next
     Dim i
     Dim doc
+    Dim docName
+    Dim docPath
     For i = 1 To CATIA.Documents.Count
         Err.Clear
         Set doc = CATIA.Documents.Item(i)
+        docName = CStr(doc.Name)
+        docPath = GetDocumentFullName(doc)
         doc.Save
         If Err.Number <> 0 Then
-            gErrorCount = gErrorCount + 1
-            WritePatchLog "ERROR", doc.Name, "", GetDocumentFullName(doc), "Save failed. Err=" & Err.Description
+            gSaveFailedCount = gSaveFailedCount + 1
+            WritePatchEvent "SAVE_FAILED", docName, "", docPath, "Document.Save", "", "", "SAVE_FAILED", Err.Number, Err.Description
             Err.Clear
         End If
     Next
@@ -420,11 +567,33 @@ Function IsTrailingPartNumberSeparator(ch)
     IsTrailingPartNumberSeparator = (ch = "," Or ch = ";" Or ch = ":" Or ch = "|")
 End Function
 
-Sub WritePatchLog(phase, productName, partNumber, valueText, message)
+Function BuildSummaryText()
+    BuildSummaryText = "Visited=" & CStr(gVisitedCount) & _
+                       "; UniqueReferences=" & CStr(gUniqueReferenceCount) & _
+                       "; Created=" & CStr(gCreatedCount) & _
+                       "; Updated=" & CStr(gUpdatedCount) & _
+                       "; ReadbackOK=" & CStr(gReadbackOkCount) & _
+                       "; Fasteners=" & CStr(gFastenerCount) & _
+                       "; Duplicates=" & CStr(gDuplicateSkippedCount) & _
+                       "; RootSkipped=" & CStr(gRootSkippedCount) & _
+                       "; WriteFailed=" & CStr(gWriteFailedCount) & _
+                       "; SaveFailed=" & CStr(gSaveFailedCount)
+End Function
+
+Sub WritePatchEvent(phase, productName, partNumber, referenceKey, methodName, propertyName, propertyValue, status, errNumber, errDescription)
     On Error Resume Next
     Dim ts
     Set ts = gFSO.OpenTextFile(gLogPath, 8, True)
-    ts.WriteLine Now & vbTab & phase & vbTab & productName & vbTab & partNumber & vbTab & valueText & vbTab & message
+    ts.WriteLine Now & vbTab & phase & vbTab & _
+                 "Product.Name=" & CStr(productName) & vbTab & _
+                 "Product.PartNumber=" & CStr(partNumber) & vbTab & _
+                 "referenceKey=" & CStr(referenceKey) & vbTab & _
+                 "methodName=" & CStr(methodName) & vbTab & _
+                 "propertyName=" & CStr(propertyName) & vbTab & _
+                 "propertyValue=" & CStr(propertyValue) & vbTab & _
+                 "status=" & CStr(status) & vbTab & _
+                 "Err.Number=" & CStr(errNumber) & vbTab & _
+                 "Err.Description=" & CStr(errDescription)
     ts.Close
     Err.Clear
 End Sub

@@ -29,6 +29,14 @@ Const USE_WHITE_BACKGROUND = True
 Const USE_RECORDER_STYLE_CAPTURE = True
 Const USE_CAPTURE_TARGET_SELECTION = True
 Const USE_CENTER_POSITION_CROP = True
+Const USE_SNIP_OBJECT_CROP = True
+Const SNIP_IGNORE_LEFT_PERCENT = 0.22
+Const SNIP_IGNORE_RIGHT_PERCENT = 0.12
+Const SNIP_IGNORE_TOP_PERCENT = 0.04
+Const SNIP_IGNORE_BOTTOM_PERCENT = 0.04
+Const SNIP_PADDING_PERCENT = 0.1
+Const SNIP_MIN_PADDING_PIXELS = 30
+Const SNIP_SCAN_STEP = 4
 Const USE_AUTO_OBJECT_CROP = True
 Const AUTO_CROP_IGNORE_LEFT_PERCENT = 0.2
 Const AUTO_CROP_WHITE_THRESHOLD = 245
@@ -775,6 +783,23 @@ Function CropCapturedImageIfPossible(originalImagePath, prod, sourcePath)
         Exit Function
     End If
 
+    If USE_SNIP_OBJECT_CROP Then
+        WritePrepareLog "SNIP_OBJECT_CROP_START", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Width=" & CStr(width) & "; Height=" & CStr(height)
+        If FindSnipObjectCropMargins(img, cropLeft, cropRight, cropTop, cropBottom, boundsMessage) Then
+            WritePrepareLog "SNIP_OBJECT_BOUNDS_FOUND", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, boundsMessage & "; CropLeft=" & CStr(cropLeft) & "; CropRight=" & CStr(cropRight) & "; CropTop=" & CStr(cropTop) & "; CropBottom=" & CStr(cropBottom)
+            If SaveWiaCrop(img, croppedPath, cropLeft, cropRight, cropTop, cropBottom) Then
+                CropCapturedImageIfPossible = croppedPath
+                WritePrepareLog "SNIP_OBJECT_CROP_DONE", prod.Name, GetProductPartNumber(prod), sourcePath, croppedPath, "Original=" & originalImagePath & "; " & boundsMessage
+                Exit Function
+            Else
+                WritePrepareLog "SNIP_OBJECT_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "SaveWiaCrop failed. Err=" & Err.Description
+                Err.Clear
+            End If
+        Else
+            WritePrepareLog "SNIP_OBJECT_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, boundsMessage
+        End If
+    End If
+
     If USE_AUTO_OBJECT_CROP Then
         WritePrepareLog "AUTO_OBJECT_CROP_START", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Width=" & CStr(width) & "; Height=" & CStr(height) & "; IgnoreLeftPercent=" & CStr(AUTO_CROP_IGNORE_LEFT_PERCENT)
         If FindAutoObjectCropMargins(img, cropLeft, cropRight, cropTop, cropBottom, boundsMessage) Then
@@ -810,6 +835,147 @@ Function CropCapturedImageIfPossible(originalImagePath, prod, sourcePath)
         WritePrepareLog "CENTER_POSITION_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Crop failed. Err=" & Err.Description
         Err.Clear
     End If
+End Function
+
+Function FindSnipObjectCropMargins(img, ByRef cropLeft, ByRef cropRight, ByRef cropTop, ByRef cropBottom, ByRef boundsMessage)
+    On Error Resume Next
+    FindSnipObjectCropMargins = False
+    boundsMessage = ""
+
+    Dim width
+    Dim height
+    Dim pixels
+    Dim pixelBase
+    Dim scanStep
+    Dim minScanX
+    Dim maxScanX
+    Dim minScanY
+    Dim maxScanY
+    Dim x
+    Dim y
+    Dim pixel
+    Dim minX
+    Dim maxX
+    Dim minY
+    Dim maxY
+    Dim foundCount
+    Dim padX
+    Dim padY
+    Dim keepLeft
+    Dim keepRight
+    Dim keepTop
+    Dim keepBottom
+    Dim boundsArea
+    Dim scanArea
+    Dim boundsRatio
+
+    width = CLng(img.Width)
+    height = CLng(img.Height)
+    scanStep = CLng(SNIP_SCAN_STEP)
+    If scanStep < 1 Then scanStep = 1
+
+    minScanX = CLng(width * SNIP_IGNORE_LEFT_PERCENT)
+    maxScanX = CLng(width * (1 - SNIP_IGNORE_RIGHT_PERCENT)) - 1
+    minScanY = CLng(height * SNIP_IGNORE_TOP_PERCENT)
+    maxScanY = CLng(height * (1 - SNIP_IGNORE_BOTTOM_PERCENT)) - 1
+
+    If minScanX < 0 Then minScanX = 0
+    If minScanY < 0 Then minScanY = 0
+    If maxScanX > width - 1 Then maxScanX = width - 1
+    If maxScanY > height - 1 Then maxScanY = height - 1
+
+    If maxScanX <= minScanX Or maxScanY <= minScanY Then
+        boundsMessage = "Invalid snip scan zone."
+        Exit Function
+    End If
+
+    Err.Clear
+    Set pixels = img.ARGBData
+    If Err.Number <> 0 Or pixels Is Nothing Then
+        boundsMessage = "ARGBData not available. Err=" & Err.Description
+        Err.Clear
+        Exit Function
+    End If
+
+    pixelBase = WiaVectorPixelBase(pixels)
+    If pixelBase < 0 Then
+        boundsMessage = "Could not determine WIA pixel index base."
+        Exit Function
+    End If
+
+    minX = width
+    minY = height
+    maxX = -1
+    maxY = -1
+    foundCount = 0
+
+    For y = minScanY To maxScanY Step scanStep
+        For x = minScanX To maxScanX Step scanStep
+            Err.Clear
+            pixel = pixels.Item((CLng(y) * CLng(width)) + CLng(x) + pixelBase)
+            If Err.Number <> 0 Then
+                boundsMessage = "Pixel read failed. X=" & CStr(x) & "; Y=" & CStr(y) & "; Err=" & Err.Description
+                Err.Clear
+                Exit Function
+            End If
+            If IsObjectPixelOnWhiteBackground(pixel) Then
+                If x < minX Then minX = x
+                If x > maxX Then maxX = x
+                If y < minY Then minY = y
+                If y > maxY Then maxY = y
+                foundCount = foundCount + 1
+            End If
+        Next
+    Next
+
+    If foundCount < 10 Or maxX < minX Or maxY < minY Then
+        boundsMessage = "No object pixels found in snip zone. FoundCount=" & CStr(foundCount) & "; Zone=" & SnipZoneText(minScanX, maxScanX, minScanY, maxScanY)
+        Exit Function
+    End If
+
+    minX = MaxLong(minScanX, minX - scanStep)
+    minY = MaxLong(minScanY, minY - scanStep)
+    maxX = MinLong(maxScanX, maxX + scanStep)
+    maxY = MinLong(maxScanY, maxY + scanStep)
+
+    boundsArea = CDbl((maxX - minX + 1)) * CDbl((maxY - minY + 1))
+    scanArea = CDbl(maxScanX - minScanX + 1) * CDbl(maxScanY - minScanY + 1)
+    If scanArea > 0 Then
+        boundsRatio = boundsArea / scanArea
+        If boundsRatio > 0.9 Then
+            boundsMessage = "Snip bounds cover almost entire scan zone; likely UI/background noise. Ratio=" & CStr(boundsRatio) & "; Zone=" & SnipZoneText(minScanX, maxScanX, minScanY, maxScanY)
+            Exit Function
+        End If
+    End If
+
+    padX = MaxLong(SNIP_MIN_PADDING_PIXELS, CLng((maxX - minX + 1) * SNIP_PADDING_PERCENT))
+    padY = MaxLong(SNIP_MIN_PADDING_PIXELS, CLng((maxY - minY + 1) * SNIP_PADDING_PERCENT))
+
+    keepLeft = MaxLong(minScanX, minX - padX)
+    keepRight = MinLong(maxScanX, maxX + padX)
+    keepTop = MaxLong(minScanY, minY - padY)
+    keepBottom = MinLong(maxScanY, maxY + padY)
+
+    If (keepRight - keepLeft) < 60 Or (keepBottom - keepTop) < 60 Then
+        boundsMessage = "Snip crop bounds too small after padding."
+        Exit Function
+    End If
+
+    cropLeft = keepLeft
+    cropRight = width - 1 - keepRight
+    cropTop = keepTop
+    cropBottom = height - 1 - keepBottom
+
+    boundsMessage = "BoundsMinX=" & CStr(minX) & "; BoundsMaxX=" & CStr(maxX) & _
+                    "; BoundsMinY=" & CStr(minY) & "; BoundsMaxY=" & CStr(maxY) & _
+                    "; FoundCount=" & CStr(foundCount) & "; " & SnipZoneText(minScanX, maxScanX, minScanY, maxScanY) & _
+                    "; PadX=" & CStr(padX) & "; PadY=" & CStr(padY)
+    FindSnipObjectCropMargins = True
+    Err.Clear
+End Function
+
+Function SnipZoneText(minScanX, maxScanX, minScanY, maxScanY)
+    SnipZoneText = "ZoneLeft=" & CStr(minScanX) & "; ZoneRight=" & CStr(maxScanX) & "; ZoneTop=" & CStr(minScanY) & "; ZoneBottom=" & CStr(maxScanY)
 End Function
 
 Function FindAutoObjectCropMargins(img, ByRef cropLeft, ByRef cropRight, ByRef cropTop, ByRef cropBottom, ByRef boundsMessage)

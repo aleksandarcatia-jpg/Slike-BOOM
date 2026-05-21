@@ -13,6 +13,7 @@ End Sub
 Const IMAGE_PROPERTY_NAME = "Slika"
 Const WORK_ROOT = "C:\Temp\CATIA_BOM_IMAGE_PATCH"
 Const IMAGE_FOLDER_NAME = "IMAGES"
+Const CROPPED_FOLDER_NAME = "CROPPED"
 Const LOG_FILE_NAME = "CATIA_BOM_IMAGE_PREPARE_LOG.txt"
 Const WRITE_CATPART_IMAGE_PROPERTY = True
 Const WRITE_CATPRODUCT_IMAGE_PROPERTY = True
@@ -25,6 +26,13 @@ Const ASK_BEFORE_SAVING_CATIA_DOCUMENTS = True
 Const AUTO_SAVE_CATIA_DOCUMENTS = False
 Const IMAGE_CAPTURE_DELAY_SECONDS = 0.2
 Const USE_WHITE_BACKGROUND = True
+Const USE_RECORDER_STYLE_CAPTURE = True
+Const USE_CAPTURE_TARGET_SELECTION = True
+Const USE_CENTER_POSITION_CROP = True
+Const CROP_LEFT_PERCENT = 0.18
+Const CROP_RIGHT_PERCENT = 0.02
+Const CROP_TOP_PERCENT = 0.02
+Const CROP_BOTTOM_PERCENT = 0.03
 Const FASTENER_KEYWORDS = "vijak|vijci|zavrtanj|zavrtnji|screw|bolt|hex bolt|hexagon bolt|imbus|allen screw|navrtka|matica|nut|hex nut|podloska|podloska|washer|plain washer|spring washer|lock washer|DIN 125|DIN125|DIN 127|DIN127|DIN 933|DIN933|DIN 931|DIN931|DIN 934|DIN934|ISO 4014|ISO 4017|ISO 4032|ISO 7089|ISO 7090"
 
 Const CAT_CAPTURE_FORMAT_JPEG = 2
@@ -34,6 +42,7 @@ Dim gProductDocument
 Dim gRootProduct
 Dim gRootFullName
 Dim gImageFolder
+Dim gCroppedFolder
 Dim gLogPath
 Dim gSourceImageCache
 Dim gProcessedKeys
@@ -96,6 +105,8 @@ Sub InitializePrepareRuntime()
     EnsureFolder WORK_ROOT
     gImageFolder = JoinPath(WORK_ROOT, IMAGE_FOLDER_NAME)
     EnsureFolder gImageFolder
+    gCroppedFolder = JoinPath(WORK_ROOT, CROPPED_FOLDER_NAME)
+    EnsureFolder gCroppedFolder
     gLogPath = JoinPath(WORK_ROOT, LOG_FILE_NAME)
     Set gSourceImageCache = CreateObject("Scripting.Dictionary")
     Set gProcessedKeys = CreateObject("Scripting.Dictionary")
@@ -203,6 +214,7 @@ Sub TraversePrepareProduct(prod, isRoot)
                     WritePrepareLog "IMAGE_PATH_BUILD_FAILED", prod.Name, rawPn, sourcePath, "", "BuildImagePath returned empty path; capture skipped."
                     WritePropertyValue prod, "IMAGE_CAPTURE_FAILED", "IMAGE_CAPTURE_FAILED", sourcePath, ""
                 ElseIf SKIP_EXISTING_IMAGES And gFSO.FileExists(imagePath) Then
+                    imagePath = FinalImagePathForCapture(imagePath, prod, sourcePath)
                     gSourceImageCache.Item(key) = imagePath
                     gImagesReused = gImagesReused + 1
                     If WritePropertyValue(prod, imagePath, "EXISTING_IMAGE_REUSED", sourcePath, imagePath) Then gSourcePropertyCache.Item(key) = imagePath
@@ -324,25 +336,135 @@ End Function
 Function CaptureActiveStandaloneViewer(imagePath, sourcePath, prod)
     On Error Resume Next
     CaptureActiveStandaloneViewer = False
+    Dim captureWindow
     Dim viewer
-    If gCurrentStandaloneWindow Is Nothing Then Set gCurrentStandaloneWindow = CATIA.ActiveWindow
+    If USE_RECORDER_STYLE_CAPTURE Then
+        Set captureWindow = CATIA.ActiveWindow
+        Set gCurrentStandaloneWindow = captureWindow
+    Else
+        If gCurrentStandaloneWindow Is Nothing Then Set gCurrentStandaloneWindow = CATIA.ActiveWindow
+        Set captureWindow = gCurrentStandaloneWindow
+    End If
     If Not ActiveDocumentMatchesSource(sourcePath) Then
         WritePrepareLog "ACTIVE_WINDOW_NOT_STANDALONE", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, ActiveCaptureContextText()
         Exit Function
     End If
 
-    Set viewer = gCurrentStandaloneWindow.ActiveViewer
+    Set viewer = captureWindow.ActiveViewer
     If viewer Is Nothing Then Exit Function
     viewer.Activate
+    WritePrepareLog "CAPTURE_RECORDER_STYLE_VIEWER", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, ActiveCaptureContextText()
     WritePrepareLog "CAPTURE_VIEWER_CONTEXT", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, ActiveCaptureContextText()
+    If USE_CAPTURE_TARGET_SELECTION Then SelectStandaloneCaptureTarget prod, sourcePath, imagePath
     If USE_WHITE_BACKGROUND Then ApplyWhiteBackground viewer, prod, sourcePath, imagePath
     ApplyIsoView viewer
     WaitSeconds IMAGE_CAPTURE_DELAY_SECONDS
     Err.Clear
     viewer.CaptureToFile CAT_CAPTURE_FORMAT_JPEG, imagePath
-    If Err.Number = 0 And gFSO.FileExists(imagePath) Then CaptureActiveStandaloneViewer = True
+    If Err.Number = 0 And gFSO.FileExists(imagePath) Then
+        imagePath = FinalImagePathForCapture(imagePath, prod, sourcePath)
+        CaptureActiveStandaloneViewer = True
+    End If
+    ClearStandaloneSelection prod, sourcePath, imagePath
     Err.Clear
 End Function
+
+Function SelectStandaloneCaptureTarget(prod, sourcePath, imagePath)
+    On Error Resume Next
+    SelectStandaloneCaptureTarget = False
+    Dim sel
+    Dim target
+    Set sel = gCurrentStandaloneDoc.Selection
+    If Err.Number <> 0 Or sel Is Nothing Then
+        WritePrepareLog "CAPTURE_TARGET_SELECT_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "Selection object not available. Err=" & Err.Description
+        Err.Clear
+        Exit Function
+    End If
+
+    Set target = StandaloneCaptureTarget(prod, sourcePath)
+    If target Is Nothing Then
+        WritePrepareLog "CAPTURE_TARGET_SELECT_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "No root object found for selection."
+        Err.Clear
+        Exit Function
+    End If
+
+    Err.Clear
+    sel.Clear
+    sel.Add target
+    If Err.Number = 0 Then
+        SelectStandaloneCaptureTarget = True
+        WritePrepareLog "CAPTURE_TARGET_SELECTED", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "Selected standalone root object before Reframe."
+    Else
+        WritePrepareLog "CAPTURE_TARGET_SELECT_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "Selection.Add failed. Err=" & Err.Description
+        Err.Clear
+    End If
+End Function
+
+Function StandaloneCaptureTarget(prod, sourcePath)
+    On Error Resume Next
+    Set StandaloneCaptureTarget = Nothing
+    Dim partNumber
+    Dim baseName
+    Dim docName
+    Dim target
+    partNumber = GetProductPartNumber(prod)
+    baseName = gFSO.GetBaseName(sourcePath)
+    docName = gFSO.GetBaseName(CStr(gCurrentStandaloneDoc.Name))
+
+    If Trim(CStr(partNumber)) <> "" Then
+        Err.Clear
+        Set target = gCurrentStandaloneDoc.GetItem(partNumber)
+        If Err.Number = 0 And Not target Is Nothing Then
+            Set StandaloneCaptureTarget = target
+            Exit Function
+        End If
+    End If
+
+    If Trim(CStr(baseName)) <> "" Then
+        Err.Clear
+        Set target = gCurrentStandaloneDoc.GetItem(baseName)
+        If Err.Number = 0 And Not target Is Nothing Then
+            Set StandaloneCaptureTarget = target
+            Exit Function
+        End If
+    End If
+
+    If Trim(CStr(docName)) <> "" Then
+        Err.Clear
+        Set target = gCurrentStandaloneDoc.GetItem(docName)
+        If Err.Number = 0 And Not target Is Nothing Then
+            Set StandaloneCaptureTarget = target
+            Exit Function
+        End If
+    End If
+
+    Err.Clear
+    Set target = gCurrentStandaloneDoc.Product
+    If Err.Number = 0 And Not target Is Nothing Then
+        Set StandaloneCaptureTarget = target
+        Exit Function
+    End If
+
+    Err.Clear
+    Set target = gCurrentStandaloneDoc.Part
+    If Err.Number = 0 And Not target Is Nothing Then
+        Set StandaloneCaptureTarget = target
+        Exit Function
+    End If
+
+    Err.Clear
+    Set target = gCurrentStandaloneDoc.Part.MainBody
+    If Err.Number = 0 And Not target Is Nothing Then Set StandaloneCaptureTarget = target
+    Err.Clear
+End Function
+
+Sub ClearStandaloneSelection(prod, sourcePath, imagePath)
+    On Error Resume Next
+    Dim sel
+    Set sel = gCurrentStandaloneDoc.Selection
+    If Err.Number = 0 And Not sel Is Nothing Then sel.Clear
+    Err.Clear
+End Sub
 
 Function ActiveDocumentMatchesSource(sourcePath)
     On Error Resume Next
@@ -601,6 +723,93 @@ Function BuildImagePath(prod, sourcePath)
         WritePrepareLog "IMAGE_PATH_BUILD_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, "", "Hash=" & hashText & "; Err.Number=" & CStr(errNumber) & "; Err.Description=" & errDescription
     End If
     Err.Clear
+End Function
+
+Function FinalImagePathForCapture(originalImagePath, prod, sourcePath)
+    On Error Resume Next
+    FinalImagePathForCapture = originalImagePath
+    If Not USE_CENTER_POSITION_CROP Then Exit Function
+    If Trim(CStr(originalImagePath)) = "" Or Not gFSO.FileExists(originalImagePath) Then Exit Function
+    FinalImagePathForCapture = CropCapturedImageIfPossible(originalImagePath, prod, sourcePath)
+    Err.Clear
+End Function
+
+Function CropCapturedImageIfPossible(originalImagePath, prod, sourcePath)
+    On Error Resume Next
+    CropCapturedImageIfPossible = originalImagePath
+    Dim croppedPath
+    Dim img
+    Dim proc
+    Dim filter
+    Dim cropped
+    Dim width
+    Dim height
+    Dim cropLeft
+    Dim cropRight
+    Dim cropTop
+    Dim cropBottom
+    croppedPath = BuildCroppedImagePath(originalImagePath)
+    If Trim(CStr(croppedPath)) = "" Then
+        WritePrepareLog "CENTER_POSITION_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Could not build cropped image path."
+        Exit Function
+    End If
+    If SKIP_EXISTING_IMAGES And gFSO.FileExists(croppedPath) Then
+        CropCapturedImageIfPossible = croppedPath
+        WritePrepareLog "CENTER_POSITION_CROP_DONE", prod.Name, GetProductPartNumber(prod), sourcePath, croppedPath, "Existing cropped image reused."
+        Exit Function
+    End If
+
+    Err.Clear
+    Set img = CreateObject("WIA.ImageFile")
+    img.LoadFile originalImagePath
+    width = CLng(img.Width)
+    height = CLng(img.Height)
+    cropLeft = CLng(width * CROP_LEFT_PERCENT)
+    cropRight = CLng(width * CROP_RIGHT_PERCENT)
+    cropTop = CLng(height * CROP_TOP_PERCENT)
+    cropBottom = CLng(height * CROP_BOTTOM_PERCENT)
+
+    If Err.Number <> 0 Or width <= 0 Or height <= 0 Then
+        WritePrepareLog "CENTER_POSITION_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "WIA load failed. Err=" & Err.Description
+        Err.Clear
+        Exit Function
+    End If
+
+    If (width - cropLeft - cropRight) < 80 Or (height - cropTop - cropBottom) < 80 Then
+        WritePrepareLog "CENTER_POSITION_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Crop would be too aggressive. Width=" & CStr(width) & "; Height=" & CStr(height)
+        Exit Function
+    End If
+
+    Set proc = CreateObject("WIA.ImageProcess")
+    proc.Filters.Add proc.FilterInfos("Crop").FilterID
+    Set filter = proc.Filters(1)
+    filter.Properties("Left") = cropLeft
+    filter.Properties("Right") = cropRight
+    filter.Properties("Top") = cropTop
+    filter.Properties("Bottom") = cropBottom
+    Set cropped = proc.Apply(img)
+    If gFSO.FileExists(croppedPath) Then gFSO.DeleteFile croppedPath, True
+    cropped.SaveFile croppedPath
+
+    If Err.Number = 0 And gFSO.FileExists(croppedPath) Then
+        CropCapturedImageIfPossible = croppedPath
+        WritePrepareLog "CENTER_POSITION_CROP_DONE", prod.Name, GetProductPartNumber(prod), sourcePath, croppedPath, "Original=" & originalImagePath & "; Left=" & CStr(cropLeft) & "; Right=" & CStr(cropRight) & "; Top=" & CStr(cropTop) & "; Bottom=" & CStr(cropBottom)
+    Else
+        WritePrepareLog "CENTER_POSITION_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Crop failed. Err=" & Err.Description
+        Err.Clear
+    End If
+End Function
+
+Function BuildCroppedImagePath(originalImagePath)
+    On Error Resume Next
+    Dim baseName
+    baseName = gFSO.GetBaseName(originalImagePath)
+    If Trim(CStr(baseName)) = "" Then baseName = "CATIA_IMAGE_" & TimestampForFile()
+    BuildCroppedImagePath = JoinPath(gCroppedFolder, SafeFileName(baseName) & "_CROP.jpg")
+    If Err.Number <> 0 Then
+        BuildCroppedImagePath = ""
+        Err.Clear
+    End If
 End Function
 
 Function StablePathHash(pathText)

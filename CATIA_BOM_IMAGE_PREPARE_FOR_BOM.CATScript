@@ -1,0 +1,1483 @@
+Language="VBSCRIPT"
+
+Sub CATMain()
+    CATIA_BOM_IMAGE_PREPARE_FOR_BOM
+End Sub
+
+' ================================================================
+' CATIA_BOM_IMAGE_PREPARE_FOR_BOM
+' Creates standalone JPG images and writes each image path into the
+' CATIA user property "Slika" before the user saves native BOM Excel.
+' ================================================================
+
+Const IMAGE_PROPERTY_NAME = "Slika"
+Const WORK_ROOT = "C:\Temp\CATIA_BOM_IMAGE_PATCH"
+Const IMAGE_FOLDER_NAME = "IMAGES"
+Const CROPPED_FOLDER_NAME = "CROPPED"
+Const LOG_FILE_NAME = "CATIA_BOM_IMAGE_PREPARE_LOG.txt"
+Const WRITE_CATPART_IMAGE_PROPERTY = True
+Const WRITE_CATPRODUCT_IMAGE_PROPERTY = True
+Const WRITE_ROOT_ASSEMBLY_IMAGE_PROPERTY = False
+Const MARK_FASTENERS_FOR_SKIP = True
+Const TEST_MODE = False
+Const TEST_MAX_ITEMS = 20
+Const SKIP_EXISTING_IMAGES = True
+Const ASK_BEFORE_SAVING_CATIA_DOCUMENTS = True
+Const AUTO_SAVE_CATIA_DOCUMENTS = False
+Const IMAGE_CAPTURE_DELAY_SECONDS = 0.2
+Const USE_WHITE_BACKGROUND = True
+Const USE_RECORDER_STYLE_CAPTURE = True
+Const USE_CAPTURE_TARGET_SELECTION = True
+Const USE_CENTER_POSITION_CROP = True
+Const USE_SNIP_OBJECT_CROP = True
+Const SNIP_IGNORE_LEFT_PERCENT = 0.22
+Const SNIP_IGNORE_RIGHT_PERCENT = 0.12
+Const SNIP_IGNORE_TOP_PERCENT = 0.04
+Const SNIP_IGNORE_BOTTOM_PERCENT = 0.04
+Const SNIP_PADDING_PERCENT = 0.1
+Const SNIP_MIN_PADDING_PIXELS = 30
+Const SNIP_SCAN_STEP = 4
+Const USE_AUTO_OBJECT_CROP = True
+Const AUTO_CROP_IGNORE_LEFT_PERCENT = 0.2
+Const AUTO_CROP_WHITE_THRESHOLD = 245
+Const AUTO_CROP_PADDING_PERCENT = 0.08
+Const AUTO_CROP_MIN_PADDING_PIXELS = 25
+Const AUTO_CROP_SCAN_STEP = 3
+Const CROP_LEFT_PERCENT = 0.18
+Const CROP_RIGHT_PERCENT = 0.02
+Const CROP_TOP_PERCENT = 0.02
+Const CROP_BOTTOM_PERCENT = 0.03
+Const FASTENER_KEYWORDS = "vijak|vijci|zavrtanj|zavrtnji|screw|bolt|hex bolt|hexagon bolt|imbus|allen screw|navrtka|matica|nut|hex nut|podloska|podloska|washer|plain washer|spring washer|lock washer|DIN 125|DIN125|DIN 127|DIN127|DIN 933|DIN933|DIN 931|DIN931|DIN 934|DIN934|ISO 4014|ISO 4017|ISO 4032|ISO 7089|ISO 7090"
+
+Const CAT_CAPTURE_FORMAT_JPEG = 2
+
+Dim gFSO
+Dim gProductDocument
+Dim gRootProduct
+Dim gRootFullName
+Dim gImageFolder
+Dim gCroppedFolder
+Dim gLogPath
+Dim gSourceImageCache
+Dim gProcessedKeys
+Dim gSourcePropertyCache
+Dim gCurrentStandaloneDoc
+Dim gCurrentStandaloneWindow
+Dim gCurrentStandaloneOpened
+Dim gMainWindow
+Dim gVisitedCount
+Dim gImagesCreated
+Dim gImagesReused
+Dim gFastenerCount
+Dim gRootSkippedCount
+Dim gSourceNotFoundCount
+Dim gCaptureFailedCount
+Dim gPropertyErrorCount
+Dim gTestSkippedCount
+Dim gImageItemCount
+Dim gDuplicateSourceReusedCount
+
+Sub CATIA_BOM_IMAGE_PREPARE_FOR_BOM()
+    On Error Resume Next
+    InitializePrepareRuntime
+    WritePrepareLog "START", "", "", "", "", "CATIA_BOM_IMAGE_PREPARE_FOR_BOM started."
+
+    If Not ValidateActiveProduct() Then Exit Sub
+    WritePrepareLog "ACTIVE_PRODUCT_VALIDATED", gRootProduct.Name, GetProductPartNumber(gRootProduct), "", "", "Active CATProduct OK."
+    WritePrepareLog "ROOT_PRODUCT", gRootProduct.Name, GetProductPartNumber(gRootProduct), gRootFullName, "", "Root product."
+
+    TraversePrepareProduct gRootProduct, True
+
+    CloseCurrentStandaloneDocument
+    ActivateMainDocument
+
+    If AUTO_SAVE_CATIA_DOCUMENTS Then
+        SaveOpenCatiaDocuments
+    ElseIf ASK_BEFORE_SAVING_CATIA_DOCUMENTS Then
+        AskToSaveOpenCatiaDocuments
+    End If
+
+    CATIA.StatusBar = ""
+    WritePrepareLog "FINISH", "", "", "", "", "ImagesCreated=" & CStr(gImagesCreated) & "; Reused=" & CStr(gImagesReused) & "; DuplicateSourceReused=" & CStr(gDuplicateSourceReusedCount) & "; Fasteners=" & CStr(gFastenerCount) & "; Errors=" & CStr(gPropertyErrorCount + gCaptureFailedCount)
+
+    MsgBox "Pre-save image priprema zavrsena." & vbCrLf & _
+           "Slike napravljene: " & CStr(gImagesCreated) & vbCrLf & _
+           "Postojece slike koriscene: " & CStr(gImagesReused) & vbCrLf & _
+           "Duplikati source fajla preskoceni: " & CStr(gDuplicateSourceReusedCount) & vbCrLf & _
+           "Fasteneri preskoceni: " & CStr(gFastenerCount) & vbCrLf & _
+           "Greske: " & CStr(gPropertyErrorCount + gCaptureFailedCount) & vbCrLf & vbCrLf & _
+           "Sada idite u Analyze -> Bill of Material i uradite Save as Excel." & vbCrLf & _
+           "Kolona Slika ce sadrzati putanje do JPG slika.", _
+           vbInformation, "CATIA_BOM_IMAGE_PREPARE_FOR_BOM"
+    Err.Clear
+End Sub
+
+Sub InitializePrepareRuntime()
+    On Error Resume Next
+    Set gFSO = CreateObject("Scripting.FileSystemObject")
+    EnsureFolder "C:\Temp"
+    EnsureFolder WORK_ROOT
+    gImageFolder = JoinPath(WORK_ROOT, IMAGE_FOLDER_NAME)
+    EnsureFolder gImageFolder
+    gCroppedFolder = JoinPath(WORK_ROOT, CROPPED_FOLDER_NAME)
+    EnsureFolder gCroppedFolder
+    gLogPath = JoinPath(WORK_ROOT, LOG_FILE_NAME)
+    Set gSourceImageCache = CreateObject("Scripting.Dictionary")
+    Set gProcessedKeys = CreateObject("Scripting.Dictionary")
+    Set gSourcePropertyCache = CreateObject("Scripting.Dictionary")
+    gSourceImageCache.CompareMode = 1
+    gProcessedKeys.CompareMode = 1
+    gSourcePropertyCache.CompareMode = 1
+    Set gCurrentStandaloneDoc = Nothing
+    Set gCurrentStandaloneWindow = Nothing
+    Set gMainWindow = Nothing
+    gCurrentStandaloneOpened = False
+    gVisitedCount = 0
+    gImagesCreated = 0
+    gImagesReused = 0
+    gFastenerCount = 0
+    gRootSkippedCount = 0
+    gSourceNotFoundCount = 0
+    gCaptureFailedCount = 0
+    gPropertyErrorCount = 0
+    gTestSkippedCount = 0
+    gImageItemCount = 0
+    gDuplicateSourceReusedCount = 0
+    Err.Clear
+End Sub
+
+Function ValidateActiveProduct()
+    On Error Resume Next
+    ValidateActiveProduct = False
+    If CATIA.Documents.Count = 0 Then
+        MsgBox "Nema otvorenog CATIA dokumenta. Otvorite glavni CATProduct.", vbExclamation, "CATIA_BOM_IMAGE_PREPARE_FOR_BOM"
+        WritePrepareLog "ERROR", "", "", "", "", "No open CATIA document."
+        Exit Function
+    End If
+    Set gProductDocument = CATIA.ActiveDocument
+    Set gRootProduct = gProductDocument.Product
+    If Err.Number <> 0 Or gRootProduct Is Nothing Then
+        WritePrepareLog "ERROR", "", "", "", "", "Active document is not CATProduct. Err=" & Err.Description
+        MsgBox "Aktivni dokument mora biti CATProduct.", vbExclamation, "CATIA_BOM_IMAGE_PREPARE_FOR_BOM"
+        Err.Clear
+        Exit Function
+    End If
+    gRootFullName = GetDocumentFullName(gProductDocument)
+    Set gMainWindow = CATIA.ActiveWindow
+    ValidateActiveProduct = True
+    Err.Clear
+End Function
+
+Sub TraversePrepareProduct(prod, isRoot)
+    On Error Resume Next
+    Dim rawPn
+    Dim sourcePath
+    Dim imagePath
+    Dim propertyValue
+    Dim status
+    Dim key
+    gVisitedCount = gVisitedCount + 1
+    rawPn = GetProductPartNumber(prod)
+    sourcePath = GetProductSourceFilePath(prod)
+    UpdatePrepareProgress rawPn
+    WritePrepareLog "PRODUCT_VISITED", prod.Name, rawPn, sourcePath, "", "IsRoot=" & CStr(isRoot)
+    If (gVisitedCount Mod 50) = 0 Then
+        WritePrepareLog "PROGRESS_CHECKPOINT", prod.Name, rawPn, sourcePath, "", ProgressText("")
+        DoEvents
+    End If
+
+    If isRoot And Not WRITE_ROOT_ASSEMBLY_IMAGE_PROPERTY Then
+        gRootSkippedCount = gRootSkippedCount + 1
+        WritePrepareLog "ROOT_ASSEMBLY_SKIPPED", prod.Name, rawPn, sourcePath, "", "Root assembly skipped by configuration."
+    ElseIf ShouldPrepareProduct(prod, isRoot, sourcePath) Then
+        If MARK_FASTENERS_FOR_SKIP And (IsFastenerProduct(prod) Or IsFastenerAssemblyProduct(prod)) Then
+            gFastenerCount = gFastenerCount + 1
+            key = UCase(sourcePath)
+            If IsValidCatiaSourcePath(sourcePath) And gSourcePropertyCache.Exists(key) Then
+                gDuplicateSourceReusedCount = gDuplicateSourceReusedCount + 1
+                WritePrepareLog "DUPLICATE_SOURCE_REUSED", prod.Name, rawPn, sourcePath, CStr(gSourcePropertyCache.Item(key)), "Fastener source already processed; property write skipped."
+            ElseIf WritePropertyValue(prod, "SKIP_FASTENER", FastenerSkipPhase(prod), sourcePath, "") Then
+                If IsValidCatiaSourcePath(sourcePath) Then gSourcePropertyCache.Item(key) = "SKIP_FASTENER"
+            End If
+        ElseIf Not IsValidCatiaSourcePath(sourcePath) Or SamePath(sourcePath, gRootFullName) Then
+            gSourceNotFoundCount = gSourceNotFoundCount + 1
+            WritePropertyValue prod, "SOURCE_PATH_NOT_FOUND", "SOURCE_PATH_NOT_FOUND", sourcePath, ""
+        Else
+            key = UCase(sourcePath)
+            If TEST_MODE And Not gProcessedKeys.Exists(key) And gImageItemCount >= TEST_MAX_ITEMS Then
+                gTestSkippedCount = gTestSkippedCount + 1
+                WritePrepareLog "TEST_MODE_NOT_PROCESSED", prod.Name, rawPn, sourcePath, "", "Test limit reached; leaving current property value."
+                Exit Sub
+            End If
+            If Not gProcessedKeys.Exists(key) Then
+                gProcessedKeys.Item(key) = True
+                gImageItemCount = gImageItemCount + 1
+            End If
+            If gSourcePropertyCache.Exists(key) Then
+                gDuplicateSourceReusedCount = gDuplicateSourceReusedCount + 1
+                imagePath = CStr(gSourcePropertyCache.Item(key))
+                WritePrepareLog "DUPLICATE_SOURCE_REUSED", prod.Name, rawPn, sourcePath, imagePath, "Source already processed; property write skipped."
+            ElseIf gSourceImageCache.Exists(key) Then
+                imagePath = CStr(gSourceImageCache.Item(key))
+                gImagesReused = gImagesReused + 1
+                If WritePropertyValue(prod, imagePath, "EXISTING_IMAGE_REUSED", sourcePath, imagePath) Then gSourcePropertyCache.Item(key) = imagePath
+            Else
+                imagePath = BuildImagePath(prod, sourcePath)
+                If Trim(CStr(imagePath)) = "" Then
+                    gCaptureFailedCount = gCaptureFailedCount + 1
+                    WritePrepareLog "IMAGE_PATH_BUILD_FAILED", prod.Name, rawPn, sourcePath, "", "BuildImagePath returned empty path; capture skipped."
+                    WritePropertyValue prod, "IMAGE_CAPTURE_FAILED", "IMAGE_CAPTURE_FAILED", sourcePath, ""
+                ElseIf SKIP_EXISTING_IMAGES And gFSO.FileExists(imagePath) Then
+                    imagePath = FinalImagePathForCapture(imagePath, prod, sourcePath)
+                    gSourceImageCache.Item(key) = imagePath
+                    gImagesReused = gImagesReused + 1
+                    If WritePropertyValue(prod, imagePath, "EXISTING_IMAGE_REUSED", sourcePath, imagePath) Then gSourcePropertyCache.Item(key) = imagePath
+                ElseIf CaptureStandaloneImage(sourcePath, imagePath, prod) Then
+                    gSourceImageCache.Item(key) = imagePath
+                    gImagesCreated = gImagesCreated + 1
+                    If WritePropertyValue(prod, imagePath, "IMAGE_PATH_WRITTEN_TO_SLIKA", sourcePath, imagePath) Then gSourcePropertyCache.Item(key) = imagePath
+                Else
+                    gCaptureFailedCount = gCaptureFailedCount + 1
+                    WritePropertyValue prod, "IMAGE_CAPTURE_FAILED", "IMAGE_CAPTURE_FAILED", sourcePath, imagePath
+                End If
+            End If
+        End If
+    End If
+
+    Dim children
+    Dim i
+    Set children = prod.Products
+    If Err.Number = 0 And Not children Is Nothing Then
+        For i = 1 To children.Count
+            TraversePrepareProduct children.Item(i), False
+            If (i Mod 50) = 0 Then DoEvents
+        Next
+    End If
+    Err.Clear
+End Sub
+
+Function WritePropertyValue(prod, propertyValue, phase, sourcePath, imagePath)
+    On Error Resume Next
+    Dim status
+    WritePropertyValue = False
+    CATIA.StatusBar = "Updating Slika property: " & GetProductPartNumber(prod)
+    status = SetOrCreateStringUserProperty(prod, IMAGE_PROPERTY_NAME, propertyValue)
+    If status = "CREATED" Or status = "UPDATED" Then
+        WritePropertyValue = True
+        If phase = "IMAGE_PATH_WRITTEN_TO_SLIKA" Then
+            WritePrepareLog "PROPERTY_" & status, prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, IMAGE_PROPERTY_NAME & "=" & propertyValue
+            WritePrepareLog "IMAGE_PATH_WRITTEN_TO_SLIKA", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, propertyValue
+        Else
+            WritePrepareLog phase, prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, IMAGE_PROPERTY_NAME & "=" & propertyValue
+            WritePrepareLog "PROPERTY_" & status, prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, IMAGE_PROPERTY_NAME & "=" & propertyValue
+        End If
+    Else
+        gPropertyErrorCount = gPropertyErrorCount + 1
+        WritePrepareLog "PROPERTY_WRITE_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "Could not write " & IMAGE_PROPERTY_NAME & "=" & propertyValue
+    End If
+    Err.Clear
+End Function
+
+Function CaptureStandaloneImage(sourcePath, imagePath, prod)
+    On Error Resume Next
+    CaptureStandaloneImage = False
+    If Trim(CStr(imagePath)) = "" Then
+        WritePrepareLog "IMAGE_PATH_BUILD_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, "", "Empty image path before standalone open; CaptureToFile not called."
+        Exit Function
+    End If
+    CATIA.StatusBar = "Opening source: " & GetProductPartNumber(prod)
+    WritePrepareLog "STANDALONE_OPEN_START", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, sourcePath
+    If Not OpenStandaloneDocument(sourcePath, prod, imagePath) Then
+        WritePrepareLog "IMAGE_CAPTURE_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "Standalone open failed."
+        CloseCurrentStandaloneDocument
+        ActivateMainDocument
+        Exit Function
+    End If
+
+    CATIA.StatusBar = "Capturing image: " & GetProductPartNumber(prod)
+    If CaptureActiveStandaloneViewer(imagePath, sourcePath, prod) Then
+        WritePrepareLog "STANDALONE_CAPTURE_DONE", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, imagePath
+        CaptureStandaloneImage = True
+    Else
+        WritePrepareLog "IMAGE_CAPTURE_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "CaptureToFile failed."
+    End If
+
+    CloseCurrentStandaloneDocument
+    ActivateMainDocument
+    Err.Clear
+End Function
+
+Function OpenStandaloneDocument(sourcePath, prod, imagePath)
+    On Error Resume Next
+    OpenStandaloneDocument = False
+    Set gCurrentStandaloneDoc = Nothing
+    Set gCurrentStandaloneWindow = Nothing
+    gCurrentStandaloneOpened = False
+
+    CATIA.DisplayFileAlerts = False
+    Set gCurrentStandaloneDoc = CATIA.Documents.Open(sourcePath)
+    CATIA.DisplayFileAlerts = True
+    If Err.Number = 0 And Not gCurrentStandaloneDoc Is Nothing Then
+        gCurrentStandaloneOpened = True
+        If ActivateStandaloneDocumentWindow(sourcePath, prod, imagePath) Then
+            OpenStandaloneDocument = True
+        Else
+            WritePrepareLog "ACTIVE_WINDOW_NOT_STANDALONE", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "Open succeeded, but active window/document did not switch to standalone source. " & ActiveCaptureContextText()
+        End If
+    End If
+    Err.Clear
+End Function
+
+Function ActivateStandaloneDocumentWindow(sourcePath, prod, imagePath)
+    On Error Resume Next
+    ActivateStandaloneDocumentWindow = False
+    Dim i
+
+    For i = 1 To 3
+        Err.Clear
+        gCurrentStandaloneDoc.Activate
+        WaitSeconds 0.15
+        Set gCurrentStandaloneWindow = CATIA.ActiveWindow
+        If ActiveDocumentMatchesSource(sourcePath) Then
+            WritePrepareLog "STANDALONE_WINDOW_ACTIVE", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, ActiveCaptureContextText()
+            ActivateStandaloneDocumentWindow = True
+            Exit Function
+        End If
+    Next
+    Err.Clear
+End Function
+
+Function CaptureActiveStandaloneViewer(imagePath, sourcePath, prod)
+    On Error Resume Next
+    CaptureActiveStandaloneViewer = False
+    Dim captureWindow
+    Dim viewer
+    If USE_RECORDER_STYLE_CAPTURE Then
+        Set captureWindow = CATIA.ActiveWindow
+        Set gCurrentStandaloneWindow = captureWindow
+    Else
+        If gCurrentStandaloneWindow Is Nothing Then Set gCurrentStandaloneWindow = CATIA.ActiveWindow
+        Set captureWindow = gCurrentStandaloneWindow
+    End If
+    If Not ActiveDocumentMatchesSource(sourcePath) Then
+        WritePrepareLog "ACTIVE_WINDOW_NOT_STANDALONE", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, ActiveCaptureContextText()
+        Exit Function
+    End If
+
+    Set viewer = captureWindow.ActiveViewer
+    If viewer Is Nothing Then Exit Function
+    viewer.Activate
+    WritePrepareLog "CAPTURE_RECORDER_STYLE_VIEWER", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, ActiveCaptureContextText()
+    WritePrepareLog "CAPTURE_VIEWER_CONTEXT", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, ActiveCaptureContextText()
+    If USE_CAPTURE_TARGET_SELECTION Then SelectStandaloneCaptureTarget prod, sourcePath, imagePath
+    If USE_WHITE_BACKGROUND Then ApplyWhiteBackground viewer, prod, sourcePath, imagePath
+    ApplyIsoView viewer
+    ClearStandaloneSelection prod, sourcePath, imagePath
+    WaitSeconds IMAGE_CAPTURE_DELAY_SECONDS
+    Err.Clear
+    viewer.CaptureToFile CAT_CAPTURE_FORMAT_JPEG, imagePath
+    If Err.Number = 0 And gFSO.FileExists(imagePath) Then
+        imagePath = FinalImagePathForCapture(imagePath, prod, sourcePath)
+        CaptureActiveStandaloneViewer = True
+    End If
+    ClearStandaloneSelection prod, sourcePath, imagePath
+    Err.Clear
+End Function
+
+Function SelectStandaloneCaptureTarget(prod, sourcePath, imagePath)
+    On Error Resume Next
+    SelectStandaloneCaptureTarget = False
+    Dim sel
+    Dim target
+    Set sel = gCurrentStandaloneDoc.Selection
+    If Err.Number <> 0 Or sel Is Nothing Then
+        WritePrepareLog "CAPTURE_TARGET_SELECT_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "Selection object not available. Err=" & Err.Description
+        Err.Clear
+        Exit Function
+    End If
+
+    Set target = StandaloneCaptureTarget(prod, sourcePath)
+    If target Is Nothing Then
+        WritePrepareLog "CAPTURE_TARGET_SELECT_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "No root object found for selection."
+        Err.Clear
+        Exit Function
+    End If
+
+    Err.Clear
+    sel.Clear
+    sel.Add target
+    If Err.Number = 0 Then
+        SelectStandaloneCaptureTarget = True
+        WritePrepareLog "CAPTURE_TARGET_SELECTED", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "Selected standalone root object before Reframe."
+    Else
+        WritePrepareLog "CAPTURE_TARGET_SELECT_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "Selection.Add failed. Err=" & Err.Description
+        Err.Clear
+    End If
+End Function
+
+Function StandaloneCaptureTarget(prod, sourcePath)
+    On Error Resume Next
+    Set StandaloneCaptureTarget = Nothing
+    Dim partNumber
+    Dim baseName
+    Dim docName
+    Dim target
+    partNumber = GetProductPartNumber(prod)
+    baseName = gFSO.GetBaseName(sourcePath)
+    docName = gFSO.GetBaseName(CStr(gCurrentStandaloneDoc.Name))
+
+    If Trim(CStr(partNumber)) <> "" Then
+        Err.Clear
+        Set target = gCurrentStandaloneDoc.GetItem(partNumber)
+        If Err.Number = 0 And Not target Is Nothing Then
+            Set StandaloneCaptureTarget = target
+            Exit Function
+        End If
+    End If
+
+    If Trim(CStr(baseName)) <> "" Then
+        Err.Clear
+        Set target = gCurrentStandaloneDoc.GetItem(baseName)
+        If Err.Number = 0 And Not target Is Nothing Then
+            Set StandaloneCaptureTarget = target
+            Exit Function
+        End If
+    End If
+
+    If Trim(CStr(docName)) <> "" Then
+        Err.Clear
+        Set target = gCurrentStandaloneDoc.GetItem(docName)
+        If Err.Number = 0 And Not target Is Nothing Then
+            Set StandaloneCaptureTarget = target
+            Exit Function
+        End If
+    End If
+
+    Err.Clear
+    Set target = gCurrentStandaloneDoc.Product
+    If Err.Number = 0 And Not target Is Nothing Then
+        Set StandaloneCaptureTarget = target
+        Exit Function
+    End If
+
+    Err.Clear
+    Set target = gCurrentStandaloneDoc.Part
+    If Err.Number = 0 And Not target Is Nothing Then
+        Set StandaloneCaptureTarget = target
+        Exit Function
+    End If
+
+    Err.Clear
+    Set target = gCurrentStandaloneDoc.Part.MainBody
+    If Err.Number = 0 And Not target Is Nothing Then Set StandaloneCaptureTarget = target
+    Err.Clear
+End Function
+
+Sub ClearStandaloneSelection(prod, sourcePath, imagePath)
+    On Error Resume Next
+    Dim sel
+    Set sel = gCurrentStandaloneDoc.Selection
+    If Err.Number = 0 And Not sel Is Nothing Then sel.Clear
+    Err.Clear
+End Sub
+
+Function ActiveDocumentMatchesSource(sourcePath)
+    On Error Resume Next
+    ActiveDocumentMatchesSource = False
+    Dim activeDoc
+    Set activeDoc = CATIA.ActiveDocument
+    If Err.Number = 0 And Not activeDoc Is Nothing Then
+        ActiveDocumentMatchesSource = SamePath(GetDocumentFullName(activeDoc), sourcePath)
+    End If
+    Err.Clear
+End Function
+
+Function ActiveCaptureContextText()
+    On Error Resume Next
+    Dim activeDoc
+    Dim activeWindow
+    Dim docText
+    Dim winText
+    docText = ""
+    winText = ""
+    Set activeDoc = CATIA.ActiveDocument
+    If Err.Number = 0 And Not activeDoc Is Nothing Then docText = CStr(activeDoc.Name) & " | " & GetDocumentFullName(activeDoc)
+    Err.Clear
+    Set activeWindow = CATIA.ActiveWindow
+    If Err.Number = 0 And Not activeWindow Is Nothing Then winText = GetWindowLabel(activeWindow)
+    ActiveCaptureContextText = "ActiveDocument=" & docText & "; ActiveWindow=" & winText
+    Err.Clear
+End Function
+
+Function GetWindowLabel(windowObj)
+    On Error Resume Next
+    GetWindowLabel = ""
+    Err.Clear
+    GetWindowLabel = CStr(windowObj.Caption)
+    If Err.Number <> 0 Or Trim(GetWindowLabel) = "" Then
+        Err.Clear
+        GetWindowLabel = CStr(windowObj.Name)
+    End If
+    Err.Clear
+End Function
+
+Sub ApplyWhiteBackground(viewer, prod, sourcePath, imagePath)
+    On Error Resume Next
+    Dim rgb(2)
+    rgb(0) = 1
+    rgb(1) = 1
+    rgb(2) = 1
+    Err.Clear
+    viewer.PutBackgroundColor rgb
+    If Err.Number = 0 Then
+        WritePrepareLog "WHITE_BACKGROUND_SET", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "Viewer background set to white."
+    Else
+        WritePrepareLog "WHITE_BACKGROUND_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "Could not set white viewer background. Err=" & Err.Description
+        Err.Clear
+    End If
+End Sub
+
+Sub ApplyIsoView(viewer)
+    On Error Resume Next
+    Dim viewpoint
+    Dim sight(2)
+    Dim up(2)
+    viewer.Reframe
+    viewer.Update
+    Set viewpoint = viewer.Viewpoint3D
+    sight(0) = 1
+    sight(1) = -1
+    sight(2) = 1
+    up(0) = -0.4082482905
+    up(1) = 0.4082482905
+    up(2) = 0.8164965809
+    viewpoint.PutSightDirection sight
+    viewpoint.PutUpDirection up
+    viewer.Reframe
+    viewer.Update
+    Err.Clear
+End Sub
+
+Sub CloseCurrentStandaloneDocument()
+    On Error Resume Next
+    If Not gCurrentStandaloneDoc Is Nothing Then
+        If gCurrentStandaloneOpened Then
+            CATIA.DisplayFileAlerts = False
+            If Not gCurrentStandaloneWindow Is Nothing Then
+                If Not IsMainWindow(gCurrentStandaloneWindow) Then gCurrentStandaloneWindow.Close
+            End If
+            gCurrentStandaloneDoc.Close
+            CATIA.DisplayFileAlerts = True
+        End If
+    End If
+    Set gCurrentStandaloneDoc = Nothing
+    Set gCurrentStandaloneWindow = Nothing
+    gCurrentStandaloneOpened = False
+    Err.Clear
+End Sub
+
+Function IsMainWindow(windowObj)
+    On Error Resume Next
+    IsMainWindow = False
+    If gMainWindow Is Nothing Or windowObj Is Nothing Then Exit Function
+    If GetWindowLabel(windowObj) = GetWindowLabel(gMainWindow) Then IsMainWindow = True
+    Err.Clear
+End Function
+
+Sub ActivateMainDocument()
+    On Error Resume Next
+    If Not gProductDocument Is Nothing Then gProductDocument.Activate
+    CATIA.RefreshDisplay = True
+    Err.Clear
+End Sub
+
+Function FindOpenDocumentByFullName(fullName, ByRef foundDoc)
+    On Error Resume Next
+    FindOpenDocumentByFullName = False
+    Dim i
+    Dim doc
+    For i = 1 To CATIA.Documents.Count
+        Set doc = CATIA.Documents.Item(i)
+        If SamePath(GetDocumentFullName(doc), fullName) Then
+            Set foundDoc = doc
+            FindOpenDocumentByFullName = True
+            Exit Function
+        End If
+    Next
+    Err.Clear
+End Function
+
+Function ShouldPrepareProduct(prod, isRoot, sourcePath)
+    On Error Resume Next
+    Dim ext
+    Dim hasChildren
+    ShouldPrepareProduct = False
+    ext = UCase(gFSO.GetExtensionName(CStr(sourcePath)))
+    hasChildren = ProductHasChildren(prod)
+    If ext = "CATPART" Then ShouldPrepareProduct = WRITE_CATPART_IMAGE_PROPERTY
+    If ext = "CATPRODUCT" Then ShouldPrepareProduct = WRITE_CATPRODUCT_IMAGE_PROPERTY
+    If ext = "" And hasChildren Then ShouldPrepareProduct = WRITE_CATPRODUCT_IMAGE_PROPERTY
+    If ext = "" And Not hasChildren Then ShouldPrepareProduct = WRITE_CATPART_IMAGE_PROPERTY
+    Err.Clear
+End Function
+
+Function SetOrCreateStringUserProperty(prod, propertyName, propertyValue)
+    On Error Resume Next
+    SetOrCreateStringUserProperty = "FAILED"
+    Dim props
+    Dim param
+    Set props = GetUserRefPropertiesForProduct(prod)
+    If props Is Nothing Then Exit Function
+
+    Set param = Nothing
+    Err.Clear
+    Set param = props.Item(CStr(propertyName))
+    If Err.Number = 0 And Not param Is Nothing Then
+        If TrySetParameterStringValue(param, propertyValue) Then
+            SetOrCreateStringUserProperty = "UPDATED"
+            Err.Clear
+            Exit Function
+        End If
+        Set param = Nothing
+        Err.Clear
+    End If
+
+    Err.Clear
+    Set param = Nothing
+    Set param = props.CreateString(CStr(propertyName), "")
+    If Err.Number = 0 And Not param Is Nothing Then
+        Err.Clear
+        param.ValuateFromString ""
+        If Err.Number = 0 Then
+            If TrySetParameterStringValue(param, propertyValue) Then SetOrCreateStringUserProperty = "CREATED"
+        Else
+            Err.Clear
+            If TrySetParameterStringValue(param, propertyValue) Then SetOrCreateStringUserProperty = "CREATED"
+        End If
+    End If
+    Err.Clear
+End Function
+
+Function GetUserRefPropertiesForProduct(prod)
+    On Error Resume Next
+    Dim refProd
+    Dim props
+    Set props = Nothing
+    Set refProd = prod.ReferenceProduct
+    If Err.Number = 0 And Not refProd Is Nothing Then
+        Err.Clear
+        Set props = refProd.UserRefProperties
+    End If
+    If props Is Nothing Then
+        Err.Clear
+        Set props = prod.UserRefProperties
+    End If
+    Set GetUserRefPropertiesForProduct = props
+    Err.Clear
+End Function
+
+Function TrySetParameterStringValue(param, valueText)
+    On Error Resume Next
+    TrySetParameterStringValue = False
+    Err.Clear
+    param.Value = CStr(valueText)
+    If Err.Number = 0 Then
+        TrySetParameterStringValue = True
+        Exit Function
+    End If
+    Err.Clear
+    param.ValuateFromString CStr(valueText)
+    If Err.Number = 0 Then TrySetParameterStringValue = True
+    Err.Clear
+End Function
+
+Function BuildImagePath(prod, sourcePath)
+    On Error Resume Next
+    Dim baseName
+    Dim sourceName
+    Dim hashText
+    Dim finalPath
+    Dim errNumber
+    Dim errDescription
+
+    Err.Clear
+    sourceName = gFSO.GetBaseName(sourcePath)
+    If Err.Number <> 0 Or Trim(CStr(sourceName)) = "" Then
+        errNumber = Err.Number
+        errDescription = Err.Description
+        sourceName = "SOURCE"
+        Err.Clear
+    End If
+
+    hashText = StablePathHash(sourcePath)
+    If Err.Number <> 0 Or Trim(CStr(hashText)) = "" Then
+        errNumber = Err.Number
+        errDescription = Err.Description
+        hashText = "NOHASH"
+        Err.Clear
+    End If
+
+    baseName = SafeFileName(GetProductPartNumber(prod) & "_" & sourceName & "_" & hashText)
+    If baseName = "" Then baseName = SafeFileName(sourceName & "_" & hashText)
+    If baseName = "" Then baseName = "CATIA_IMAGE"
+    If Len(baseName) > 140 Then baseName = Left(baseName, 131) & "_" & hashText
+
+    finalPath = JoinPath(gImageFolder, baseName & ".jpg")
+    If Err.Number <> 0 Or Trim(CStr(finalPath)) = "" Then
+        errNumber = Err.Number
+        errDescription = Err.Description
+        Err.Clear
+        finalPath = JoinPath(gImageFolder, "CATIA_IMAGE_" & TimestampForFile() & ".jpg")
+    End If
+
+    If Trim(CStr(finalPath)) <> "" Then
+        BuildImagePath = finalPath
+        WritePrepareLog "IMAGE_PATH_BUILT", prod.Name, GetProductPartNumber(prod), sourcePath, finalPath, "Hash=" & hashText & "; Err.Number=" & CStr(errNumber) & "; Err.Description=" & errDescription
+    Else
+        BuildImagePath = ""
+        WritePrepareLog "IMAGE_PATH_BUILD_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, "", "Hash=" & hashText & "; Err.Number=" & CStr(errNumber) & "; Err.Description=" & errDescription
+    End If
+    Err.Clear
+End Function
+
+Function FinalImagePathForCapture(originalImagePath, prod, sourcePath)
+    On Error Resume Next
+    FinalImagePathForCapture = originalImagePath
+    If Not USE_CENTER_POSITION_CROP Then Exit Function
+    If Trim(CStr(originalImagePath)) = "" Or Not gFSO.FileExists(originalImagePath) Then Exit Function
+    FinalImagePathForCapture = CropCapturedImageIfPossible(originalImagePath, prod, sourcePath)
+    Err.Clear
+End Function
+
+Function CropCapturedImageIfPossible(originalImagePath, prod, sourcePath)
+    On Error Resume Next
+    CropCapturedImageIfPossible = originalImagePath
+    Dim croppedPath
+    Dim img
+    Dim width
+    Dim height
+    Dim cropLeft
+    Dim cropRight
+    Dim cropTop
+    Dim cropBottom
+    Dim boundsMessage
+    croppedPath = BuildCroppedImagePath(originalImagePath)
+    If Trim(CStr(croppedPath)) = "" Then
+        WritePrepareLog "CENTER_POSITION_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Could not build cropped image path."
+        Exit Function
+    End If
+
+    Err.Clear
+    Set img = CreateObject("WIA.ImageFile")
+    img.LoadFile originalImagePath
+    width = CLng(img.Width)
+    height = CLng(img.Height)
+    cropLeft = CLng(width * CROP_LEFT_PERCENT)
+    cropRight = CLng(width * CROP_RIGHT_PERCENT)
+    cropTop = CLng(height * CROP_TOP_PERCENT)
+    cropBottom = CLng(height * CROP_BOTTOM_PERCENT)
+
+    If Err.Number <> 0 Or width <= 0 Or height <= 0 Then
+        WritePrepareLog "CENTER_POSITION_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "WIA load failed. Err=" & Err.Description
+        Err.Clear
+        Exit Function
+    End If
+
+    If USE_SNIP_OBJECT_CROP Then
+        WritePrepareLog "SNIP_OBJECT_CROP_START", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Width=" & CStr(width) & "; Height=" & CStr(height)
+        If FindSnipObjectCropMargins(img, cropLeft, cropRight, cropTop, cropBottom, boundsMessage) Then
+            WritePrepareLog "SNIP_OBJECT_BOUNDS_FOUND", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, boundsMessage & "; CropLeft=" & CStr(cropLeft) & "; CropRight=" & CStr(cropRight) & "; CropTop=" & CStr(cropTop) & "; CropBottom=" & CStr(cropBottom)
+            If SaveWiaCrop(img, croppedPath, cropLeft, cropRight, cropTop, cropBottom) Then
+                CropCapturedImageIfPossible = croppedPath
+                WritePrepareLog "SNIP_OBJECT_CROP_DONE", prod.Name, GetProductPartNumber(prod), sourcePath, croppedPath, "Original=" & originalImagePath & "; " & boundsMessage
+                Exit Function
+            Else
+                WritePrepareLog "SNIP_OBJECT_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "SaveWiaCrop failed. Err=" & Err.Description
+                Err.Clear
+            End If
+        Else
+            WritePrepareLog "SNIP_OBJECT_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, boundsMessage
+        End If
+    End If
+
+    If USE_AUTO_OBJECT_CROP Then
+        WritePrepareLog "AUTO_OBJECT_CROP_START", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Width=" & CStr(width) & "; Height=" & CStr(height) & "; IgnoreLeftPercent=" & CStr(AUTO_CROP_IGNORE_LEFT_PERCENT)
+        If FindAutoObjectCropMargins(img, cropLeft, cropRight, cropTop, cropBottom, boundsMessage) Then
+            WritePrepareLog "AUTO_OBJECT_CROP_BOUNDS_FOUND", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, boundsMessage & "; CropLeft=" & CStr(cropLeft) & "; CropRight=" & CStr(cropRight) & "; CropTop=" & CStr(cropTop) & "; CropBottom=" & CStr(cropBottom)
+            If SaveWiaCrop(img, croppedPath, cropLeft, cropRight, cropTop, cropBottom) Then
+                CropCapturedImageIfPossible = croppedPath
+                WritePrepareLog "AUTO_OBJECT_CROP_DONE", prod.Name, GetProductPartNumber(prod), sourcePath, croppedPath, "Original=" & originalImagePath & "; " & boundsMessage
+                Exit Function
+            Else
+                WritePrepareLog "AUTO_OBJECT_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "SaveWiaCrop failed. Err=" & Err.Description
+                Err.Clear
+            End If
+        Else
+            WritePrepareLog "AUTO_OBJECT_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, boundsMessage
+        End If
+    End If
+
+    cropLeft = CLng(width * CROP_LEFT_PERCENT)
+    cropRight = CLng(width * CROP_RIGHT_PERCENT)
+    cropTop = CLng(height * CROP_TOP_PERCENT)
+    cropBottom = CLng(height * CROP_BOTTOM_PERCENT)
+
+    If (width - cropLeft - cropRight) < 80 Or (height - cropTop - cropBottom) < 80 Then
+        WritePrepareLog "CENTER_POSITION_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Fallback crop would be too aggressive. Width=" & CStr(width) & "; Height=" & CStr(height)
+        Exit Function
+    End If
+
+    WritePrepareLog "FIXED_LEFT_CROP_FALLBACK_USED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Left=" & CStr(cropLeft) & "; Right=" & CStr(cropRight) & "; Top=" & CStr(cropTop) & "; Bottom=" & CStr(cropBottom)
+    If SaveWiaCrop(img, croppedPath, cropLeft, cropRight, cropTop, cropBottom) Then
+        CropCapturedImageIfPossible = croppedPath
+        WritePrepareLog "CENTER_POSITION_CROP_DONE", prod.Name, GetProductPartNumber(prod), sourcePath, croppedPath, "Original=" & originalImagePath & "; Left=" & CStr(cropLeft) & "; Right=" & CStr(cropRight) & "; Top=" & CStr(cropTop) & "; Bottom=" & CStr(cropBottom)
+    Else
+        WritePrepareLog "CENTER_POSITION_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Crop failed. Err=" & Err.Description
+        Err.Clear
+    End If
+End Function
+
+Function FindSnipObjectCropMargins(img, ByRef cropLeft, ByRef cropRight, ByRef cropTop, ByRef cropBottom, ByRef boundsMessage)
+    On Error Resume Next
+    FindSnipObjectCropMargins = False
+    boundsMessage = ""
+
+    Dim width
+    Dim height
+    Dim pixels
+    Dim pixelBase
+    Dim scanStep
+    Dim minScanX
+    Dim maxScanX
+    Dim minScanY
+    Dim maxScanY
+    Dim x
+    Dim y
+    Dim pixel
+    Dim minX
+    Dim maxX
+    Dim minY
+    Dim maxY
+    Dim foundCount
+    Dim padX
+    Dim padY
+    Dim keepLeft
+    Dim keepRight
+    Dim keepTop
+    Dim keepBottom
+    Dim boundsArea
+    Dim scanArea
+    Dim boundsRatio
+
+    width = CLng(img.Width)
+    height = CLng(img.Height)
+    scanStep = CLng(SNIP_SCAN_STEP)
+    If scanStep < 1 Then scanStep = 1
+
+    minScanX = CLng(width * SNIP_IGNORE_LEFT_PERCENT)
+    maxScanX = CLng(width * (1 - SNIP_IGNORE_RIGHT_PERCENT)) - 1
+    minScanY = CLng(height * SNIP_IGNORE_TOP_PERCENT)
+    maxScanY = CLng(height * (1 - SNIP_IGNORE_BOTTOM_PERCENT)) - 1
+
+    If minScanX < 0 Then minScanX = 0
+    If minScanY < 0 Then minScanY = 0
+    If maxScanX > width - 1 Then maxScanX = width - 1
+    If maxScanY > height - 1 Then maxScanY = height - 1
+
+    If maxScanX <= minScanX Or maxScanY <= minScanY Then
+        boundsMessage = "Invalid snip scan zone."
+        Exit Function
+    End If
+
+    Err.Clear
+    Set pixels = img.ARGBData
+    If Err.Number <> 0 Or pixels Is Nothing Then
+        boundsMessage = "ARGBData not available. Err=" & Err.Description
+        Err.Clear
+        Exit Function
+    End If
+
+    pixelBase = WiaVectorPixelBase(pixels)
+    If pixelBase < 0 Then
+        boundsMessage = "Could not determine WIA pixel index base."
+        Exit Function
+    End If
+
+    minX = width
+    minY = height
+    maxX = -1
+    maxY = -1
+    foundCount = 0
+
+    For y = minScanY To maxScanY Step scanStep
+        For x = minScanX To maxScanX Step scanStep
+            Err.Clear
+            pixel = pixels.Item((CLng(y) * CLng(width)) + CLng(x) + pixelBase)
+            If Err.Number <> 0 Then
+                boundsMessage = "Pixel read failed. X=" & CStr(x) & "; Y=" & CStr(y) & "; Err=" & Err.Description
+                Err.Clear
+                Exit Function
+            End If
+            If IsObjectPixelOnWhiteBackground(pixel) Then
+                If x < minX Then minX = x
+                If x > maxX Then maxX = x
+                If y < minY Then minY = y
+                If y > maxY Then maxY = y
+                foundCount = foundCount + 1
+            End If
+        Next
+    Next
+
+    If foundCount < 10 Or maxX < minX Or maxY < minY Then
+        boundsMessage = "No object pixels found in snip zone. FoundCount=" & CStr(foundCount) & "; Zone=" & SnipZoneText(minScanX, maxScanX, minScanY, maxScanY)
+        Exit Function
+    End If
+
+    minX = MaxLong(minScanX, minX - scanStep)
+    minY = MaxLong(minScanY, minY - scanStep)
+    maxX = MinLong(maxScanX, maxX + scanStep)
+    maxY = MinLong(maxScanY, maxY + scanStep)
+
+    boundsArea = CDbl((maxX - minX + 1)) * CDbl((maxY - minY + 1))
+    scanArea = CDbl(maxScanX - minScanX + 1) * CDbl(maxScanY - minScanY + 1)
+    If scanArea > 0 Then
+        boundsRatio = boundsArea / scanArea
+        If boundsRatio > 0.9 Then
+            boundsMessage = "Snip bounds cover almost entire scan zone; likely UI/background noise. Ratio=" & CStr(boundsRatio) & "; Zone=" & SnipZoneText(minScanX, maxScanX, minScanY, maxScanY)
+            Exit Function
+        End If
+    End If
+
+    padX = MaxLong(SNIP_MIN_PADDING_PIXELS, CLng((maxX - minX + 1) * SNIP_PADDING_PERCENT))
+    padY = MaxLong(SNIP_MIN_PADDING_PIXELS, CLng((maxY - minY + 1) * SNIP_PADDING_PERCENT))
+
+    keepLeft = MaxLong(minScanX, minX - padX)
+    keepRight = MinLong(maxScanX, maxX + padX)
+    keepTop = MaxLong(minScanY, minY - padY)
+    keepBottom = MinLong(maxScanY, maxY + padY)
+
+    If (keepRight - keepLeft) < 60 Or (keepBottom - keepTop) < 60 Then
+        boundsMessage = "Snip crop bounds too small after padding."
+        Exit Function
+    End If
+
+    cropLeft = keepLeft
+    cropRight = width - 1 - keepRight
+    cropTop = keepTop
+    cropBottom = height - 1 - keepBottom
+
+    boundsMessage = "BoundsMinX=" & CStr(minX) & "; BoundsMaxX=" & CStr(maxX) & _
+                    "; BoundsMinY=" & CStr(minY) & "; BoundsMaxY=" & CStr(maxY) & _
+                    "; FoundCount=" & CStr(foundCount) & "; " & SnipZoneText(minScanX, maxScanX, minScanY, maxScanY) & _
+                    "; PadX=" & CStr(padX) & "; PadY=" & CStr(padY)
+    FindSnipObjectCropMargins = True
+    Err.Clear
+End Function
+
+Function SnipZoneText(minScanX, maxScanX, minScanY, maxScanY)
+    SnipZoneText = "ZoneLeft=" & CStr(minScanX) & "; ZoneRight=" & CStr(maxScanX) & "; ZoneTop=" & CStr(minScanY) & "; ZoneBottom=" & CStr(maxScanY)
+End Function
+
+Function FindAutoObjectCropMargins(img, ByRef cropLeft, ByRef cropRight, ByRef cropTop, ByRef cropBottom, ByRef boundsMessage)
+    On Error Resume Next
+    FindAutoObjectCropMargins = False
+    boundsMessage = ""
+
+    Dim width
+    Dim height
+    Dim pixels
+    Dim pixelBase
+    Dim scanStep
+    Dim ignoreLeft
+    Dim x
+    Dim y
+    Dim pixel
+    Dim minX
+    Dim maxX
+    Dim minY
+    Dim maxY
+    Dim foundCount
+    Dim padX
+    Dim padY
+    Dim keepLeft
+    Dim keepRight
+    Dim keepTop
+    Dim keepBottom
+    Dim boundsArea
+    Dim scanArea
+    Dim boundsRatio
+
+    width = CLng(img.Width)
+    height = CLng(img.Height)
+    scanStep = CLng(AUTO_CROP_SCAN_STEP)
+    If scanStep < 1 Then scanStep = 1
+    ignoreLeft = CLng(width * AUTO_CROP_IGNORE_LEFT_PERCENT)
+    If ignoreLeft < 0 Then ignoreLeft = 0
+    If ignoreLeft > width - 1 Then ignoreLeft = 0
+
+    Err.Clear
+    Set pixels = img.ARGBData
+    If Err.Number <> 0 Or pixels Is Nothing Then
+        boundsMessage = "ARGBData not available. Err=" & Err.Description
+        Err.Clear
+        Exit Function
+    End If
+
+    pixelBase = WiaVectorPixelBase(pixels)
+    If pixelBase < 0 Then
+        boundsMessage = "Could not determine WIA pixel index base."
+        Exit Function
+    End If
+
+    minX = width
+    minY = height
+    maxX = -1
+    maxY = -1
+    foundCount = 0
+
+    For y = 0 To height - 1 Step scanStep
+        For x = ignoreLeft To width - 1 Step scanStep
+            Err.Clear
+            pixel = pixels.Item((CLng(y) * CLng(width)) + CLng(x) + pixelBase)
+            If Err.Number <> 0 Then
+                boundsMessage = "Pixel read failed. X=" & CStr(x) & "; Y=" & CStr(y) & "; Err=" & Err.Description
+                Err.Clear
+                Exit Function
+            End If
+            If IsObjectPixelOnWhiteBackground(pixel) Then
+                If x < minX Then minX = x
+                If x > maxX Then maxX = x
+                If y < minY Then minY = y
+                If y > maxY Then maxY = y
+                foundCount = foundCount + 1
+            End If
+        Next
+    Next
+
+    If foundCount < 10 Or maxX < minX Or maxY < minY Then
+        boundsMessage = "No object pixels found. FoundCount=" & CStr(foundCount) & "; IgnoreLeft=" & CStr(ignoreLeft)
+        Exit Function
+    End If
+
+    minX = MaxLong(ignoreLeft, minX - scanStep)
+    minY = MaxLong(0, minY - scanStep)
+    maxX = MinLong(width - 1, maxX + scanStep)
+    maxY = MinLong(height - 1, maxY + scanStep)
+
+    boundsArea = CDbl((maxX - minX + 1)) * CDbl((maxY - minY + 1))
+    scanArea = CDbl(width - ignoreLeft) * CDbl(height)
+    If scanArea > 0 Then
+        boundsRatio = boundsArea / scanArea
+        If boundsRatio > 0.92 Then
+            boundsMessage = "Bounds cover almost entire scanned area; background probably not white. Ratio=" & CStr(boundsRatio)
+            Exit Function
+        End If
+    End If
+
+    padX = MaxLong(AUTO_CROP_MIN_PADDING_PIXELS, CLng((maxX - minX + 1) * AUTO_CROP_PADDING_PERCENT))
+    padY = MaxLong(AUTO_CROP_MIN_PADDING_PIXELS, CLng((maxY - minY + 1) * AUTO_CROP_PADDING_PERCENT))
+
+    keepLeft = MaxLong(ignoreLeft, minX - padX)
+    keepRight = MinLong(width - 1, maxX + padX)
+    keepTop = MaxLong(0, minY - padY)
+    keepBottom = MinLong(height - 1, maxY + padY)
+
+    If (keepRight - keepLeft) < 60 Or (keepBottom - keepTop) < 60 Then
+        boundsMessage = "Auto crop bounds too small after padding."
+        Exit Function
+    End If
+
+    cropLeft = keepLeft
+    cropRight = width - 1 - keepRight
+    cropTop = keepTop
+    cropBottom = height - 1 - keepBottom
+
+    boundsMessage = "BoundsMinX=" & CStr(minX) & "; BoundsMaxX=" & CStr(maxX) & _
+                    "; BoundsMinY=" & CStr(minY) & "; BoundsMaxY=" & CStr(maxY) & _
+                    "; FoundCount=" & CStr(foundCount) & "; IgnoreLeft=" & CStr(ignoreLeft) & _
+                    "; PadX=" & CStr(padX) & "; PadY=" & CStr(padY)
+    FindAutoObjectCropMargins = True
+    Err.Clear
+End Function
+
+Function WiaVectorPixelBase(pixels)
+    On Error Resume Next
+    Dim testPixel
+    WiaVectorPixelBase = -1
+    Err.Clear
+    testPixel = pixels.Item(1)
+    If Err.Number = 0 Then
+        WiaVectorPixelBase = 1
+        Exit Function
+    End If
+    Err.Clear
+    testPixel = pixels.Item(0)
+    If Err.Number = 0 Then WiaVectorPixelBase = 0
+    Err.Clear
+End Function
+
+Function IsObjectPixelOnWhiteBackground(argbValue)
+    Dim redValue
+    Dim greenValue
+    Dim blueValue
+    redValue = ColorByteFromArgb(argbValue, 65536)
+    greenValue = ColorByteFromArgb(argbValue, 256)
+    blueValue = ColorByteFromArgb(argbValue, 1)
+    IsObjectPixelOnWhiteBackground = Not (redValue >= AUTO_CROP_WHITE_THRESHOLD And greenValue >= AUTO_CROP_WHITE_THRESHOLD And blueValue >= AUTO_CROP_WHITE_THRESHOLD)
+End Function
+
+Function ColorByteFromArgb(argbValue, divisor)
+    Dim valueAsDouble
+    Dim lowValue
+    Dim highValue
+    valueAsDouble = CDbl(argbValue)
+    If valueAsDouble < 0 Then valueAsDouble = valueAsDouble + CDbl("4294967296")
+    lowValue = Int(valueAsDouble / CDbl(divisor))
+    highValue = Int(valueAsDouble / (CDbl(divisor) * 256))
+    ColorByteFromArgb = CLng(lowValue - (highValue * 256))
+End Function
+
+Function SaveWiaCrop(img, croppedPath, cropLeft, cropRight, cropTop, cropBottom)
+    On Error Resume Next
+    SaveWiaCrop = False
+    Dim proc
+    Dim filter
+    Dim cropped
+    Err.Clear
+    Set proc = CreateObject("WIA.ImageProcess")
+    proc.Filters.Add proc.FilterInfos("Crop").FilterID
+    Set filter = proc.Filters(1)
+    filter.Properties("Left") = CLng(cropLeft)
+    filter.Properties("Right") = CLng(cropRight)
+    filter.Properties("Top") = CLng(cropTop)
+    filter.Properties("Bottom") = CLng(cropBottom)
+    Set cropped = proc.Apply(img)
+    If gFSO.FileExists(croppedPath) Then gFSO.DeleteFile croppedPath, True
+    cropped.SaveFile croppedPath
+    If Err.Number = 0 And gFSO.FileExists(croppedPath) Then SaveWiaCrop = True
+    Err.Clear
+End Function
+
+Function MaxLong(firstValue, secondValue)
+    If CLng(firstValue) >= CLng(secondValue) Then
+        MaxLong = CLng(firstValue)
+    Else
+        MaxLong = CLng(secondValue)
+    End If
+End Function
+
+Function MinLong(firstValue, secondValue)
+    If CLng(firstValue) <= CLng(secondValue) Then
+        MinLong = CLng(firstValue)
+    Else
+        MinLong = CLng(secondValue)
+    End If
+End Function
+
+Function BuildCroppedImagePath(originalImagePath)
+    On Error Resume Next
+    Dim baseName
+    baseName = gFSO.GetBaseName(originalImagePath)
+    If Trim(CStr(baseName)) = "" Then baseName = "CATIA_IMAGE_" & TimestampForFile()
+    BuildCroppedImagePath = JoinPath(gCroppedFolder, SafeFileName(baseName) & "_CROP.jpg")
+    If Err.Number <> 0 Then
+        BuildCroppedImagePath = ""
+        Err.Clear
+    End If
+End Function
+
+Function StablePathHash(pathText)
+    On Error Resume Next
+    Dim i
+    Dim code
+    Dim hashValue
+    hashValue = 0
+    For i = 1 To Len(CStr(pathText))
+        code = AscW(Mid(CStr(pathText), i, 1))
+        If code < 0 Then code = code + 65536
+        hashValue = (hashValue + ((code Mod 251) * (i Mod 251))) Mod 16777215
+    Next
+    StablePathHash = Right("00000000" & Hex(CLng(hashValue)), 8)
+    If Err.Number <> 0 Or Trim(CStr(StablePathHash)) = "" Then StablePathHash = "NOHASH"
+    Err.Clear
+End Function
+
+Function TimestampForFile()
+    Dim d
+    d = Now
+    TimestampForFile = Year(d) & Right("0" & Month(d), 2) & Right("0" & Day(d), 2) & "_" & Right("0" & Hour(d), 2) & Right("0" & Minute(d), 2) & Right("0" & Second(d), 2)
+End Function
+
+Sub UpdatePrepareProgress(currentPartNumber)
+    On Error Resume Next
+    CATIA.StatusBar = ProgressText(currentPartNumber)
+    Err.Clear
+End Sub
+
+Function ProgressText(currentPartNumber)
+    Dim errorsCount
+    errorsCount = gPropertyErrorCount + gCaptureFailedCount + gSourceNotFoundCount
+    ProgressText = "Preparing BOM images: visited " & CStr(gVisitedCount) & _
+                   ", created " & CStr(gImagesCreated) & _
+                   ", reused " & CStr(gImagesReused + gDuplicateSourceReusedCount) & _
+                   ", errors " & CStr(errorsCount)
+    If Trim(CStr(currentPartNumber)) <> "" Then ProgressText = ProgressText & " - " & CStr(currentPartNumber)
+End Function
+
+Function IsFastenerProduct(prod)
+    Dim scanText
+    scanText = GetProductPartNumber(prod) & " " & CStr(prod.Name) & " " & GetProductNomenclature(prod)
+    IsFastenerProduct = ContainsFastenerKeyword(scanText)
+End Function
+
+Function IsFastenerAssemblyProduct(prod)
+    Dim partNumberText
+    Dim nameText
+    Dim nomenclatureText
+    Dim scanText
+    IsFastenerAssemblyProduct = False
+    If Not ProductHasChildren(prod) Then Exit Function
+    partNumberText = NormalizeFastenerText(GetProductPartNumber(prod))
+    nameText = NormalizeFastenerText(CStr(prod.Name))
+    nomenclatureText = NormalizeFastenerText(GetProductNomenclature(prod))
+    scanText = " " & partNumberText & " " & nameText & " " & nomenclatureText & " "
+    If IsVvFastenerAssemblyText(partNumberText) Or IsVvFastenerAssemblyText(nameText) Or IsVvFastenerAssemblyText(nomenclatureText) Then
+        IsFastenerAssemblyProduct = True
+        Exit Function
+    End If
+    If InStr(1, scanText, " vijcana veza ", vbTextCompare) > 0 Then
+        IsFastenerAssemblyProduct = True
+        Exit Function
+    End If
+    If InStr(1, scanText, " bolt assembly ", vbTextCompare) > 0 Then
+        IsFastenerAssemblyProduct = True
+        Exit Function
+    End If
+    If InStr(1, scanText, " fastener assembly ", vbTextCompare) > 0 Then IsFastenerAssemblyProduct = True
+End Function
+
+Function IsVvFastenerAssemblyText(valueText)
+    IsVvFastenerAssemblyText = False
+    If Left(CStr(valueText), 3) = "vv " Then IsVvFastenerAssemblyText = True
+    If Left(CStr(valueText), 4) = "vv m" Then IsVvFastenerAssemblyText = True
+End Function
+
+Function FastenerSkipPhase(prod)
+    If IsFastenerAssemblyProduct(prod) Then
+        FastenerSkipPhase = "FASTENER_ASSEMBLY_MARKED_SKIP"
+    Else
+        FastenerSkipPhase = "FASTENER_MARKED_SKIP"
+    End If
+End Function
+
+Function ContainsFastenerKeyword(valueText)
+    Dim scanText
+    Dim keywords
+    Dim kw
+    ContainsFastenerKeyword = False
+    scanText = NormalizeFastenerText(valueText)
+    keywords = Split(FASTENER_KEYWORDS, "|")
+    For Each kw In keywords
+        If NormalizeFastenerText(CStr(kw)) <> "" Then
+            If InStr(1, scanText, NormalizeFastenerText(CStr(kw)), vbTextCompare) > 0 Then
+                ContainsFastenerKeyword = True
+                Exit Function
+            End If
+        End If
+    Next
+End Function
+
+Function NormalizeFastenerText(valueText)
+    Dim s
+    s = LCase(CStr(valueText))
+    s = Replace(s, ChrW(&H10D), "c")
+    s = Replace(s, ChrW(&H107), "c")
+    s = Replace(s, ChrW(&H161), "s")
+    s = Replace(s, ChrW(&H111), "d")
+    s = Replace(s, ChrW(&H17E), "z")
+    s = Replace(s, ".", " ")
+    s = Replace(s, "-", " ")
+    s = Replace(s, "_", " ")
+    s = Replace(s, "/", " ")
+    s = Replace(s, "\", " ")
+    s = Replace(s, vbTab, " ")
+    s = Replace(s, vbCr, " ")
+    s = Replace(s, vbLf, " ")
+    Do While InStr(1, s, "  ", vbTextCompare) > 0
+        s = Replace(s, "  ", " ")
+    Loop
+    NormalizeFastenerText = Trim(s)
+End Function
+
+Function GetProductPartNumber(prod)
+    On Error Resume Next
+    GetProductPartNumber = Trim(CStr(prod.PartNumber))
+    If GetProductPartNumber = "" Then
+        Dim refProd
+        Set refProd = prod.ReferenceProduct
+        If Not refProd Is Nothing Then GetProductPartNumber = Trim(CStr(refProd.PartNumber))
+    End If
+    Err.Clear
+End Function
+
+Function GetProductNomenclature(prod)
+    On Error Resume Next
+    GetProductNomenclature = CStr(prod.Nomenclature)
+    Err.Clear
+End Function
+
+Function ProductHasChildren(prod)
+    On Error Resume Next
+    ProductHasChildren = False
+    Dim children
+    Set children = prod.Products
+    If Err.Number = 0 And Not children Is Nothing Then ProductHasChildren = (children.Count > 0)
+    Err.Clear
+End Function
+
+Function GetProductSourceFilePath(prod)
+    On Error Resume Next
+    Dim refProd
+    Dim candidate
+    Set refProd = prod.ReferenceProduct
+    If Not refProd Is Nothing Then
+        candidate = FindSourcePathInObjectChain(refProd.Parent)
+        If IsValidCatiaSourcePath(candidate) Then
+            GetProductSourceFilePath = candidate
+            Exit Function
+        End If
+        Err.Clear
+        candidate = CStr(refProd.GetMasterShapeRepresentationPathName)
+        If IsValidCatiaSourcePath(candidate) Then
+            GetProductSourceFilePath = candidate
+            Exit Function
+        End If
+    End If
+    candidate = FindSourcePathInObjectChain(prod.Parent)
+    If IsValidCatiaSourcePath(candidate) Then
+        GetProductSourceFilePath = candidate
+        Exit Function
+    End If
+    Err.Clear
+    candidate = CStr(prod.GetMasterShapeRepresentationPathName)
+    If IsValidCatiaSourcePath(candidate) Then GetProductSourceFilePath = candidate
+    Err.Clear
+End Function
+
+Function FindSourcePathInObjectChain(obj)
+    On Error Resume Next
+    Dim current
+    Dim i
+    Dim candidate
+    Set current = obj
+    For i = 1 To 20
+        If current Is Nothing Then Exit For
+        Err.Clear
+        candidate = CStr(current.FullName)
+        If IsValidCatiaSourcePath(candidate) Then
+            FindSourcePathInObjectChain = candidate
+            Exit Function
+        End If
+        Err.Clear
+        Set current = current.Parent
+    Next
+    Err.Clear
+End Function
+
+Function IsValidCatiaSourcePath(pathText)
+    Dim ext
+    IsValidCatiaSourcePath = False
+    If Trim(CStr(pathText)) = "" Then Exit Function
+    ext = UCase(gFSO.GetExtensionName(CStr(pathText)))
+    If (ext = "CATPART" Or ext = "CATPRODUCT") Then IsValidCatiaSourcePath = gFSO.FileExists(CStr(pathText))
+End Function
+
+Function GetDocumentFullName(doc)
+    On Error Resume Next
+    GetDocumentFullName = CStr(doc.FullName)
+    If Err.Number <> 0 Then
+        GetDocumentFullName = ""
+        Err.Clear
+    End If
+End Function
+
+Function SamePath(pathA, pathB)
+    SamePath = (UCase(Trim(CStr(pathA))) = UCase(Trim(CStr(pathB))) And Trim(CStr(pathA)) <> "")
+End Function
+
+Sub AskToSaveOpenCatiaDocuments()
+    On Error Resume Next
+    Dim answer
+    answer = MsgBox("Makro je dodao/azurirao property 'Slika' sa putanjama do slika. Da li zelite da sacuvate otvorene CATIA dokumente?" & vbCrLf & vbCrLf & _
+                    "YES = sacuvaj otvorene dokumente" & vbCrLf & _
+                    "NO = ne snimaj" & vbCrLf & _
+                    "CANCEL = ne snimaj i zavrsi", _
+                    vbYesNoCancel + vbQuestion, "CATIA_BOM_IMAGE_PREPARE_FOR_BOM")
+    If answer = vbYes Then SaveOpenCatiaDocuments
+    Err.Clear
+End Sub
+
+Sub SaveOpenCatiaDocuments()
+    On Error Resume Next
+    Dim i
+    Dim doc
+    For i = 1 To CATIA.Documents.Count
+        Err.Clear
+        Set doc = CATIA.Documents.Item(i)
+        doc.Save
+        If Err.Number <> 0 Then
+            gPropertyErrorCount = gPropertyErrorCount + 1
+            WritePrepareLog "ERROR", doc.Name, "", GetDocumentFullName(doc), "", "Save failed. Err=" & Err.Description
+            Err.Clear
+        End If
+    Next
+End Sub
+
+Sub WaitSeconds(secondsValue)
+    Dim t
+    t = Timer
+    Do While Timer - t < CDbl(secondsValue)
+        DoEvents
+        If Timer < t Then Exit Do
+    Loop
+End Sub
+
+Function SafeFileName(valueText)
+    Dim s
+    Dim badChars
+    Dim ch
+    s = Trim(CStr(valueText))
+    badChars = Array("\", "/", ":", "*", "?", """", "<", ">", "|", vbTab, vbCr, vbLf)
+    For Each ch In badChars
+        s = Replace(s, CStr(ch), "_")
+    Next
+    Do While InStr(1, s, "__", vbTextCompare) > 0
+        s = Replace(s, "__", "_")
+    Loop
+    SafeFileName = Trim(s)
+End Function
+
+Sub WritePrepareLog(phase, productName, partNumber, sourcePath, imagePath, message)
+    On Error Resume Next
+    Dim ts
+    Set ts = gFSO.OpenTextFile(gLogPath, 8, True)
+    ts.WriteLine Now & vbTab & phase & vbTab & productName & vbTab & partNumber & vbTab & sourcePath & vbTab & imagePath & vbTab & message
+    ts.Close
+    Err.Clear
+End Sub
+
+Sub EnsureFolder(pathText)
+    On Error Resume Next
+    If Trim(CStr(pathText)) <> "" Then
+        If Not gFSO.FolderExists(pathText) Then gFSO.CreateFolder pathText
+    End If
+    Err.Clear
+End Sub
+
+Function JoinPath(folderPath, fileName)
+    If Right(CStr(folderPath), 1) = "\" Then
+        JoinPath = CStr(folderPath) & CStr(fileName)
+    Else
+        JoinPath = CStr(folderPath) & "\" & CStr(fileName)
+    End If
+End Function

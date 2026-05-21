@@ -6,49 +6,42 @@ End Sub
 
 ' ================================================================
 ' CATIA_VISUAL_BOM_EXPORTER
-' Native CATIA BOM -> Excel -> standalone-window thumbnails only.
+' Two-phase model BOM Excel thumbnail workflow.
 ' ================================================================
 
 ' ---------------------- CONFIGURATION ---------------------------
+Const WORK_ROOT = "C:\Temp\CATIA_VISUAL_BOM_WORK"
+Const STATE_FILE_NAME = "VISUAL_BOM_STATE.txt"
+Const SAVE_EVERY_N_ROWS = 25
+Const SKIP_EXISTING_IMAGES = True
+Const RESUME_MODE = True
+Const TEST_MODE = True
+Const TEST_MAX_ROWS = 20
+Const SKIP_FASTENER_IMAGES = True
+Const PREFER_CATPART_OVER_CATPRODUCT = True
+Const ALLOW_ROOT_ASSEMBLY_IMAGE = False
+Const ALLOW_SUBASSEMBLY_IMAGE = True
+Const FASTENER_KEYWORDS = "vijak|vijci|zavrtanj|zavrtnji|screw|bolt|hex bolt|hexagon bolt|imbus|allen screw|navrtka|matica|nut|hex nut|podloska|washer|plain washer|spring washer|lock washer|DIN 125|DIN125|DIN 127|DIN127|DIN 933|DIN933|DIN 931|DIN931|DIN 934|DIN934|ISO 4014|ISO 4017|ISO 4032|ISO 7089|ISO 7090"
+Const IMAGE_WIDTH = 1000
+Const IMAGE_HEIGHT = 750
+Const THUMBNAIL_WIDTH = 160
+Const THUMBNAIL_HEIGHT = 120
+Const IMAGE_CAPTURE_DELAY_SECONDS = 0.2
 Const STANDALONE_CAPTURE_ONLY = True
-Const PREFER_STANDALONE_PART_CAPTURE = True
 Const FALLBACK_TO_ASSEMBLY_HIDE_SHOW = False
 Const CLOSE_STANDALONE_DOCUMENT_AFTER_CAPTURE = True
 Const NEVER_SAVE_CATIA_DOCUMENTS = True
-Const SKIP_FASTENER_IMAGES = True
-Const SKIP_FASTENER_ROWS = False
-Const FASTENER_KEYWORDS = "vijak|vijci|zavrtanj|zavrtnji|screw|bolt|hex bolt|hexagon bolt|imbus|allen screw|navrtka|matica|nut|hex nut|podloska|washer|plain washer|spring washer|lock washer|DIN 125|DIN125|DIN 127|DIN127|DIN 933|DIN933|DIN 931|DIN931|DIN 934|DIN934|ISO 4014|ISO 4017|ISO 4032|ISO 7089|ISO 7090"
-Const FAST_IMAGE_FORMAT = "jpg"
-Const IMAGE_WIDTH = 1000
-Const IMAGE_HEIGHT = 750
-Const CREATE_THUMBNAIL_FILES = True
-Const INSERT_THUMBNAIL_FILE_IN_EXCEL = True
-Const INSERT_IMAGES_IN_EXCEL = True
-Const THUMBNAIL_WIDTH = 160
-Const THUMBNAIL_HEIGHT = 120
-Const TEST_MODE = True
-Const TEST_MAX_ROWS = 20
-Const SAVE_EVERY_N_ROWS = 25
-Const RESUME_MODE = True
-Const SKIP_EXISTING_IMAGES = True
-Const OUTPUT_TO_DESKTOP = True
-Const USE_SHADED_WITH_EDGES = True
-Const USE_WHITE_BACKGROUND = True
-Const USE_PARALLEL_PROJECTION = True
-Const IMAGE_CAPTURE_DELAY_SECONDS = 0.15
 
 ' CATIA constants used late-bound.
 Const CAT_CAPTURE_FORMAT_JPEG = 2
 Const CAT_RENDER_SHADING = 0
 Const CAT_RENDER_SHADING_WITH_EDGES = 1
 Const CAT_PROJECTION_CYLINDRIC = 0
-Const CAT_FILE_TYPE_TXT = 0
-Const CAT_FILE_TYPE_HTML = 2
 
 ' Excel constants used late-bound.
-Const XL_OPENXML_WORKBOOK = 51
-Const XL_CENTER = -4108
-Const XL_LEFT = -4131
+Const XL_EXCEL8 = 56
+Const XL_UP = -4162
+Const XL_TO_LEFT = -4159
 Const XL_TOP = -4160
 Const XL_CONTINUOUS = 1
 Const XL_THIN = 2
@@ -57,598 +50,775 @@ Const MSO_FALSE = 0
 
 Dim gFSO
 Dim gShell
-Dim gRootProduct
-Dim gActiveDoc
-Dim gOutputFolder
+Dim gProductDocument
+Dim gProduct
+Dim gRootPartNumber
+Dim gMainDocumentFullName
+Dim gStateFilePath
+Dim gWorkbookFolder
 Dim gImageFolder
 Dim gThumbnailFolder
 Dim gDebugLogPath
-Dim gExcelPath
-Dim gNativeBomPath
-Dim gNativeHeaders
-Dim gBomRows
-Dim gSourceIndex
-Dim gImageCache
+Dim gSelectedBomExcelPath
+Dim gWorkExcelPath
+Dim gFinalExcelPath
+Dim gFinalFolder
 Dim gExcelApp
 Dim gWorkbook
 Dim gWsBom
-Dim gWsLog
-Dim gWsSummary
-Dim gWorkbookSaved
+Dim gHeaderRow
 Dim gPartNumberColumnIndex
-Dim gDescriptionColumnIndex
-Dim gThumbnailColumnIndex
+Dim gImageColumnIndex
 Dim gImagePathColumnIndex
-Dim gThumbnailPathColumnIndex
 Dim gExportStatusColumnIndex
 Dim gImageSkipReasonColumnIndex
-Dim gNextLogRow
-Dim gProcessedImageRows
-Dim gSuccessfulImageRows
-Dim gSkippedFastenerRows
+Dim gLastBomRow
+Dim gSourceIndex
+Dim gNeededPartNumbers
+Dim gFoundNeededPartNumbers
+Dim gImageCache
 Dim gCurrentStandaloneDoc
 Dim gCurrentStandaloneOpened
-Dim gMainDocumentFullName
-Dim gAbortMessage
+Dim gProcessedImageRows
+Dim gSuccessfulImageRows
+Dim gReusedImageRows
+Dim gSkippedFastenerRows
+Dim gRowsWithoutPartNumber
+Dim gSourceNotFoundRows
+Dim gImageCaptureFailedRows
+Dim gErrorCount
+Dim gLastMatchMethod
+Dim gLastMatchedRawPartNumber
+Dim gLastMatchedNormalizedPartNumber
+Dim gLastMatchedSourceExtension
+Dim gLastMatchedIsRootAssembly
+Dim gLastMatchedHasChildren
+Dim gLastMatchedDepth
+Dim gLastMatchedProductName
+Dim gLastMatchedCandidateCount
+Dim gLastMatchBlockedReason
+Dim gAbortAlreadyHandled
+Dim gPhase2Success
+Dim gPendingDebugText
 
 Sub CATIA_VISUAL_BOM_EXPORTER()
     On Error Resume Next
+
     InitializeRuntime
     If Not ValidateActiveProductDocument() Then Exit Sub
-    PrepareOutputFolders
-    WriteDebugPhase "START", 0, "", "Native CATIA BOM export started."
+    PrepareWorkFolders
 
-    If Not ExportAndLoadNativeBom() Then
-        AbortWithMessage "CATIA native Bill of Material export nije uspeo. Makro ne koristi rucnu rekonstrukciju BOM-a.", "CATIA_NATIVE_BOM_EXPORT", 0, ""
-        Exit Sub
+    WriteDebugPhase "START", 0, "", "", "", "CATIA_VISUAL_BOM_EXPORTER started."
+
+    If IsWaitingForBomExcelState() Then
+        RunPhase2
+    Else
+        RunPhase1
     End If
 
-    If Not CreateExcelReportFromNativeBom() Then
-        AbortWithMessage "Microsoft Excel nije dostupan ili Excel fajl nije mogao da se napravi.", "EXCEL_CREATED", 0, ""
-        Exit Sub
-    End If
-
-    WriteDebugPhase "CATIA_FILE_INDEX_START", 0, "", "Building Part Number -> source file path index."
-    BuildCatiaFileIndex
-    WriteDebugPhase "CATIA_FILE_INDEX_DONE", 0, "", "Indexed source files: " & CStr(gSourceIndex.Count)
-
-    If Not ProcessBomRowsForThumbnails() Then Exit Sub
-
-    SaveExcelCheckpoint "FINISH", 0, ""
-    UpdateSummarySheet
     CleanupCatiaSession
-    WriteDebugPhase "FINISH", 0, "", "Macro finished."
-    MsgBox "Visual BOM export je zavrsen." & vbCrLf & vbCrLf & _
-           "Excel:" & vbCrLf & gExcelPath, vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
+    Err.Clear
 End Sub
 
 Sub InitializeRuntime()
     Set gFSO = CreateObject("Scripting.FileSystemObject")
     Set gShell = CreateObject("WScript.Shell")
-    Set gNativeHeaders = NewList()
-    Set gBomRows = NewList()
     Set gSourceIndex = CreateObject("Scripting.Dictionary")
+    Set gNeededPartNumbers = CreateObject("Scripting.Dictionary")
+    Set gFoundNeededPartNumbers = CreateObject("Scripting.Dictionary")
     Set gImageCache = CreateObject("Scripting.Dictionary")
     gSourceIndex.CompareMode = 1
+    gNeededPartNumbers.CompareMode = 1
+    gFoundNeededPartNumbers.CompareMode = 1
     gImageCache.CompareMode = 1
     Set gExcelApp = Nothing
     Set gWorkbook = Nothing
     Set gWsBom = Nothing
-    Set gWsLog = Nothing
-    Set gWsSummary = Nothing
-    gWorkbookSaved = False
     Set gCurrentStandaloneDoc = Nothing
     gCurrentStandaloneOpened = False
-    gPartNumberColumnIndex = 0
-    gDescriptionColumnIndex = 0
-    gThumbnailColumnIndex = 0
-    gImagePathColumnIndex = 0
-    gThumbnailPathColumnIndex = 0
-    gExportStatusColumnIndex = 0
-    gImageSkipReasonColumnIndex = 0
-    gNextLogRow = 2
     gProcessedImageRows = 0
     gSuccessfulImageRows = 0
+    gReusedImageRows = 0
     gSkippedFastenerRows = 0
-    gAbortMessage = ""
+    gRowsWithoutPartNumber = 0
+    gSourceNotFoundRows = 0
+    gImageCaptureFailedRows = 0
+    gErrorCount = 0
+    ResetLastSourceMatch
+    gAbortAlreadyHandled = False
+    gPhase2Success = False
+    gPendingDebugText = ""
     Randomize
 End Sub
 
 Function ValidateActiveProductDocument()
     On Error Resume Next
     ValidateActiveProductDocument = False
+
     If CATIA.Documents.Count = 0 Then
-        MsgBox "Nema otvorenog CATIA dokumenta. Otvorite CATProduct i pokrenite makro.", vbExclamation, "CATIA_VISUAL_BOM_EXPORTER"
+        MsgBox "Nema otvorenog CATIA dokumenta. Otvorite glavni CATProduct i pokrenite makro.", vbExclamation, "CATIA_VISUAL_BOM_EXPORTER"
         Exit Function
     End If
-    Set gActiveDoc = CATIA.ActiveDocument
-    If Not IsActiveDocumentProduct(gActiveDoc) Then
+
+    Set gProductDocument = CATIA.ActiveDocument
+    Set gProduct = gProductDocument.Product
+    If Err.Number <> 0 Or gProduct Is Nothing Then
+        Err.Clear
         MsgBox "Aktivni dokument mora biti CATProduct.", vbExclamation, "CATIA_VISUAL_BOM_EXPORTER"
         Exit Function
     End If
-    Set gRootProduct = gActiveDoc.Product
-    gMainDocumentFullName = GetDocumentFullName(gActiveDoc)
+
+    gRootPartNumber = GetProductPartNumber(gProduct)
+    If gRootPartNumber = "" Then gRootPartNumber = SafeFileName(gProduct.Name)
+    If gRootPartNumber = "" Then gRootPartNumber = "CATIA_PRODUCT"
+    gMainDocumentFullName = GetDocumentFullName(gProductDocument)
     ValidateActiveProductDocument = True
     Err.Clear
 End Function
 
-Function IsActiveDocumentProduct(doc)
+Sub PrepareWorkFolders()
     On Error Resume Next
-    Dim p
-    Set p = doc.Product
-    IsActiveDocumentProduct = (Err.Number = 0 And Not p Is Nothing)
-    Err.Clear
-End Function
-
-Sub PrepareOutputFolders()
-    Dim rootName
-    Dim baseFolder
-    rootName = SafeFileName(FirstNonEmpty(GetProductPartNumber(gRootProduct), gRootProduct.Name, "CATProduct"))
-    If rootName = "" Then rootName = "CATProduct"
-
-    If OUTPUT_TO_DESKTOP Then
-        baseFolder = gShell.SpecialFolders("Desktop")
-    Else
-        baseFolder = CStr(gActiveDoc.Path)
-        If baseFolder = "" Then baseFolder = gShell.SpecialFolders("Desktop")
-    End If
-
-    gOutputFolder = JoinPath(baseFolder, rootName & "_VISUAL_BOM_EXPORT")
-    gImageFolder = JoinPath(gOutputFolder, "IMAGES")
-    gThumbnailFolder = JoinPath(gOutputFolder, "THUMBNAILS")
-    gDebugLogPath = JoinPath(gOutputFolder, "DEBUG_PHASE_LOG.txt")
-    gExcelPath = JoinPath(gOutputFolder, "VISUAL_BOM_EXPORT.xlsx")
-
-    EnsureFolder gOutputFolder
+    EnsureFolder "C:\Temp"
+    EnsureFolder WORK_ROOT
+    gWorkbookFolder = JoinPath(WORK_ROOT, "WORKBOOK")
+    gImageFolder = JoinPath(WORK_ROOT, "IMAGES")
+    gThumbnailFolder = JoinPath(WORK_ROOT, "THUMBNAILS")
+    gDebugLogPath = JoinPath(WORK_ROOT, "DEBUG_PHASE_LOG.txt")
+    gStateFilePath = JoinPath(WORK_ROOT, STATE_FILE_NAME)
+    EnsureFolder gWorkbookFolder
     EnsureFolder gImageFolder
     EnsureFolder gThumbnailFolder
+    Err.Clear
 End Sub
 
-Function ExportAndLoadNativeBom()
+Function IsWaitingForBomExcelState()
     On Error Resume Next
-    ExportAndLoadNativeBom = False
-    WriteDebugPhase "CATIA_NATIVE_BOM_EXPORT_START", 0, GetProductPartNumber(gRootProduct), "Trying Product.ExtractBOM."
-
-    Dim fileTypes
-    Dim fileExts
-    Dim i
-    Dim candidatePath
-    fileTypes = Array(CAT_FILE_TYPE_TXT, 1, CAT_FILE_TYPE_HTML)
-    fileExts = Array("txt", "txt", "html")
-
-    For i = LBound(fileTypes) To UBound(fileTypes)
-        ResetNativeBomData
-        candidatePath = JoinPath(gOutputFolder, "~CATIA_NATIVE_BOM." & CStr(fileExts(i)))
-        If gFSO.FileExists(candidatePath) Then gFSO.DeleteFile candidatePath, True
-        Err.Clear
-        gRootProduct.ExtractBOM CLng(fileTypes(i)), candidatePath
-        If Err.Number = 0 And gFSO.FileExists(candidatePath) Then
-            If LoadNativeBomFile(candidatePath) Then
-                gNativeBomPath = candidatePath
-                WriteDebugPhase "CATIA_NATIVE_BOM_EXPORT_DONE", 0, "", "Native BOM rows: " & CStr(ListCount(gBomRows)) & "; file=" & candidatePath
-                WriteDebugPhase "BOM_HEADERS_READ", 0, "", JoinHeaderNames()
-                gFSO.DeleteFile candidatePath, True
-                ExportAndLoadNativeBom = True
-                Exit Function
-            End If
-        End If
-        Err.Clear
-    Next
+    IsWaitingForBomExcelState = False
+    If Not gFSO.FileExists(gStateFilePath) Then Exit Function
+    IsWaitingForBomExcelState = (UCase(ReadStateValue("status")) = "WAITING_FOR_BOM_EXCEL")
+    Err.Clear
 End Function
 
-Sub ResetNativeBomData()
-    Set gNativeHeaders = NewList()
-    Set gBomRows = NewList()
-End Sub
-
-Function LoadNativeBomFile(filePath)
+Sub RunPhase1()
     On Error Resume Next
-    LoadNativeBomFile = False
-    Dim ts
-    Dim txt
-    If Not gFSO.FileExists(filePath) Then Exit Function
-    Set ts = gFSO.OpenTextFile(filePath, 1, False)
-    If Err.Number <> 0 Then
-        Err.Clear
-        Exit Function
-    End If
-    txt = ts.ReadAll
-    ts.Close
 
-    If InStr(1, LCase(filePath), ".htm", vbTextCompare) > 0 Then
-        LoadNativeBomFile = LoadHtmlBomText(txt)
+    WriteStateFile
+    WriteDebugPhase "PHASE1_PREPARED", 0, "", "", gStateFilePath, "Phase 1 prepared."
+
+    MsgBox "PHASE 1 je pripremljena." & vbCrLf & vbCrLf & _
+           "Sada uradite:" & vbCrLf & _
+           "1. Analyze -> Bill of Material" & vbCrLf & _
+           "2. Define Bill of Material / Define formats" & vbCrLf & _
+           "3. Podesite BOM kako zelite" & vbCrLf & _
+           "4. Save as Excel" & vbCrLf & _
+           "5. Ponovo pokrenite ovaj isti makro da doda slike.", _
+           vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
+
+    Err.Clear
+    CATIA.StartCommand "Bill of Material"
+    If Err.Number = 0 Then
+        WriteDebugPhase "BILL_OF_MATERIAL_COMMAND_STARTED_OR_SKIPPED", 0, "", "", "", "CATIA command started."
     Else
-        LoadNativeBomFile = LoadDelimitedBomText(txt)
+        WriteDebugPhase "BILL_OF_MATERIAL_COMMAND_STARTED_OR_SKIPPED", 0, "", "", "", "CATIA command could not be started; user must open it manually. Err.Number=" & CStr(Err.Number) & "; Err.Description=" & Err.Description
+        Err.Clear
     End If
-    LoadNativeBomFile = (LoadNativeBomFile And ListCount(gNativeHeaders) > 0 And ListCount(gBomRows) > 0)
-    Err.Clear
-End Function
 
-Function LoadDelimitedBomText(txt)
+    CATIA.StatusBar = ""
+    Err.Clear
+End Sub
+
+Sub RunPhase2()
     On Error Resume Next
-    LoadDelimitedBomText = False
-    Dim lines
-    Dim i
+    WriteDebugPhase "PHASE2_STARTED", 0, "", "", gStateFilePath, "Phase 2 started."
+
+    gSelectedBomExcelPath = AskUserForExistingBomExcel()
+    If gSelectedBomExcelPath = "" Then
+        MsgBox "Export je otkazan od strane korisnika.", vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
+        WriteDebugPhase "ERROR", 0, "", "", "", "User cancelled existing BOM Excel selection."
+        Exit Sub
+    End If
+    WriteDebugPhase "EXISTING_BOM_EXCEL_SELECTED", 0, "", "", gSelectedBomExcelPath, gSelectedBomExcelPath
+
+    gFinalFolder = AskUserForOutputFolder(GetDefaultOutputFolder())
+    If gFinalFolder = "" Then
+        MsgBox "Export je otkazan od strane korisnika.", vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
+        WriteDebugPhase "ERROR", 0, "", "", "", "User cancelled final folder selection."
+        Exit Sub
+    End If
+    WriteDebugPhase "FINAL_FOLDER_SELECTED", 0, "", "", gFinalFolder, gFinalFolder
+
+    gFinalExcelPath = BuildFinalExcelPath(gFinalFolder, gSelectedBomExcelPath)
+    gFinalExcelPath = ResolveExistingOutputFile(gFinalExcelPath)
+    If gFinalExcelPath = "" Then
+        MsgBox "Export je otkazan od strane korisnika.", vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
+        Exit Sub
+    End If
+
+    If Not CreateLocalWorkbookCopy(gSelectedBomExcelPath) Then
+        AbortPhase2 "Ne mogu da napravim lokalnu kopiju BOM Excela. Proverite da li je fajl otvoren ili zakljucan.", "LOCAL_WORKBOOK_CREATED", 0, "", "", ""
+        Exit Sub
+    End If
+
+    If Not OpenLocalWorkbookAndPrepareColumns() Then
+        If Not gAbortAlreadyHandled Then AbortPhase2 "Ne mogu da pripremim Excel BOM za slike.", "EXCEL_OPENED", 0, "", "", ""
+        Exit Sub
+    End If
+
+    BuildNeededPartNumbersFromBomRows
+    BuildCatiaFileIndex
+    ProcessBomRowsForThumbnails
+
+    If Not gAbortAlreadyHandled Then
+        SaveExcelCheckpoint "Before final save", 0, "", ""
+        If FinalSaveWorkbook() Then
+            gPhase2Success = True
+            ClearStateFile
+            WriteDebugPhase "FINISH", 0, "", "", gFinalExcelPath, "Phase 2 finished."
+            MsgBox "Gotovo. Finalni Excel je snimljen:" & vbCrLf & vbCrLf & gFinalExcelPath, vbInformation, "CATIA_VISUAL_BOM_EXPORTER"
+        End If
+    End If
+    Err.Clear
+End Sub
+
+Sub WriteStateFile()
+    On Error Resume Next
+    Dim ts
+    Set ts = gFSO.OpenTextFile(gStateFilePath, 2, True)
+    ts.WriteLine "status=WAITING_FOR_BOM_EXCEL"
+    ts.WriteLine "root_full_path=" & gMainDocumentFullName
+    ts.WriteLine "root_part_number=" & gRootPartNumber
+    ts.WriteLine "phase1_datetime=" & CStr(Now)
+    ts.WriteLine "work_folder=" & WORK_ROOT
+    ts.Close
+    WriteDebugPhase "STATE_FILE_WRITTEN", 0, "", "", gStateFilePath, "State file written."
+    Err.Clear
+End Sub
+
+Function ReadStateValue(keyName)
+    On Error Resume Next
+    ReadStateValue = ""
+    If Not gFSO.FileExists(gStateFilePath) Then Exit Function
+    Dim ts
     Dim lineText
-    Dim delim
-    Dim cells
-    Dim headerFound
-    lines = Split(Replace(txt, vbCr, vbLf), vbLf)
-    headerFound = False
-
-    For i = LBound(lines) To UBound(lines)
-        lineText = Trim(CStr(lines(i)))
-        If lineText <> "" Then
-            delim = DetectDelimiter(lineText)
-            If delim <> "" Then
-                cells = ParseDelimitedLine(lineText, delim)
-                If Not headerFound Then
-                    If LooksLikeBomHeader(cells) Then
-                        AddHeaderArray cells
-                        headerFound = True
-                    End If
-                Else
-                    AddBomRowArray cells
-                End If
+    Dim p
+    Set ts = gFSO.OpenTextFile(gStateFilePath, 1, False)
+    Do Until ts.AtEndOfStream
+        lineText = ts.ReadLine
+        p = InStr(1, lineText, "=", vbTextCompare)
+        If p > 0 Then
+            If LCase(Left(lineText, p - 1)) = LCase(keyName) Then
+                ReadStateValue = Mid(lineText, p + 1)
+                Exit Do
             End If
         End If
-    Next
+    Loop
+    ts.Close
+    Err.Clear
+End Function
 
-    If Not headerFound Then
-        For i = LBound(lines) To UBound(lines)
-            lineText = Trim(CStr(lines(i)))
-            delim = DetectDelimiter(lineText)
-            If delim <> "" Then
-                cells = ParseDelimitedLine(lineText, delim)
-                If CountUsefulCells(cells) >= 2 Then
-                    AddHeaderArray cells
-                    headerFound = True
-                    Exit For
-                End If
-            End If
-        Next
-        If headerFound Then
-            For i = i + 1 To UBound(lines)
-                lineText = Trim(CStr(lines(i)))
-                delim = DetectDelimiter(lineText)
-                If delim <> "" Then AddBomRowArray ParseDelimitedLine(lineText, delim)
-            Next
-        End If
+Sub ClearStateFile()
+    On Error Resume Next
+    If gFSO.FileExists(gStateFilePath) Then gFSO.DeleteFile gStateFilePath, True
+    WriteDebugPhase "STATE_FILE_CLEARED", 0, "", "", gStateFilePath, "State file cleared."
+    Err.Clear
+End Sub
+
+Function AskUserForExistingBomExcel()
+    On Error Resume Next
+    AskUserForExistingBomExcel = ""
+    Dim selectedPath
+    selectedPath = AskUserForExistingBomExcelWithExcelDialog()
+    If selectedPath = "__CANCEL__" Then Exit Function
+    If selectedPath <> "" Then
+        AskUserForExistingBomExcel = selectedPath
+        Exit Function
     End If
-
-    LoadDelimitedBomText = (ListCount(gNativeHeaders) > 0 And ListCount(gBomRows) > 0)
+    selectedPath = AskUserForExistingBomExcelWithCatiaDialog()
+    If selectedPath = "__CANCEL__" Then Exit Function
+    If selectedPath <> "" Then
+        AskUserForExistingBomExcel = selectedPath
+        Exit Function
+    End If
+    AskUserForExistingBomExcel = AskUserForExistingBomExcelInputBox()
     Err.Clear
 End Function
 
-Function LoadHtmlBomText(txt)
+Function AskUserForExistingBomExcelWithExcelDialog()
     On Error Resume Next
-    LoadHtmlBomText = False
-    Dim reTr
-    Dim reCell
-    Dim rows
-    Dim rowMatch
-    Dim cellMatches
-    Dim cellMatch
-    Dim values
-    Dim headerFound
-
-    Set reTr = CreateObject("VBScript.RegExp")
-    reTr.Global = True
-    reTr.IgnoreCase = True
-    reTr.Pattern = "<tr[\s\S]*?</tr>"
-
-    Set reCell = CreateObject("VBScript.RegExp")
-    reCell.Global = True
-    reCell.IgnoreCase = True
-    reCell.Pattern = "<t[dh][^>]*>([\s\S]*?)</t[dh]>"
-
-    Set rows = reTr.Execute(txt)
-    headerFound = False
-    For Each rowMatch In rows
-        Set cellMatches = reCell.Execute(CStr(rowMatch.Value))
-        If cellMatches.Count > 0 Then
-            values = EmptyArray()
-            For Each cellMatch In cellMatches
-                values = ArrayPush(values, HtmlToText(CStr(cellMatch.SubMatches(0))))
-            Next
-            If Not headerFound Then
-                If LooksLikeBomHeader(values) Or CountUsefulCells(values) >= 2 Then
-                    AddHeaderArray values
-                    headerFound = True
-                End If
-            Else
-                AddBomRowArray values
-            End If
-        End If
-    Next
-    LoadHtmlBomText = (ListCount(gNativeHeaders) > 0 And ListCount(gBomRows) > 0)
-    Err.Clear
-End Function
-
-Sub AddHeaderArray(cells)
-    Dim i
-    Dim h
-    Set gNativeHeaders = NewList()
-    For i = LBound(cells) To UBound(cells)
-        h = Trim(CStr(cells(i)))
-        If h = "" Then h = "Column " & CStr(i + 1)
-        ListAddValue gNativeHeaders, h
-    Next
-    gPartNumberColumnIndex = FindHeaderIndexInList(gNativeHeaders, "Part Number|Number|PartNumber|Broj dela|Br. dela")
-    gDescriptionColumnIndex = FindHeaderIndexInList(gNativeHeaders, "Nomenclature|Description|Keywords|Naziv")
-End Sub
-
-Sub AddBomRowArray(cells)
-    On Error Resume Next
-    If CountUsefulCells(cells) = 0 Then Exit Sub
-    If IsSeparatorRow(cells) Then Exit Sub
-
-    Dim values
-    Dim i
-    Set values = NewList()
-    For i = 1 To ListCount(gNativeHeaders)
-        If (i - 1) <= UBound(cells) Then
-            ListAddValue values, Trim(CStr(cells(i - 1)))
-        Else
-            ListAddValue values, ""
-        End If
-    Next
-
-    Dim rec
-    Set rec = CreateObject("Scripting.Dictionary")
-    Set rec.Item("Values") = values
-    rec.Item("ExcelRow") = CLng(ListCount(gBomRows) + 2)
-    rec.Item("ImagePath") = ""
-    rec.Item("ThumbnailPath") = ""
-    rec.Item("ExportStatus") = ""
-    rec.Item("ImageSkipReason") = ""
-    ListAddObject gBomRows, rec
-    Err.Clear
-End Sub
-
-Function CreateExcelReportFromNativeBom()
-    On Error Resume Next
-    CreateExcelReportFromNativeBom = False
-    Set gExcelApp = CreateObject("Excel.Application")
-    If Err.Number <> 0 Or gExcelApp Is Nothing Then
+    AskUserForExistingBomExcelWithExcelDialog = ""
+    Dim xl
+    Dim fd
+    Set xl = CreateObject("Excel.Application")
+    If Err.Number <> 0 Or xl Is Nothing Then
         Err.Clear
         Exit Function
     End If
-    gExcelApp.Visible = False
+    xl.Visible = False
+    Set fd = xl.FileDialog(3)
+    If Err.Number <> 0 Or fd Is Nothing Then
+        xl.Quit
+        Set xl = Nothing
+        Err.Clear
+        Exit Function
+    End If
+    fd.Title = "Izaberite CATIA BOM Excel koji ste rucno snimili"
+    fd.AllowMultiSelect = False
+    fd.Filters.Clear
+    fd.Filters.Add "Excel files", "*.xls;*.xlsx;*.xlsm"
+    If fd.Show = -1 Then
+        AskUserForExistingBomExcelWithExcelDialog = CStr(fd.SelectedItems(1))
+    Else
+        AskUserForExistingBomExcelWithExcelDialog = "__CANCEL__"
+    End If
+    xl.Quit
+    Set xl = Nothing
+    Err.Clear
+End Function
+
+Function AskUserForExistingBomExcelWithCatiaDialog()
+    On Error Resume Next
+    AskUserForExistingBomExcelWithCatiaDialog = ""
+    AskUserForExistingBomExcelWithCatiaDialog = CStr(CATIA.FileSelectionBox("Izaberite CATIA BOM Excel koji ste rucno snimili", "*.xls;*.xlsx;*.xlsm", 0))
+    If Err.Number <> 0 Then
+        AskUserForExistingBomExcelWithCatiaDialog = ""
+        Err.Clear
+    ElseIf Trim(AskUserForExistingBomExcelWithCatiaDialog) = "" Then
+        AskUserForExistingBomExcelWithCatiaDialog = "__CANCEL__"
+    End If
+End Function
+
+Function AskUserForExistingBomExcelInputBox()
+    On Error Resume Next
+    Dim p
+    p = InputBox("Unesite punu putanju do CATIA BOM Excel fajla (*.xls, *.xlsx, *.xlsm):", "CATIA_VISUAL_BOM_EXPORTER")
+    p = Trim(CStr(p))
+    If p <> "" And gFSO.FileExists(p) Then
+        AskUserForExistingBomExcelInputBox = p
+    Else
+        AskUserForExistingBomExcelInputBox = ""
+    End If
+    Err.Clear
+End Function
+
+Function AskUserForOutputFolder(defaultFolder)
+    On Error Resume Next
+    AskUserForOutputFolder = ""
+    Dim selectedFolder
+    selectedFolder = AskUserForOutputFolderExcelDialog(defaultFolder)
+    If selectedFolder = "__CANCEL__" Then Exit Function
+    If selectedFolder <> "" Then
+        AskUserForOutputFolder = selectedFolder
+        Exit Function
+    End If
+    selectedFolder = AskUserForOutputFolderShell(defaultFolder)
+    If selectedFolder = "__CANCEL__" Then Exit Function
+    If selectedFolder <> "" Then
+        AskUserForOutputFolder = selectedFolder
+        Exit Function
+    End If
+    AskUserForOutputFolder = AskUserForOutputFolderInputBox(defaultFolder)
+    Err.Clear
+End Function
+
+Function AskUserForOutputFolderExcelDialog(defaultFolder)
+    On Error Resume Next
+    AskUserForOutputFolderExcelDialog = ""
+    Dim xl
+    Dim fd
+    Set xl = CreateObject("Excel.Application")
+    If Err.Number <> 0 Or xl Is Nothing Then
+        Err.Clear
+        Exit Function
+    End If
+    xl.Visible = False
+    Set fd = xl.FileDialog(4)
+    If Err.Number <> 0 Or fd Is Nothing Then
+        xl.Quit
+        Set xl = Nothing
+        Err.Clear
+        Exit Function
+    End If
+    fd.Title = "Izaberite folder za finalni Excel sa slikama"
+    fd.AllowMultiSelect = False
+    If CStr(defaultFolder) <> "" Then fd.InitialFileName = AddTrailingSlash(defaultFolder)
+    If fd.Show = -1 Then
+        AskUserForOutputFolderExcelDialog = CStr(fd.SelectedItems(1))
+    Else
+        AskUserForOutputFolderExcelDialog = "__CANCEL__"
+    End If
+    xl.Quit
+    Set xl = Nothing
+    Err.Clear
+End Function
+
+Function AskUserForOutputFolderShell(defaultFolder)
+    On Error Resume Next
+    AskUserForOutputFolderShell = ""
+    Dim shellApp
+    Dim folder
+    Set shellApp = CreateObject("Shell.Application")
+    If Err.Number <> 0 Or shellApp Is Nothing Then
+        Err.Clear
+        Exit Function
+    End If
+    Set folder = shellApp.BrowseForFolder(0, "Izaberite folder za finalni Excel sa slikama", 0, defaultFolder)
+    If folder Is Nothing Then
+        AskUserForOutputFolderShell = "__CANCEL__"
+        Exit Function
+    End If
+    AskUserForOutputFolderShell = CStr(folder.Self.Path)
+    Err.Clear
+End Function
+
+Function AskUserForOutputFolderInputBox(defaultFolder)
+    On Error Resume Next
+    Dim p
+    p = InputBox("Unesite/potvrdite folder za finalni Excel sa slikama:", "CATIA_VISUAL_BOM_EXPORTER", defaultFolder)
+    p = Trim(CStr(p))
+    If p <> "" And gFSO.FolderExists(p) Then
+        AskUserForOutputFolderInputBox = p
+    Else
+        AskUserForOutputFolderInputBox = ""
+    End If
+    Err.Clear
+End Function
+
+Function BuildFinalExcelPath(finalFolder, originalExcelPath)
+    Dim baseName
+    baseName = SafeFileName(gFSO.GetBaseName(originalExcelPath))
+    If baseName = "" Then baseName = "BOM"
+    BuildFinalExcelPath = JoinPath(finalFolder, baseName & "_WITH_IMAGES.xls")
+End Function
+
+Function ResolveExistingOutputFile(xlsPath)
+    On Error Resume Next
+    ResolveExistingOutputFile = xlsPath
+    If Not gFSO.FileExists(xlsPath) Then Exit Function
+
+    Dim answer
+    answer = MsgBox("Fajl vec postoji:" & vbCrLf & xlsPath & vbCrLf & vbCrLf & _
+                    "YES = zameni postojeci fajl" & vbCrLf & _
+                    "NO = napravi novi fajl sa timestamp nastavkom" & vbCrLf & _
+                    "CANCEL = prekini export", _
+                    vbYesNoCancel + vbQuestion, "CATIA_VISUAL_BOM_EXPORTER")
+    If answer = vbYes Then
+        gFSO.DeleteFile xlsPath, True
+        If Err.Number <> 0 Then
+            MsgBox "Ne mogu da obrisem postojeci Excel. Zatvorite fajl ako je otvoren:" & vbCrLf & xlsPath, vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
+            Err.Clear
+            ResolveExistingOutputFile = ""
+        End If
+    ElseIf answer = vbNo Then
+        ResolveExistingOutputFile = Replace(xlsPath, ".xls", "_" & TimestampForFile() & ".xls")
+    Else
+        ResolveExistingOutputFile = ""
+    End If
+    Err.Clear
+End Function
+
+Function CreateLocalWorkbookCopy(sourceExcelPath)
+    On Error Resume Next
+    CreateLocalWorkbookCopy = False
+    EnsureFolder gWorkbookFolder
+    gWorkExcelPath = JoinPath(gWorkbookFolder, SafeFileName(gFSO.GetBaseName(sourceExcelPath)) & "_WORK.xls")
+    If gFSO.FileExists(gWorkExcelPath) Then
+        Err.Clear
+        gFSO.DeleteFile gWorkExcelPath, True
+        If Err.Number <> 0 Then
+            Err.Clear
+            Exit Function
+        End If
+    End If
+
+    If LCase(gFSO.GetExtensionName(sourceExcelPath)) = "xls" Then
+        gFSO.CopyFile sourceExcelPath, gWorkExcelPath, True
+    Else
+        If Not EnsureExcelApp() Then Exit Function
+        Dim tempWb
+        gExcelApp.DisplayAlerts = False
+        Set tempWb = gExcelApp.Workbooks.Open(sourceExcelPath)
+        If Err.Number <> 0 Or tempWb Is Nothing Then
+            Err.Clear
+            Exit Function
+        End If
+        tempWb.SaveAs gWorkExcelPath, XL_EXCEL8
+        tempWb.Close False
+        gExcelApp.DisplayAlerts = True
+    End If
+
+    If gFSO.FileExists(gWorkExcelPath) Then
+        WriteDebugPhase "LOCAL_WORKBOOK_CREATED", 0, "", "", gWorkExcelPath, "Local workbook copy created."
+        CreateLocalWorkbookCopy = True
+    End If
+    Err.Clear
+End Function
+
+Function OpenLocalWorkbookAndPrepareColumns()
+    On Error Resume Next
+    OpenLocalWorkbookAndPrepareColumns = False
+    If Not EnsureExcelApp() Then
+        MsgBox "Microsoft Excel nije dostupan.", vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
+        Exit Function
+    End If
+
+    gExcelApp.Visible = True
     gExcelApp.DisplayAlerts = False
     gExcelApp.ScreenUpdating = False
+    Set gWorkbook = gExcelApp.Workbooks.Open(gWorkExcelPath)
+    If Err.Number <> 0 Or gWorkbook Is Nothing Then
+        Err.Clear
+        Exit Function
+    End If
 
-    Set gWorkbook = gExcelApp.Workbooks.Add
-    Do While gWorkbook.Worksheets.Count < 3
-        gWorkbook.Worksheets.Add
-    Loop
-    Do While gWorkbook.Worksheets.Count > 3
-        gWorkbook.Worksheets(gWorkbook.Worksheets.Count).Delete
-    Loop
     Set gWsBom = gWorkbook.Worksheets(1)
-    Set gWsLog = gWorkbook.Worksheets(2)
-    Set gWsSummary = gWorkbook.Worksheets(3)
-    gWsBom.Name = "BOM"
-    gWsLog.Name = "EXPORT_LOG"
-    gWsSummary.Name = "SUMMARY"
+    WriteDebugPhase "EXCEL_OPENED", 0, "", "", gWorkExcelPath, "Local workbook opened."
 
-    PrepareBomSheet
-    PrepareLogSheet
-    PrepareSummarySheet
-    WriteNativeBomRowsToExcel
-    SaveExcelCheckpoint "EXCEL_CREATED", 0, ""
-    WriteDebugPhase "EXCEL_CREATED", 0, "", gExcelPath
-    CreateExcelReportFromNativeBom = True
+    If Not FindBomHeaderRowAndPartNumberColumn() Then
+        SaveExcelCheckpoint "Part Number column missing", 0, "", ""
+        MsgBox "Part Number / Part No. kolona nije pronadjena u BOM-u. Proverite naziv kolone.", vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
+        Exit Function
+    End If
+    WriteDebugPhase "PART_NUMBER_COLUMN_FOUND", gHeaderRow, "", "", "", "Column=" & CStr(gPartNumberColumnIndex)
+
+    EnsureImageAndHelperColumns
+    gLastBomRow = LastUsedRow(gWsBom)
+    SaveExcelCheckpoint "EXCEL_OPENED", 0, "", ""
+    OpenLocalWorkbookAndPrepareColumns = True
     Err.Clear
 End Function
 
-Sub PrepareBomSheet()
-    Dim insertAfter
-    Dim c
-    Dim outCol
-    Dim headerText
+Function EnsureExcelApp()
+    On Error Resume Next
+    EnsureExcelApp = False
+    If Not gExcelApp Is Nothing Then
+        EnsureExcelApp = True
+        Exit Function
+    End If
+    Set gExcelApp = CreateObject("Excel.Application")
+    If Err.Number = 0 And Not gExcelApp Is Nothing Then EnsureExcelApp = True
+    Err.Clear
+End Function
 
-    insertAfter = gPartNumberColumnIndex
-    If insertAfter <= 0 Then insertAfter = 1
-    outCol = 1
-    For c = 1 To ListCount(gNativeHeaders)
-        headerText = CStr(ListValue(gNativeHeaders, c))
-        gWsBom.Cells(1, outCol).Value = headerText
-        outCol = outCol + 1
-        If c = insertAfter Then
-            gThumbnailColumnIndex = outCol
-            gWsBom.Cells(1, outCol).Value = "Thumbnail"
-            outCol = outCol + 1
-        End If
-    Next
-    gImagePathColumnIndex = outCol
-    gWsBom.Cells(1, outCol).Value = "Image Path"
-    outCol = outCol + 1
-    gThumbnailPathColumnIndex = outCol
-    gWsBom.Cells(1, outCol).Value = "Thumbnail Path"
-    outCol = outCol + 1
-    gExportStatusColumnIndex = outCol
-    gWsBom.Cells(1, outCol).Value = "Export Status"
-    outCol = outCol + 1
-    gImageSkipReasonColumnIndex = outCol
-    gWsBom.Cells(1, outCol).Value = "Image Skip Reason"
-
-    gWsBom.Rows(1).Font.Bold = True
-    gWsBom.Rows(1).HorizontalAlignment = XL_CENTER
-    gWsBom.Columns(gThumbnailColumnIndex).ColumnWidth = 24
-    gWsBom.Columns(gImagePathColumnIndex).ColumnWidth = 45
-    gWsBom.Columns(gThumbnailPathColumnIndex).ColumnWidth = 45
-    gWsBom.Columns(gExportStatusColumnIndex).ColumnWidth = 22
-    gWsBom.Columns(gImageSkipReasonColumnIndex).ColumnWidth = 40
-End Sub
-
-Sub PrepareLogSheet()
-    gWsLog.Cells(1, 1).Value = "No."
-    gWsLog.Cells(1, 2).Value = "Date/Time"
-    gWsLog.Cells(1, 3).Value = "Excel Row"
-    gWsLog.Cells(1, 4).Value = "Part Number"
-    gWsLog.Cells(1, 5).Value = "Status"
-    gWsLog.Cells(1, 6).Value = "Phase"
-    gWsLog.Cells(1, 7).Value = "Message"
-    gWsLog.Cells(1, 8).Value = "Image Path"
-    gWsLog.Cells(1, 9).Value = "Thumbnail Path"
-    gWsLog.Rows(1).Font.Bold = True
-    gWsLog.Columns("A:I").ColumnWidth = 24
-End Sub
-
-Sub PrepareSummarySheet()
-    gWsSummary.Cells(1, 1).Value = "CATIA VISUAL BOM EXPORTER"
-    gWsSummary.Cells(3, 1).Value = "Main Assembly Part Number"
-    gWsSummary.Cells(4, 1).Value = "Export Date/Time"
-    gWsSummary.Cells(5, 1).Value = "Output Folder"
-    gWsSummary.Cells(6, 1).Value = "Excel File"
-    gWsSummary.Cells(7, 1).Value = "Native BOM Rows"
-    gWsSummary.Cells(8, 1).Value = "Images Processed"
-    gWsSummary.Cells(9, 1).Value = "Successful Images"
-    gWsSummary.Cells(10, 1).Value = "Skipped Fasteners"
-    gWsSummary.Cells(11, 1).Value = "Debug Log"
-    gWsSummary.Cells(12, 1).Value = "Mode"
-    gWsSummary.Range("A1:B1").Font.Bold = True
-    gWsSummary.Columns("A").ColumnWidth = 28
-    gWsSummary.Columns("B").ColumnWidth = 95
-    UpdateSummarySheet
-End Sub
-
-Sub WriteNativeBomRowsToExcel()
+Function FindBomHeaderRowAndPartNumberColumn()
+    On Error Resume Next
+    FindBomHeaderRowAndPartNumberColumn = False
+    Dim used
+    Dim maxRow
+    Dim maxCol
     Dim r
     Dim c
-    Dim outCol
-    Dim rec
-    For r = 1 To ListCount(gBomRows)
-        Set rec = ListObject(gBomRows, r)
-        outCol = 1
-        For c = 1 To ListCount(gNativeHeaders)
-            gWsBom.Cells(CLng(rec.Item("ExcelRow")), outCol).Value = GetNativeValue(rec, c)
-            outCol = outCol + 1
-            If outCol = gThumbnailColumnIndex Then outCol = outCol + 1
-        Next
-        gWsBom.Rows(CLng(rec.Item("ExcelRow"))).RowHeight = CLng(THUMBNAIL_HEIGHT * 0.75) + 12
-    Next
-    ApplyBomBorders
-End Sub
+    Dim rawHeader
+    Dim normalizedHeader
+    Dim priority
+    Dim bestPriority
+    Dim bestRow
+    Dim bestCol
+    Set used = gWsBom.UsedRange
+    maxRow = used.Row + used.Rows.Count - 1
+    maxCol = used.Column + used.Columns.Count - 1
+    If maxRow > 30 Then maxRow = 30
+    If maxCol > 120 Then maxCol = 120
 
-Function ProcessBomRowsForThumbnails()
-    On Error Resume Next
-    ProcessBomRowsForThumbnails = False
-    Dim i
-    Dim rec
-    Dim excelRow
-    Dim partNumber
-    Dim status
-    Dim reason
-    Dim sourcePath
-    Dim imagePath
-    Dim thumbPath
-    Dim shouldMakeImage
-    Dim normalizedPartNumber
-
-    For i = 1 To ListCount(gBomRows)
-        Set rec = ListObject(gBomRows, i)
-        excelRow = CLng(rec.Item("ExcelRow"))
-        partNumber = GetPartNumberFromRow(rec)
-        normalizedPartNumber = NormalizePartNumber(partNumber)
-        CATIA.StatusBar = "BOM thumbnail row " & CStr(i) & " / " & CStr(ListCount(gBomRows)) & " - " & partNumber
-        WriteDebugPhase "ROW_START", excelRow, partNumber, "Raw BOM Part Number=" & partNumber & "; Normalized BOM Part Number=" & normalizedPartNumber
-        shouldMakeImage = True
-
-        If SKIP_FASTENER_IMAGES And IsFastenerBomRow(rec) Then
-            gSkippedFastenerRows = gSkippedFastenerRows + 1
-            reason = "Standard fastener - retained in BOM, image skipped"
-            SetBomUtilityValues rec, "", "", "SKIPPED_IMAGE_ONLY", reason
-            WriteExportLog excelRow, partNumber, "SKIPPED_IMAGE_ONLY", "FASTENER_SKIPPED_IMAGE", reason, "", ""
-            WriteDebugPhase "FASTENER_SKIPPED_IMAGE", excelRow, partNumber, reason
-            shouldMakeImage = False
-        End If
-
-        If shouldMakeImage And TEST_MODE And gProcessedImageRows >= TEST_MAX_ROWS Then
-            SetBomUtilityValues rec, "", "", "", "TEST_MODE limit reached; image not processed"
-            shouldMakeImage = False
-        End If
-
-        If shouldMakeImage Then
-            gProcessedImageRows = gProcessedImageRows + 1
-            imagePath = BuildImagePath(partNumber, GetDescriptionFromRow(rec), excelRow)
-            thumbPath = ThumbnailPathForImage(imagePath)
-
-            If ReuseExistingOrCachedImage(partNumber, imagePath, thumbPath, rec) Then
-                If Not InsertThumbnailForRow(excelRow, thumbPath) Then
-                    AbortWithMessage "Excel ne moze da ubaci thumbnail za Part Number: " & partNumber, "EXCEL_THUMBNAIL_INSERTED", excelRow, partNumber
-                    Exit Function
+    bestPriority = 9999
+    bestRow = 0
+    bestCol = 0
+    For r = 1 To maxRow
+        For c = 1 To maxCol
+            rawHeader = CStr(gWsBom.Cells(r, c).Value)
+            If Trim(rawHeader) <> "" Then
+                normalizedHeader = NormalizeHeaderName(rawHeader)
+                WriteDebugPhase "BOM_HEADERS_READ", r, rawHeader, normalizedHeader, "", "Header[" & CStr(c) & "] Raw='" & rawHeader & "' Normalized='" & normalizedHeader & "'"
+                priority = PartNumberHeaderPriority(normalizedHeader)
+                If priority > 0 Then
+                    If priority < bestPriority Then
+                        bestPriority = priority
+                        bestRow = r
+                        bestCol = c
+                    End If
                 End If
-                SetBomUtilityValues rec, imagePath, thumbPath, "EXISTING_REUSED", ""
-                WriteExportLog excelRow, partNumber, "EXISTING_REUSED", "EXCEL_THUMBNAIL_INSERTED", "Existing image/thumbnail reused.", imagePath, thumbPath
-                gSuccessfulImageRows = gSuccessfulImageRows + 1
-                MaybeSaveByProgress excelRow, partNumber
-            Else
-                sourcePath = SourcePathForPartNumber(partNumber)
-                If sourcePath = "" Or Not gFSO.FileExists(sourcePath) Then
-                    SetBomUtilityValues rec, "", "", "SOURCE_FILE_NOT_FOUND", "Source file not found"
-                    WriteExportLog excelRow, partNumber, "SOURCE_FILE_NOT_FOUND", "SOURCE_FILE_NOT_FOUND", "Source file not found for Part Number: " & partNumber & "; normalized=" & normalizedPartNumber, "", ""
-                    WriteDebugPhase "SOURCE_FILE_NOT_FOUND", excelRow, partNumber, "Source file not found for Part Number: " & partNumber & "; normalized=" & normalizedPartNumber
-                    AbortWithMessage "Source file not found for Part Number: " & partNumber, "SOURCE_FILE_NOT_FOUND", excelRow, partNumber
-                    Exit Function
-                End If
-
-                If Not IsSupportedCatiaSourceFile(sourcePath) Then
-                    SetBomUtilityValues rec, "", "", "UNSUPPORTED_SOURCE_FILE", sourcePath
-                    WriteExportLog excelRow, partNumber, "UNSUPPORTED_SOURCE_FILE", "UNSUPPORTED_SOURCE_FILE", sourcePath, "", ""
-                    WriteDebugPhase "UNSUPPORTED_SOURCE_FILE", excelRow, partNumber, sourcePath
-                    AbortWithMessage "Unsupported source file for Part Number: " & partNumber & vbCrLf & sourcePath, "UNSUPPORTED_SOURCE_FILE", excelRow, partNumber
-                    Exit Function
-                End If
-
-                WriteDebugPhase "SOURCE_FILE_FOUND", excelRow, partNumber, "Normalized BOM Part Number=" & normalizedPartNumber & "; Source=" & sourcePath
-                If Not CaptureStandaloneImage(partNumber, sourcePath, imagePath, thumbPath, excelRow) Then
-                    SetBomUtilityValues rec, imagePath, thumbPath, "STANDALONE_CAPTURE_FAILED", "Standalone open/capture failed"
-                    AbortWithMessage "Standalone capture failed for Part Number: " & partNumber, "STANDALONE_CAPTURE_FAILED", excelRow, partNumber
-                    Exit Function
-                End If
-
-                SetBomUtilityValues rec, imagePath, thumbPath, "OK", ""
-                CacheImage partNumber, imagePath, thumbPath
-                If Not InsertThumbnailForRow(excelRow, thumbPath) Then
-                    AbortWithMessage "Excel ne moze da ubaci thumbnail za Part Number: " & partNumber, "EXCEL_THUMBNAIL_INSERTED", excelRow, partNumber
-                    Exit Function
-                End If
-                gSuccessfulImageRows = gSuccessfulImageRows + 1
-                WriteExportLog excelRow, partNumber, "OK", "EXCEL_THUMBNAIL_INSERTED", "Thumbnail inserted.", imagePath, thumbPath
-                MaybeSaveByProgress excelRow, partNumber
             End If
-        End If
-
-        DoEvents
+        Next
     Next
 
-    ProcessBomRowsForThumbnails = True
+    If bestCol > 0 Then
+        gHeaderRow = bestRow
+        gPartNumberColumnIndex = bestCol
+        FindBomHeaderRowAndPartNumberColumn = True
+    End If
     Err.Clear
 End Function
+
+Function IsPartNumberHeader(valueText)
+    IsPartNumberHeader = (PartNumberHeaderPriority(NormalizeHeaderName(valueText)) > 0)
+End Function
+
+Function PartNumberHeaderPriority(normalizedHeader)
+    PartNumberHeaderPriority = 0
+    Select Case CStr(normalizedHeader)
+        Case "PARTNUMBER", "PARTNO", "PN"
+            PartNumberHeaderPriority = 1
+        Case "DRAWINGNO", "DRAWINGNUMBER", "DRWNO", "DRWNODON", "BROJCRTEZA", "BRCRTEZA"
+            PartNumberHeaderPriority = 2
+        Case "OZNAKA", "POZICIJA", "POZICIJADON", "POSITIONDON", "ITEM", "ITEMDON"
+            PartNumberHeaderPriority = 3
+        Case "NUMBER"
+            PartNumberHeaderPriority = 4
+    End Select
+End Function
+
+Function IsImageHeader(valueText)
+    Dim h
+    h = NormalizeHeaderName(valueText)
+    IsImageHeader = (h = "slika" Or h = "image" Or h = "thumbnail" Or h = "picture" Or h = "foto" Or h = "preview")
+End Function
+
+Sub EnsureImageAndHelperColumns()
+    On Error Resume Next
+    gImageColumnIndex = FindImageColumn()
+    If gImageColumnIndex = 0 Then
+        gWsBom.Columns(gPartNumberColumnIndex + 1).Insert
+        gWsBom.Cells(gHeaderRow, gPartNumberColumnIndex + 1).Value = "Thumbnail"
+        gImageColumnIndex = gPartNumberColumnIndex + 1
+    End If
+    gImagePathColumnIndex = EnsureEndHelperColumn("Image Path")
+    gExportStatusColumnIndex = EnsureEndHelperColumn("Export Status")
+    gImageSkipReasonColumnIndex = EnsureEndHelperColumn("Image Skip Reason")
+
+    gWsBom.Columns(gImageColumnIndex).ColumnWidth = 20
+    gWsBom.Columns(gImagePathColumnIndex).ColumnWidth = 45
+    gWsBom.Columns(gExportStatusColumnIndex).ColumnWidth = 24
+    gWsBom.Columns(gImageSkipReasonColumnIndex).ColumnWidth = 45
+    gWsBom.Rows(gHeaderRow).Font.Bold = True
+    ApplyBomBorders
+    WriteDebugPhase "IMAGE_COLUMN_FOUND_OR_CREATED", gHeaderRow, "", "", "", "Image column=" & CStr(gImageColumnIndex)
+    Err.Clear
+End Sub
+
+Function FindImageColumn()
+    On Error Resume Next
+    FindImageColumn = 0
+    Dim used
+    Dim maxCol
+    Dim c
+    Set used = gWsBom.UsedRange
+    maxCol = used.Column + used.Columns.Count - 1
+    For c = 1 To maxCol
+        If IsImageHeader(CStr(gWsBom.Cells(gHeaderRow, c).Value)) Then
+            FindImageColumn = c
+            Exit Function
+        End If
+    Next
+    Err.Clear
+End Function
+
+Function EnsureEndHelperColumn(headerText)
+    On Error Resume Next
+    Dim existing
+    existing = FindHeaderColumn(headerText)
+    If existing > 0 Then
+        EnsureEndHelperColumn = existing
+    Else
+        EnsureEndHelperColumn = LastUsedColumn(gWsBom) + 1
+        gWsBom.Cells(gHeaderRow, EnsureEndHelperColumn).Value = headerText
+    End If
+    Err.Clear
+End Function
+
+Function FindHeaderColumn(headerText)
+    On Error Resume Next
+    FindHeaderColumn = 0
+    Dim used
+    Dim maxCol
+    Dim c
+    Set used = gWsBom.UsedRange
+    maxCol = used.Column + used.Columns.Count - 1
+    For c = 1 To maxCol
+        If NormalizeHeaderName(CStr(gWsBom.Cells(gHeaderRow, c).Value)) = NormalizeHeaderName(headerText) Then
+            FindHeaderColumn = c
+            Exit Function
+        End If
+    Next
+    Err.Clear
+End Function
+
+Sub BuildNeededPartNumbersFromBomRows()
+    On Error Resume Next
+    Set gNeededPartNumbers = CreateObject("Scripting.Dictionary")
+    Set gFoundNeededPartNumbers = CreateObject("Scripting.Dictionary")
+    gNeededPartNumbers.CompareMode = 1
+    gFoundNeededPartNumbers.CompareMode = 1
+
+    Dim rowIndex
+    Dim rawPartNumber
+    Dim normalizedPartNumber
+    Dim candidateRows
+    candidateRows = 0
+
+    For rowIndex = gHeaderRow + 1 To gLastBomRow
+        rawPartNumber = CStr(gWsBom.Cells(rowIndex, gPartNumberColumnIndex).Value)
+        normalizedPartNumber = NormalizePartNumber(rawPartNumber)
+        If normalizedPartNumber <> "" Then
+            If Not (SKIP_FASTENER_IMAGES And IsFastenerExcelRow(rowIndex)) Then
+                candidateRows = candidateRows + 1
+                If Not (TEST_MODE And candidateRows > TEST_MAX_ROWS) Then
+                    If Not ExistingImageAvailable(normalizedPartNumber, rowIndex) Then
+                        If Not gNeededPartNumbers.Exists(normalizedPartNumber) Then gNeededPartNumbers.Item(normalizedPartNumber) = True
+                    End If
+                End If
+            End If
+        End If
+        If (rowIndex Mod 250) = 0 Then DoEvents
+    Next
+
+    WriteDebugPhase "NEEDED_PART_NUMBERS_BUILT", 0, "", "", "", "Unique needed Part Numbers=" & CStr(gNeededPartNumbers.Count)
+    Err.Clear
+End Sub
 
 Sub BuildCatiaFileIndex()
     On Error Resume Next
-    TraverseProductForSourceIndex gRootProduct
+    WriteDebugPhase "CATIA_FILE_INDEX_START", 0, "", "", "", "Indexing source files for needed Part Numbers."
+    CATIA.StatusBar = "Indexing source files: found 0 / " & CStr(gNeededPartNumbers.Count)
+    If gNeededPartNumbers.Count > 0 Then TraverseProductForSourceIndex gProduct, 0
+    WriteDebugPhase "CATIA_FILE_INDEX_DONE", 0, "", "", "", "Found=" & CStr(gFoundNeededPartNumbers.Count) & " / Needed=" & CStr(gNeededPartNumbers.Count)
     Err.Clear
 End Sub
 
-Sub TraverseProductForSourceIndex(prod)
+Sub TraverseProductForSourceIndex(prod, depth)
     On Error Resume Next
-    Dim pn
+    If AllNeededPartNumbersFound() Then Exit Sub
+
+    Dim rawPn
     Dim normalizedPn
     Dim sourcePath
-    pn = GetProductPartNumber(prod)
-    normalizedPn = NormalizePartNumber(pn)
-    sourcePath = GetProductSourceFilePath(prod)
-    If pn <> "" Then WriteDebugPhase "CATIA_FILE_INDEX_ITEM", 0, pn, "Raw ProductTree Part Number=" & pn & "; Normalized ProductTree Part Number=" & normalizedPn & "; Source=" & sourcePath
-    If pn <> "" And sourcePath <> "" Then
-        If Not SamePath(sourcePath, gMainDocumentFullName) Or normalizedPn = NormalizePartNumber(GetProductPartNumber(gRootProduct)) Then
-            If Not gSourceIndex.Exists(normalizedPn) Then gSourceIndex.Item(normalizedPn) = sourcePath
+    Dim ext
+    Dim isRoot
+    Dim hasChildren
+    Dim productName
+    rawPn = GetProductPartNumber(prod)
+    normalizedPn = NormalizePartNumber(rawPn)
+    If ShouldIndexPartNumber(normalizedPn) Then
+        sourcePath = GetProductSourceFilePath(prod)
+        If normalizedPn <> "" And sourcePath <> "" Then
+            ext = UCase(gFSO.GetExtensionName(sourcePath))
+            isRoot = SamePath(sourcePath, gMainDocumentFullName)
+            hasChildren = ProductHasChildren(prod)
+            productName = CStr(prod.Name)
+            WriteDebugPhase "CATIA_FILE_INDEX_ITEM", 0, rawPn, normalizedPn, sourcePath, _
+                "ProductName=" & productName & _
+                "; Extension=" & ext & _
+                "; IsRootAssembly=" & CStr(isRoot) & _
+                "; HasChildren=" & CStr(hasChildren) & _
+                "; Depth=" & CStr(depth)
+            If isRoot And Not ALLOW_ROOT_ASSEMBLY_IMAGE Then
+                WriteDebugPhase "ROOT_ASSEMBLY_MATCH_BLOCKED", 0, rawPn, normalizedPn, sourcePath, "Root assembly not added to source index."
+            Else
+                AddSourceCandidate rawPn, normalizedPn, sourcePath, ext, isRoot, hasChildren, depth, productName
+                MarkNeededPartNumberFound normalizedPn, sourcePath
+            End If
         End If
     End If
 
+    If AllNeededPartNumbersFound() Then Exit Sub
     Dim children
     Dim i
     Set children = prod.Products
@@ -657,51 +827,253 @@ Sub TraverseProductForSourceIndex(prod)
         Exit Sub
     End If
     For i = 1 To children.Count
-        TraverseProductForSourceIndex children.Item(i)
-        If (gSourceIndex.Count Mod 250) = 0 Then DoEvents
+        TraverseProductForSourceIndex children.Item(i), CLng(depth) + 1
+        If AllNeededPartNumbersFound() Then Exit For
+        If (i Mod 250) = 0 Then DoEvents
     Next
     Err.Clear
 End Sub
 
-Function CaptureStandaloneImage(partNumber, sourcePath, imagePath, thumbPath, excelRow)
+Function ProductHasChildren(prod)
+    On Error Resume Next
+    ProductHasChildren = False
+    Dim children
+    Set children = prod.Products
+    If Err.Number = 0 And Not children Is Nothing Then ProductHasChildren = (children.Count > 0)
+    Err.Clear
+End Function
+
+Sub AddSourceCandidate(rawPn, normalizedPn, sourcePath, ext, isRoot, hasChildren, depth, productName)
+    On Error Resume Next
+    Dim recordText
+    Dim existingText
+    normalizedPn = NormalizePartNumber(normalizedPn)
+    If normalizedPn = "" Then Exit Sub
+    recordText = CandidateRecord(rawPn, normalizedPn, sourcePath, ext, isRoot, hasChildren, depth, productName)
+    If gSourceIndex.Exists(normalizedPn) Then
+        existingText = CStr(gSourceIndex.Item(normalizedPn))
+        gSourceIndex.Item(normalizedPn) = existingText & vbLf & recordText
+    Else
+        gSourceIndex.Item(normalizedPn) = recordText
+    End If
+    Err.Clear
+End Sub
+
+Function CandidateRecord(rawPn, normalizedPn, sourcePath, ext, isRoot, hasChildren, depth, productName)
+    CandidateRecord = Replace(CStr(rawPn), vbTab, " ") & vbTab & _
+                      Replace(CStr(normalizedPn), vbTab, " ") & vbTab & _
+                      Replace(CStr(sourcePath), vbTab, " ") & vbTab & _
+                      Replace(CStr(ext), vbTab, " ") & vbTab & _
+                      BoolToken(isRoot) & vbTab & _
+                      BoolToken(hasChildren) & vbTab & _
+                      CStr(depth) & vbTab & _
+                      Replace(CStr(productName), vbTab, " ")
+End Function
+
+Function BoolToken(value)
+    If CBool(value) Then
+        BoolToken = "1"
+    Else
+        BoolToken = "0"
+    End If
+End Function
+
+Function ShouldIndexPartNumber(normalizedPn)
+    normalizedPn = NormalizePartNumber(normalizedPn)
+    ShouldIndexPartNumber = (MatchedNeededPartNumberKey(normalizedPn) <> "")
+End Function
+
+Sub MarkNeededPartNumberFound(normalizedPn, sourcePath)
+    On Error Resume Next
+    Dim matchedKey
+    Dim ext
+    matchedKey = MatchedNeededPartNumberKeyExactOrNoRev(normalizedPn)
+    If matchedKey <> "" Then
+        ext = UCase(gFSO.GetExtensionName(sourcePath))
+        If PREFER_CATPART_OVER_CATPRODUCT And ext <> "CATPART" Then Exit Sub
+        If Not gFoundNeededPartNumbers.Exists(matchedKey) Then gFoundNeededPartNumbers.Item(matchedKey) = True
+        CATIA.StatusBar = "Indexing source files: found " & CStr(gFoundNeededPartNumbers.Count) & " / " & CStr(gNeededPartNumbers.Count)
+    End If
+    Err.Clear
+End Sub
+
+Function MatchedNeededPartNumberKey(normalizedPn)
+    On Error Resume Next
+    MatchedNeededPartNumberKey = ""
+    Dim key
+    Dim pnNoRev
+    Dim keyNoRev
+    normalizedPn = NormalizePartNumber(normalizedPn)
+    If normalizedPn = "" Then Exit Function
+    If gNeededPartNumbers.Exists(normalizedPn) Then
+        MatchedNeededPartNumberKey = normalizedPn
+        Exit Function
+    End If
+    pnNoRev = PartNumberWithoutRevision(normalizedPn)
+    For Each key In gNeededPartNumbers.Keys
+        keyNoRev = PartNumberWithoutRevision(CStr(key))
+        If keyNoRev <> "" And keyNoRev = pnNoRev Then
+            MatchedNeededPartNumberKey = CStr(key)
+            Exit Function
+        End If
+        If IsSafePartialPartNumberMatch(CStr(key), normalizedPn) Then
+            MatchedNeededPartNumberKey = CStr(key)
+            Exit Function
+        End If
+    Next
+    Err.Clear
+End Function
+
+Function MatchedNeededPartNumberKeyExactOrNoRev(normalizedPn)
+    On Error Resume Next
+    MatchedNeededPartNumberKeyExactOrNoRev = ""
+    Dim key
+    Dim pnNoRev
+    Dim keyNoRev
+    normalizedPn = NormalizePartNumber(normalizedPn)
+    If normalizedPn = "" Then Exit Function
+    If gNeededPartNumbers.Exists(normalizedPn) Then
+        MatchedNeededPartNumberKeyExactOrNoRev = normalizedPn
+        Exit Function
+    End If
+    pnNoRev = PartNumberWithoutRevision(normalizedPn)
+    For Each key In gNeededPartNumbers.Keys
+        keyNoRev = PartNumberWithoutRevision(CStr(key))
+        If keyNoRev <> "" And keyNoRev = pnNoRev Then
+            MatchedNeededPartNumberKeyExactOrNoRev = CStr(key)
+            Exit Function
+        End If
+    Next
+    Err.Clear
+End Function
+
+Function AllNeededPartNumbersFound()
+    On Error Resume Next
+    AllNeededPartNumbersFound = False
+    If gNeededPartNumbers.Count = 0 Then Exit Function
+    AllNeededPartNumbersFound = (gFoundNeededPartNumbers.Count >= gNeededPartNumbers.Count)
+    Err.Clear
+End Function
+
+Function ProcessBomRowsForThumbnails()
+    On Error Resume Next
+    ProcessBomRowsForThumbnails = False
+    Dim rowIndex
+    Dim rawPartNumber
+    Dim normalizedPartNumber
+    Dim sourcePath
+    Dim imagePath
+    Dim thumbPath
+    Dim reason
+    Dim candidateRows
+    candidateRows = 0
+
+    For rowIndex = gHeaderRow + 1 To gLastBomRow
+        rawPartNumber = CStr(gWsBom.Cells(rowIndex, gPartNumberColumnIndex).Value)
+        normalizedPartNumber = NormalizePartNumber(rawPartNumber)
+        CATIA.StatusBar = "Processing BOM images: row " & CStr(rowIndex - gHeaderRow) & " / " & CStr(gLastBomRow - gHeaderRow)
+        WriteDebugPhase "ROW_START", rowIndex, rawPartNumber, normalizedPartNumber, "", "Row start."
+
+        If normalizedPartNumber = "" Then
+            If RowHasAnyData(rowIndex) Then
+                gRowsWithoutPartNumber = gRowsWithoutPartNumber + 1
+                SetRowUtilityValues rowIndex, "", "NO_PART_NUMBER", "No Part Number in BOM row"
+                WriteDebugPhase "ROW_START", rowIndex, rawPartNumber, normalizedPartNumber, "", "NO_PART_NUMBER"
+            End If
+        ElseIf SKIP_FASTENER_IMAGES And IsFastenerExcelRow(rowIndex) Then
+            gSkippedFastenerRows = gSkippedFastenerRows + 1
+            SetRowUtilityValues rowIndex, "", "SKIPPED_FASTENER", "Fastener image skipped"
+            WriteDebugPhase "FASTENER_SKIPPED", rowIndex, rawPartNumber, normalizedPartNumber, "", "Fastener image skipped."
+        Else
+            candidateRows = candidateRows + 1
+            If TEST_MODE And candidateRows > TEST_MAX_ROWS Then
+                SetRowUtilityValues rowIndex, "", "NOT_PROCESSED_TEST_LIMIT", "TEST_MODE limit reached"
+            Else
+                imagePath = BuildImagePath(normalizedPartNumber, rowIndex)
+                thumbPath = ThumbnailPathForImage(imagePath)
+
+                If ReuseExistingOrCachedImage(normalizedPartNumber, imagePath, thumbPath) Then
+                    SetRowUtilityValues rowIndex, imagePath, "EXISTING_REUSED", ""
+                    If InsertThumbnailForRow(rowIndex, thumbPath) Then
+                        gProcessedImageRows = gProcessedImageRows + 1
+                        gSuccessfulImageRows = gSuccessfulImageRows + 1
+                        gReusedImageRows = gReusedImageRows + 1
+                        WriteDebugPhase "EXISTING_REUSED", rowIndex, rawPartNumber, normalizedPartNumber, "", thumbPath
+                    Else
+                        SetRowUtilityValues rowIndex, imagePath, "IMAGE_CAPTURE_FAILED", "Could not insert existing image in Excel"
+                    End If
+                Else
+                    sourcePath = SourcePathForPartNumber(rawPartNumber)
+                    If sourcePath = "" Or Not gFSO.FileExists(sourcePath) Then
+                        gSourceNotFoundRows = gSourceNotFoundRows + 1
+                        If gLastMatchBlockedReason = "ROOT_ASSEMBLY_MATCH_BLOCKED" Then
+                            SetRowUtilityValues rowIndex, "", "ROOT_ASSEMBLY_MATCH_BLOCKED", "Root assembly match blocked"
+                            WriteDebugPhase "ROOT_ASSEMBLY_MATCH_BLOCKED", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, "Root assembly match blocked; ALLOW_ROOT_ASSEMBLY_IMAGE=False"
+                        Else
+                            SetRowUtilityValues rowIndex, "", "SOURCE_FILE_NOT_FOUND", "Source file not found for Part Number"
+                            WriteDebugPhase "SOURCE_FILE_NOT_FOUND", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, "Source not found. BlockedReason=" & gLastMatchBlockedReason
+                        End If
+                    Else
+                        WriteDebugPhase "SOURCE_FILE_FOUND", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, BuildSourceMatchLogMessage()
+                        If UCase(gLastMatchedSourceExtension) = "CATPRODUCT" Then WriteDebugPhase "WARNING_SOURCE_IS_CATPRODUCT", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, BuildSourceMatchLogMessage()
+                        If CaptureStandaloneImage(rawPartNumber, normalizedPartNumber, sourcePath, imagePath, thumbPath, rowIndex) Then
+                            SetRowUtilityValues rowIndex, imagePath, "OK", ""
+                            CacheImage normalizedPartNumber, imagePath, thumbPath
+                            If InsertThumbnailForRow(rowIndex, thumbPath) Then
+                                gProcessedImageRows = gProcessedImageRows + 1
+                                gSuccessfulImageRows = gSuccessfulImageRows + 1
+                                WriteDebugPhase "IMAGE_INSERTED_IN_EXCEL", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, thumbPath
+                            Else
+                                gImageCaptureFailedRows = gImageCaptureFailedRows + 1
+                                SetRowUtilityValues rowIndex, imagePath, "IMAGE_CAPTURE_FAILED", "Could not insert image in Excel"
+                            End If
+                        Else
+                            gImageCaptureFailedRows = gImageCaptureFailedRows + 1
+                            SetRowUtilityValues rowIndex, imagePath, "IMAGE_CAPTURE_FAILED", "Standalone image capture failed"
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        If SAVE_EVERY_N_ROWS > 0 Then
+            If ((rowIndex - gHeaderRow) Mod SAVE_EVERY_N_ROWS) = 0 Then SaveExcelCheckpoint "Periodic save", rowIndex, rawPartNumber, normalizedPartNumber
+        End If
+        DoEvents
+    Next
+
+    ProcessBomRowsForThumbnails = True
+    Err.Clear
+End Function
+
+Function CaptureStandaloneImage(rawPartNumber, normalizedPartNumber, sourcePath, imagePath, thumbPath, excelRow)
     On Error Resume Next
     CaptureStandaloneImage = False
     If gFSO.FileExists(imagePath) Then gFSO.DeleteFile imagePath, True
     If gFSO.FileExists(thumbPath) Then gFSO.DeleteFile thumbPath, True
 
-    WriteDebugPhase "STANDALONE_OPEN_START", excelRow, partNumber, sourcePath
+    WriteDebugPhase "STANDALONE_OPEN_START", excelRow, rawPartNumber, normalizedPartNumber, sourcePath, sourcePath
     If Not OpenStandaloneDocument(sourcePath) Then
-        WriteExportLog excelRow, partNumber, "STANDALONE_OPEN_FAILED", "STANDALONE_OPEN_START", "Cannot open source file.", imagePath, thumbPath
-        WriteDebugPhase "ERROR", excelRow, partNumber, "Cannot open source file: " & sourcePath
         CloseCurrentStandaloneDocument
         ActivateMainDocument
         Exit Function
     End If
-    WriteDebugPhase "STANDALONE_OPEN_DONE", excelRow, partNumber, sourcePath
 
-    WriteDebugPhase "STANDALONE_CAPTURE_START", excelRow, partNumber, imagePath
-    ApplyIsoViewAndFit
-    If Not CaptureActiveViewerToJpg(imagePath) Then
-        WriteExportLog excelRow, partNumber, "STANDALONE_CAPTURE_FAILED", "STANDALONE_CAPTURE_START", "CaptureToFile failed.", imagePath, thumbPath
-        WriteDebugPhase "ERROR", excelRow, partNumber, "CaptureToFile failed: " & imagePath
+    If Not CaptureActiveStandaloneViewer(imagePath) Then
         CloseCurrentStandaloneDocument
         ActivateMainDocument
         Exit Function
     End If
-    WriteDebugPhase "STANDALONE_CAPTURE_DONE", excelRow, partNumber, imagePath
+    WriteDebugPhase "STANDALONE_CAPTURE_DONE", excelRow, rawPartNumber, normalizedPartNumber, sourcePath, imagePath
 
     If Not CreateThumbnailFile(imagePath, thumbPath, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT) Then
-        WriteExportLog excelRow, partNumber, "ERROR", "THUMBNAIL_CREATED", "Thumbnail creation failed.", imagePath, thumbPath
-        WriteDebugPhase "ERROR", excelRow, partNumber, "Thumbnail creation failed: " & thumbPath
-        CloseCurrentStandaloneDocument
-        ActivateMainDocument
-        Exit Function
+        Err.Clear
+        gFSO.CopyFile imagePath, thumbPath, True
     End If
-    WriteDebugPhase "THUMBNAIL_CREATED", excelRow, partNumber, thumbPath
 
     CloseCurrentStandaloneDocument
     ActivateMainDocument
-    CaptureStandaloneImage = True
+    CaptureStandaloneImage = gFSO.FileExists(imagePath) And gFSO.FileExists(thumbPath)
     Err.Clear
 End Function
 
@@ -717,14 +1089,11 @@ Function OpenStandaloneDocument(sourcePath)
         Exit Function
     End If
 
-    Dim oldAlerts
-    oldAlerts = CATIA.DisplayFileAlerts
-    Err.Clear
+    CATIA.StatusBar = "Opening standalone file: " & gFSO.GetFileName(sourcePath)
     CATIA.DisplayFileAlerts = False
     Set gCurrentStandaloneDoc = CATIA.Documents.Open(sourcePath)
-    CATIA.DisplayFileAlerts = oldAlerts
     If Err.Number <> 0 Or gCurrentStandaloneDoc Is Nothing Then
-        CATIA.DisplayFileAlerts = oldAlerts
+        CATIA.DisplayFileAlerts = True
         Err.Clear
         Exit Function
     End If
@@ -738,13 +1107,9 @@ Sub CloseCurrentStandaloneDocument()
     On Error Resume Next
     If Not gCurrentStandaloneDoc Is Nothing Then
         If CLOSE_STANDALONE_DOCUMENT_AFTER_CAPTURE And gCurrentStandaloneOpened Then
-            Dim oldAlerts
-            oldAlerts = CATIA.DisplayFileAlerts
-            Err.Clear
             CATIA.DisplayFileAlerts = False
             gCurrentStandaloneDoc.Close
-            CATIA.DisplayFileAlerts = oldAlerts
-            WriteDebugPhase "STANDALONE_CLOSE_DONE", 0, "", "Standalone document closed without saving."
+            CATIA.DisplayFileAlerts = True
         End If
     End If
     Set gCurrentStandaloneDoc = Nothing
@@ -752,66 +1117,46 @@ Sub CloseCurrentStandaloneDocument()
     Err.Clear
 End Sub
 
-Function CaptureActiveViewerToJpg(imagePath)
+Function CaptureActiveStandaloneViewer(imagePath)
     On Error Resume Next
-    CaptureActiveViewerToJpg = False
+    CaptureActiveStandaloneViewer = False
     Dim viewer
-    Set viewer = CATIA.ActiveWindow.ActiveViewer
-    viewer.Activate
-    viewer.Update
-    WaitSeconds IMAGE_CAPTURE_DELAY_SECONDS
-    viewer.CaptureToFile CAT_CAPTURE_FORMAT_JPEG, imagePath
-    WaitSeconds 0.05
-    CaptureActiveViewerToJpg = gFSO.FileExists(imagePath)
-    Err.Clear
-End Function
-
-Sub ApplyIsoViewAndFit()
-    On Error Resume Next
-    Dim viewer
-    Dim vp
+    Dim viewpoint
     Dim sight(2)
     Dim up(2)
+
+    CATIA.ActiveWindow.Width = IMAGE_WIDTH
+    CATIA.ActiveWindow.Height = IMAGE_HEIGHT
     Set viewer = CATIA.ActiveWindow.ActiveViewer
     viewer.Activate
-    If USE_SHADED_WITH_EDGES Then
-        viewer.RenderingMode = CAT_RENDER_SHADING_WITH_EDGES
-        If Err.Number <> 0 Then
-            Err.Clear
-            viewer.RenderingMode = CAT_RENDER_SHADING
-        End If
-    End If
-    If USE_WHITE_BACKGROUND Then
-        Dim bg(2)
-        bg(0) = 1
-        bg(1) = 1
-        bg(2) = 1
-        viewer.PutBackgroundColor bg
+    viewer.Reframe
+    viewer.Update
+
+    viewer.RenderingMode = CAT_RENDER_SHADING_WITH_EDGES
+    If Err.Number <> 0 Then
         Err.Clear
+        viewer.RenderingMode = CAT_RENDER_SHADING
     End If
-    Set vp = viewer.Viewpoint3D
+
+    Set viewpoint = viewer.Viewpoint3D
     sight(0) = 1
     sight(1) = -1
     sight(2) = 1
     up(0) = -0.4082482905
     up(1) = 0.4082482905
     up(2) = 0.8164965809
-    vp.PutSightDirection sight
-    vp.PutUpDirection up
-    If USE_PARALLEL_PROJECTION Then
-        vp.ProjectionMode = CAT_PROJECTION_CYLINDRIC
-        Err.Clear
-    End If
-    CATIA.ActiveWindow.Width = IMAGE_WIDTH
-    CATIA.ActiveWindow.Height = IMAGE_HEIGHT
-    viewer.Update
-    viewer.Reframe
-    viewer.Update
-    viewer.Reframe
-    viewer.Update
-    DoEvents
+    viewpoint.PutSightDirection sight
+    viewpoint.PutUpDirection up
+    viewpoint.ProjectionMode = CAT_PROJECTION_CYLINDRIC
     Err.Clear
-End Sub
+
+    viewer.Reframe
+    viewer.Update
+    WaitSeconds IMAGE_CAPTURE_DELAY_SECONDS
+    viewer.CaptureToFile CAT_CAPTURE_FORMAT_JPEG, imagePath
+    CaptureActiveStandaloneViewer = gFSO.FileExists(imagePath)
+    Err.Clear
+End Function
 
 Function CreateThumbnailFile(sourcePath, thumbPath, maxWidth, maxHeight)
     On Error Resume Next
@@ -836,101 +1181,97 @@ Function CreateThumbnailFile(sourcePath, thumbPath, maxWidth, maxHeight)
         gFSO.MoveFile tmpPath, thumbPath
         CreateThumbnailFile = gFSO.FileExists(thumbPath)
     End If
+    WriteDebugPhase "THUMBNAIL_CREATED", 0, "", "", thumbPath, CStr(CreateThumbnailFile)
     Err.Clear
 End Function
 
-Function InsertThumbnailForRow(excelRow, thumbPath)
+Function InsertThumbnailForRow(rowIndex, thumbPath)
     On Error Resume Next
     InsertThumbnailForRow = False
-    If Not INSERT_IMAGES_IN_EXCEL Then
-        InsertThumbnailForRow = True
-        Exit Function
-    End If
     If thumbPath = "" Or Not gFSO.FileExists(thumbPath) Then Exit Function
 
     Dim cell
     Dim pic
-    Set cell = gWsBom.Cells(CLng(excelRow), gThumbnailColumnIndex)
-    gWsBom.Rows(CLng(excelRow)).RowHeight = CLng(THUMBNAIL_HEIGHT * 0.75) + 12
+    Set cell = gWsBom.Cells(CLng(rowIndex), gImageColumnIndex)
+    DeletePicturesInCell gWsBom, cell
+    gWsBom.Rows(CLng(rowIndex)).RowHeight = 90
     Set pic = gWsBom.Shapes.AddPicture(thumbPath, MSO_FALSE, MSO_TRUE, cell.Left + 2, cell.Top + 2, -1, -1)
     pic.LockAspectRatio = MSO_TRUE
     If pic.Width > THUMBNAIL_WIDTH Then pic.Width = THUMBNAIL_WIDTH
     If pic.Height > THUMBNAIL_HEIGHT Then pic.Height = THUMBNAIL_HEIGHT
     pic.Left = cell.Left + ((cell.Width - pic.Width) / 2)
     pic.Top = cell.Top + ((cell.Height - pic.Height) / 2)
-    WriteDebugPhase "EXCEL_THUMBNAIL_INSERTED", excelRow, GetPartNumberFromExcelRow(excelRow), thumbPath
     InsertThumbnailForRow = (Err.Number = 0)
+    If InsertThumbnailForRow Then WriteDebugPhase "IMAGE_INSERTED_IN_EXCEL", rowIndex, "", "", "", thumbPath
     Err.Clear
 End Function
 
-Sub SetBomUtilityValues(rec, imagePath, thumbPath, statusText, skipReason)
+Sub DeletePicturesInCell(ws, cell)
     On Error Resume Next
-    Dim rowIndex
-    rowIndex = CLng(rec.Item("ExcelRow"))
-    rec.Item("ImagePath") = imagePath
-    rec.Item("ThumbnailPath") = thumbPath
-    rec.Item("ExportStatus") = statusText
-    rec.Item("ImageSkipReason") = skipReason
-    gWsBom.Cells(rowIndex, gImagePathColumnIndex).Value = imagePath
-    gWsBom.Cells(rowIndex, gThumbnailPathColumnIndex).Value = thumbPath
-    gWsBom.Cells(rowIndex, gExportStatusColumnIndex).Value = statusText
-    gWsBom.Cells(rowIndex, gImageSkipReasonColumnIndex).Value = skipReason
+    Dim i
+    Dim shp
+    For i = ws.Shapes.Count To 1 Step -1
+        Set shp = ws.Shapes.Item(i)
+        If shp.Top >= cell.Top - 1 And shp.Top < cell.Top + cell.Height And shp.Left >= cell.Left - 1 And shp.Left < cell.Left + cell.Width Then shp.Delete
+    Next
     Err.Clear
 End Sub
 
-Sub WriteExportLog(excelRow, partNumber, statusText, phase, messageText, imagePath, thumbPath)
+Sub SetRowUtilityValues(rowIndex, imagePath, statusText, skipReason)
     On Error Resume Next
-    gWsLog.Cells(gNextLogRow, 1).Value = gNextLogRow - 1
-    gWsLog.Cells(gNextLogRow, 2).Value = Now
-    gWsLog.Cells(gNextLogRow, 3).Value = excelRow
-    gWsLog.Cells(gNextLogRow, 4).Value = partNumber
-    gWsLog.Cells(gNextLogRow, 5).Value = statusText
-    gWsLog.Cells(gNextLogRow, 6).Value = phase
-    gWsLog.Cells(gNextLogRow, 7).Value = messageText
-    gWsLog.Cells(gNextLogRow, 8).Value = imagePath
-    gWsLog.Cells(gNextLogRow, 9).Value = thumbPath
-    gNextLogRow = gNextLogRow + 1
+    If gImagePathColumnIndex > 0 Then gWsBom.Cells(rowIndex, gImagePathColumnIndex).Value = imagePath
+    If gExportStatusColumnIndex > 0 Then gWsBom.Cells(rowIndex, gExportStatusColumnIndex).Value = statusText
+    If gImageSkipReasonColumnIndex > 0 Then gWsBom.Cells(rowIndex, gImageSkipReasonColumnIndex).Value = skipReason
     Err.Clear
 End Sub
 
-Sub WriteDebugPhase(phase, excelRow, partNumber, messageText)
-    On Error Resume Next
-    Dim ts
-    Set ts = gFSO.OpenTextFile(gDebugLogPath, 8, True)
-    ts.WriteLine FormatDateTime(Now, 2) & " " & FormatDateTime(Now, 3) & " | " & phase & " | ExcelRow=" & CStr(excelRow) & " | PartNumber=" & CStr(partNumber) & " | " & CStr(messageText)
-    ts.Close
-    Err.Clear
-End Sub
-
-Sub SaveExcelCheckpoint(phase, excelRow, partNumber)
+Sub SaveExcelCheckpoint(phase, rowIndex, rawPartNumber, normalizedPartNumber)
     On Error Resume Next
     If gWorkbook Is Nothing Then Exit Sub
-    UpdateSummarySheet
-    gExcelApp.DisplayAlerts = False
-    If Not gWorkbookSaved Then
-        gWorkbook.SaveAs gExcelPath, XL_OPENXML_WORKBOOK
-        If Err.Number = 0 Then gWorkbookSaved = True
-    Else
-        gWorkbook.Save
-    End If
-    WriteDebugPhase "SAVE_CHECKPOINT", excelRow, partNumber, phase
+    gWorkbook.Save
+    WriteDebugPhase "SAVE_CHECKPOINT", rowIndex, rawPartNumber, normalizedPartNumber, "", phase
     Err.Clear
 End Sub
 
-Sub MaybeSaveByProgress(excelRow, partNumber)
-    If gSuccessfulImageRows = 1 Then
-        SaveExcelCheckpoint "First successful image", excelRow, partNumber
-    ElseIf SAVE_EVERY_N_ROWS > 0 Then
-        If (gProcessedImageRows Mod SAVE_EVERY_N_ROWS) = 0 Then SaveExcelCheckpoint "Periodic save", excelRow, partNumber
-    End If
-End Sub
-
-Sub AbortWithMessage(messageText, phase, excelRow, partNumber)
+Function FinalSaveWorkbook()
     On Error Resume Next
-    gAbortMessage = messageText
-    WriteDebugPhase "ERROR", excelRow, partNumber, phase & ": " & messageText
-    WriteExportLog excelRow, partNumber, "ERROR", phase, messageText, "", ""
-    SaveExcelCheckpoint phase, excelRow, partNumber
+    FinalSaveWorkbook = False
+    If gWorkbook Is Nothing Then Exit Function
+    gWorkbook.Save
+    gExcelApp.DisplayAlerts = False
+    Err.Clear
+    gWorkbook.SaveAs gFinalExcelPath, XL_EXCEL8
+    If Err.Number = 0 And gFSO.FileExists(gFinalExcelPath) Then
+        FinalSaveWorkbook = True
+        WriteDebugPhase "FINAL_SAVE_DONE", 0, "", "", gFinalExcelPath, gFinalExcelPath
+    Else
+        Dim saveErr
+        saveErr = Err.Description
+        Err.Clear
+        gWorkbook.Save
+        gWorkbook.Close False
+        Set gWorkbook = Nothing
+        gFSO.CopyFile gWorkExcelPath, gFinalExcelPath, True
+        If Err.Number = 0 And gFSO.FileExists(gFinalExcelPath) Then
+            Set gWorkbook = gExcelApp.Workbooks.Open(gFinalExcelPath)
+            Set gWsBom = gWorkbook.Worksheets(1)
+            FinalSaveWorkbook = True
+            WriteDebugPhase "FINAL_SAVE_DONE", 0, "", "", gFinalExcelPath, "Saved by CopyFile after SaveAs failure: " & saveErr
+        Else
+            AbortPhase2 "Finalno snimanje Excela nije uspelo: " & saveErr & " / " & Err.Description, "FINAL_SAVE_DONE", 0, "", "", gFinalExcelPath
+            Err.Clear
+        End If
+    End If
+    gExcelApp.DisplayAlerts = True
+    Err.Clear
+End Function
+
+Sub AbortPhase2(messageText, phase, rowIndex, rawPartNumber, normalizedPartNumber, sourcePath)
+    On Error Resume Next
+    gAbortAlreadyHandled = True
+    gErrorCount = gErrorCount + 1
+    WriteDebugPhase "ERROR", rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, phase & ": " & messageText & "; Err.Number=" & CStr(Err.Number) & "; Err.Description=" & Err.Description
+    SaveExcelCheckpoint phase, rowIndex, rawPartNumber, normalizedPartNumber
     CleanupCatiaSession
     MsgBox messageText, vbCritical, "CATIA_VISUAL_BOM_EXPORTER"
     Err.Clear
@@ -940,9 +1281,10 @@ Sub CleanupCatiaSession()
     On Error Resume Next
     CloseCurrentStandaloneDocument
     ActivateMainDocument
-    If Not gActiveDoc Is Nothing Then gActiveDoc.Selection.Clear
+    If Not gProductDocument Is Nothing Then gProductDocument.Selection.Clear
     CATIA.RefreshDisplay = True
     CATIA.StatusBar = ""
+    CATIA.DisplayFileAlerts = True
     If Not gExcelApp Is Nothing Then
         gExcelApp.ScreenUpdating = True
         gExcelApp.DisplayAlerts = True
@@ -953,64 +1295,42 @@ End Sub
 
 Sub ActivateMainDocument()
     On Error Resume Next
-    If Not gActiveDoc Is Nothing Then gActiveDoc.Activate
+    If Not gProductDocument Is Nothing Then gProductDocument.Activate
     Err.Clear
 End Sub
 
-Sub UpdateSummarySheet()
+Sub WriteDebugPhase(phase, rowIndex, rawPartNumber, normalizedPartNumber, sourcePath, messageText)
     On Error Resume Next
-    If gWsSummary Is Nothing Then Exit Sub
-    gWsSummary.Cells(3, 2).Value = GetProductPartNumber(gRootProduct)
-    gWsSummary.Cells(4, 2).Value = Now
-    gWsSummary.Cells(5, 2).Value = gOutputFolder
-    gWsSummary.Cells(6, 2).Value = gExcelPath
-    gWsSummary.Cells(7, 2).Value = ListCount(gBomRows)
-    gWsSummary.Cells(8, 2).Value = gProcessedImageRows
-    gWsSummary.Cells(9, 2).Value = gSuccessfulImageRows
-    gWsSummary.Cells(10, 2).Value = gSkippedFastenerRows
-    gWsSummary.Cells(11, 2).Value = gDebugLogPath
-    gWsSummary.Cells(12, 2).Value = "TEST_MODE=" & CStr(TEST_MODE) & "; TEST_MAX_ROWS=" & CStr(TEST_MAX_ROWS) & "; STANDALONE_CAPTURE_ONLY=" & CStr(STANDALONE_CAPTURE_ONLY)
+    Dim ts
+    Dim lineText
+    lineText = FormatDateTime(Now, 2) & " " & FormatDateTime(Now, 3) & _
+               " | " & phase & _
+               " | ExcelRow=" & CStr(rowIndex) & _
+               " | Raw Part Number=" & CStr(rawPartNumber) & _
+               " | Normalized Part Number=" & CStr(normalizedPartNumber) & _
+               " | Source Path=" & CStr(sourcePath) & _
+               " | " & CStr(messageText)
+    If gDebugLogPath = "" Then
+        gPendingDebugText = gPendingDebugText & lineText & vbCrLf
+        Exit Sub
+    End If
+    Set ts = gFSO.OpenTextFile(gDebugLogPath, 8, True)
+    If gPendingDebugText <> "" Then
+        ts.Write gPendingDebugText
+        gPendingDebugText = ""
+    End If
+    ts.WriteLine lineText
+    ts.Close
     Err.Clear
 End Sub
 
-Function SourcePathForPartNumber(partNumber)
-    On Error Resume Next
-    SourcePathForPartNumber = ""
-    Dim normalizedPn
-    Dim noRevPn
-    Dim candidateKey
-
-    normalizedPn = NormalizePartNumber(partNumber)
-    If normalizedPn = "" Then Exit Function
-
-    If gSourceIndex.Exists(normalizedPn) Then
-        SourcePathForPartNumber = CStr(gSourceIndex.Item(normalizedPn))
-        Exit Function
-    End If
-
-    noRevPn = PartNumberWithoutRevision(normalizedPn)
-    If noRevPn <> "" And noRevPn <> normalizedPn Then
-        If gSourceIndex.Exists(noRevPn) Then
-            SourcePathForPartNumber = CStr(gSourceIndex.Item(noRevPn))
-            Exit Function
-        End If
-    End If
-
-    candidateKey = FindUniqueSourceIndexCandidate(normalizedPn)
-    If candidateKey = "" And noRevPn <> "" And noRevPn <> normalizedPn Then candidateKey = FindUniqueSourceIndexCandidate(noRevPn)
-    If candidateKey <> "" Then SourcePathForPartNumber = CStr(gSourceIndex.Item(candidateKey))
-    Err.Clear
-End Function
-
-Function ReuseExistingOrCachedImage(partNumber, imagePath, thumbPath, rec)
+Function ReuseExistingOrCachedImage(normalizedPartNumber, imagePath, thumbPath)
     On Error Resume Next
     ReuseExistingOrCachedImage = False
-    Dim cacheKey
     Dim payload
     Dim parts
-    cacheKey = NormalizePartNumber(partNumber)
-    If gImageCache.Exists(cacheKey) Then
-        payload = CStr(gImageCache.Item(cacheKey))
+    If gImageCache.Exists(normalizedPartNumber) Then
+        payload = CStr(gImageCache.Item(normalizedPartNumber))
         parts = Split(payload, "|")
         If UBound(parts) >= 1 Then
             imagePath = CStr(parts(0))
@@ -1018,69 +1338,194 @@ Function ReuseExistingOrCachedImage(partNumber, imagePath, thumbPath, rec)
         End If
     End If
     If SKIP_EXISTING_IMAGES And gFSO.FileExists(imagePath) Then
-        If Not gFSO.FileExists(thumbPath) Then CreateThumbnailFile imagePath, thumbPath, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT
+        If Not gFSO.FileExists(thumbPath) Then
+            If Not CreateThumbnailFile(imagePath, thumbPath, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT) Then gFSO.CopyFile imagePath, thumbPath, True
+        End If
         If gFSO.FileExists(thumbPath) Then
-            CacheImage partNumber, imagePath, thumbPath
+            CacheImage normalizedPartNumber, imagePath, thumbPath
             ReuseExistingOrCachedImage = True
         End If
     End If
     Err.Clear
 End Function
 
-Sub CacheImage(partNumber, imagePath, thumbPath)
-    If NormalizePartNumber(partNumber) <> "" Then gImageCache.Item(NormalizePartNumber(partNumber)) = imagePath & "|" & thumbPath
+Function ExistingImageAvailable(normalizedPartNumber, rowIndex)
+    Dim imagePath
+    imagePath = BuildImagePath(normalizedPartNumber, rowIndex)
+    ExistingImageAvailable = (SKIP_EXISTING_IMAGES And gFSO.FileExists(imagePath))
+End Function
+
+Sub CacheImage(normalizedPartNumber, imagePath, thumbPath)
+    If normalizedPartNumber <> "" Then gImageCache.Item(normalizedPartNumber) = imagePath & "|" & thumbPath
 End Sub
 
-Function BuildImagePath(partNumber, descriptionText, excelRow)
+Function BuildImagePath(normalizedPartNumber, rowIndex)
     Dim baseName
-    baseName = SafeFileName(Trim(CStr(partNumber) & "_" & CStr(descriptionText)))
-    If baseName = "" Or baseName = "_" Then baseName = "BOM_ROW_" & CStr(excelRow)
+    baseName = SafeFileName(normalizedPartNumber)
+    If baseName = "" Then baseName = "BOM_ROW_" & CStr(rowIndex)
     If Len(baseName) > 140 Then baseName = Left(baseName, 140)
-    BuildImagePath = JoinPath(gImageFolder, baseName & "." & FAST_IMAGE_FORMAT)
+    BuildImagePath = JoinPath(gImageFolder, baseName & ".jpg")
 End Function
 
 Function ThumbnailPathForImage(imagePath)
     ThumbnailPathForImage = JoinPath(gThumbnailFolder, gFSO.GetBaseName(imagePath) & ".jpg")
 End Function
 
-Function GetPartNumberFromRow(rec)
-    If gPartNumberColumnIndex > 0 Then
-        GetPartNumberFromRow = GetNativeValue(rec, gPartNumberColumnIndex)
-    Else
-        GetPartNumberFromRow = GetNativeValue(rec, 1)
-    End If
-End Function
-
-Function GetDescriptionFromRow(rec)
-    If gDescriptionColumnIndex > 0 Then GetDescriptionFromRow = GetNativeValue(rec, gDescriptionColumnIndex)
-End Function
-
-Function GetNativeValue(rec, nativeColumnIndex)
+Function SourcePathForPartNumber(partNumber)
     On Error Resume Next
-    Dim values
-    Set values = rec.Item("Values")
-    GetNativeValue = ""
-    If nativeColumnIndex > 0 And nativeColumnIndex <= ListCount(values) Then GetNativeValue = CStr(ListValue(values, nativeColumnIndex))
+    ResetLastSourceMatch
+    SourcePathForPartNumber = ""
+    Dim normalizedPn
+    Dim noRevPn
+    Dim candidateKey
+    normalizedPn = NormalizePartNumber(partNumber)
+    If normalizedPn = "" Then Exit Function
+    If gSourceIndex.Exists(normalizedPn) Then
+        SourcePathForPartNumber = SelectBestSourceCandidate(CStr(gSourceIndex.Item(normalizedPn)), "EXACT")
+        Exit Function
+    End If
+    noRevPn = PartNumberWithoutRevision(normalizedPn)
+    If noRevPn <> "" And noRevPn <> normalizedPn Then
+        If gSourceIndex.Exists(noRevPn) Then
+            SourcePathForPartNumber = SelectBestSourceCandidate(CStr(gSourceIndex.Item(noRevPn)), "NO_REV")
+            Exit Function
+        End If
+    End If
+    candidateKey = FindUniqueSourceIndexCandidate(normalizedPn)
+    If candidateKey = "" And noRevPn <> "" And noRevPn <> normalizedPn Then candidateKey = FindUniqueSourceIndexCandidate(noRevPn)
+    If candidateKey <> "" Then SourcePathForPartNumber = SelectBestSourceCandidate(CStr(gSourceIndex.Item(candidateKey)), "SAFE_UNIQUE_PARTIAL")
     Err.Clear
 End Function
 
-Function GetPartNumberFromExcelRow(excelRow)
-    Dim idx
-    idx = CLng(excelRow) - 1
-    If idx >= 1 And idx <= ListCount(gBomRows) Then GetPartNumberFromExcelRow = GetPartNumberFromRow(ListObject(gBomRows, idx))
+Sub ResetLastSourceMatch()
+    gLastMatchMethod = ""
+    gLastMatchedRawPartNumber = ""
+    gLastMatchedNormalizedPartNumber = ""
+    gLastMatchedSourceExtension = ""
+    gLastMatchedIsRootAssembly = False
+    gLastMatchedHasChildren = False
+    gLastMatchedDepth = 0
+    gLastMatchedProductName = ""
+    gLastMatchedCandidateCount = 0
+    gLastMatchBlockedReason = ""
+End Sub
+
+Function BuildSourceMatchLogMessage()
+    BuildSourceMatchLogMessage = _
+        "Matched ProductTree Part Number=" & gLastMatchedRawPartNumber & _
+        "; Matched normalized Part Number=" & gLastMatchedNormalizedPartNumber & _
+        "; Source extension=" & gLastMatchedSourceExtension & _
+        "; Is CATPart=" & CStr(UCase(gLastMatchedSourceExtension) = "CATPART") & _
+        "; Is CATProduct=" & CStr(UCase(gLastMatchedSourceExtension) = "CATPRODUCT") & _
+        "; Is root assembly=" & CStr(gLastMatchedIsRootAssembly) & _
+        "; Has children=" & CStr(gLastMatchedHasChildren) & _
+        "; Product name=" & gLastMatchedProductName & _
+        "; Depth=" & CStr(gLastMatchedDepth) & _
+        "; Match method=" & gLastMatchMethod & _
+        "; Candidate count=" & CStr(gLastMatchedCandidateCount) & _
+        "; Note=" & gLastMatchBlockedReason
 End Function
 
-Function IsFastenerBomRow(rec)
+Function SelectBestSourceCandidate(candidateListText, matchMethod)
     On Error Resume Next
-    IsFastenerBomRow = False
-    Dim scanText
+    SelectBestSourceCandidate = ""
+    Dim records
     Dim i
+    Dim rec
+    Dim bestRecord
+    Dim firstValidRecord
+    Dim validCount
+    Dim catPartCount
+    records = Split(CStr(candidateListText), vbLf)
+    gLastMatchedCandidateCount = UBound(records) + 1
+    validCount = 0
+    catPartCount = 0
+    bestRecord = ""
+    firstValidRecord = ""
+
+    For i = 0 To UBound(records)
+        rec = CStr(records(i))
+        If IsSelectableCandidate(rec) Then
+            validCount = validCount + 1
+            If firstValidRecord = "" Then firstValidRecord = rec
+            If UCase(CandidateField(rec, 3)) = "CATPART" Then
+                catPartCount = catPartCount + 1
+                If PREFER_CATPART_OVER_CATPRODUCT And bestRecord = "" Then bestRecord = rec
+            End If
+        End If
+    Next
+
+    If bestRecord = "" Then bestRecord = firstValidRecord
+    If bestRecord = "" Then Exit Function
+
+    FillLastMatchFromRecord bestRecord, matchMethod, catPartCount
+    SelectBestSourceCandidate = CandidateField(bestRecord, 2)
+    Err.Clear
+End Function
+
+Function IsSelectableCandidate(candidateRecord)
+    On Error Resume Next
+    IsSelectableCandidate = False
+    Dim sourcePath
+    Dim ext
+    Dim isRoot
+    Dim hasChildren
+    sourcePath = CandidateField(candidateRecord, 2)
+    ext = UCase(CandidateField(candidateRecord, 3))
+    isRoot = (CandidateField(candidateRecord, 4) = "1")
+    hasChildren = (CandidateField(candidateRecord, 5) = "1")
+    If sourcePath = "" Or Not gFSO.FileExists(sourcePath) Then Exit Function
+    If ext <> "CATPART" And ext <> "CATPRODUCT" Then Exit Function
+    If isRoot And Not ALLOW_ROOT_ASSEMBLY_IMAGE Then
+        gLastMatchBlockedReason = "ROOT_ASSEMBLY_MATCH_BLOCKED"
+        Exit Function
+    End If
+    If ext = "CATPRODUCT" And hasChildren And Not ALLOW_SUBASSEMBLY_IMAGE Then Exit Function
+    IsSelectableCandidate = True
+    Err.Clear
+End Function
+
+Sub FillLastMatchFromRecord(candidateRecord, matchMethod, catPartCount)
+    gLastMatchMethod = matchMethod
+    gLastMatchedRawPartNumber = CandidateField(candidateRecord, 0)
+    gLastMatchedNormalizedPartNumber = CandidateField(candidateRecord, 1)
+    gLastMatchedSourceExtension = UCase(CandidateField(candidateRecord, 3))
+    gLastMatchedIsRootAssembly = (CandidateField(candidateRecord, 4) = "1")
+    gLastMatchedHasChildren = (CandidateField(candidateRecord, 5) = "1")
+    gLastMatchedDepth = CLng(Val(CandidateField(candidateRecord, 6)))
+    gLastMatchedProductName = CandidateField(candidateRecord, 7)
+    If catPartCount > 1 Then gLastMatchBlockedReason = "DUPLICATE_CATPART_CANDIDATES"
+End Sub
+
+Function CandidateField(candidateRecord, fieldIndex)
+    On Error Resume Next
+    Dim parts
+    parts = Split(CStr(candidateRecord), vbTab)
+    If UBound(parts) >= CLng(fieldIndex) Then
+        CandidateField = CStr(parts(CLng(fieldIndex)))
+    Else
+        CandidateField = ""
+    End If
+    Err.Clear
+End Function
+
+Function IsFastenerExcelRow(rowIndex)
+    On Error Resume Next
+    IsFastenerExcelRow = False
+    Dim used
+    Dim maxCol
+    Dim c
+    Dim scanText
     Dim keywords
     Dim kw
     Dim normalizedKw
+    Set used = gWsBom.UsedRange
+    maxCol = used.Column + used.Columns.Count - 1
     scanText = ""
-    For i = 1 To ListCount(gNativeHeaders)
-        scanText = scanText & " " & GetNativeValue(rec, i)
+    For c = 1 To maxCol
+        If c <> gImageColumnIndex And c <> gImagePathColumnIndex And c <> gExportStatusColumnIndex And c <> gImageSkipReasonColumnIndex Then
+            scanText = scanText & " " & CStr(gWsBom.Cells(rowIndex, c).Value)
+        End If
     Next
     scanText = NormalizeFastenerText(scanText)
     keywords = Split(FASTENER_KEYWORDS, "|")
@@ -1088,7 +1533,7 @@ Function IsFastenerBomRow(rec)
         normalizedKw = NormalizeFastenerText(CStr(kw))
         If normalizedKw <> "" Then
             If InStr(1, scanText, normalizedKw, vbTextCompare) > 0 Then
-                IsFastenerBomRow = True
+                IsFastenerExcelRow = True
                 Exit Function
             End If
         End If
@@ -1132,27 +1577,34 @@ End Function
 Function GetProductSourceFilePath(prod)
     On Error Resume Next
     Dim refProd
-    Dim pathText
-    pathText = TryGetMasterShapePath(prod)
-    If pathText <> "" Then
-        GetProductSourceFilePath = pathText
-        Exit Function
-    End If
+    Dim candidate
     Set refProd = prod.ReferenceProduct
     If Not refProd Is Nothing Then
-        pathText = FindSourcePathInObjectChain(refProd)
-        If pathText <> "" Then
-            GetProductSourceFilePath = pathText
-            Exit Function
-        End If
-        pathText = TryGetMasterShapePath(refProd)
-        If pathText <> "" Then
-            GetProductSourceFilePath = pathText
+        candidate = FindSourcePathInObjectChain(refProd.Parent)
+        If candidate <> "" Then
+            GetProductSourceFilePath = candidate
             Exit Function
         End If
     End If
-    pathText = FindSourcePathInObjectChain(prod)
-    If pathText <> "" Then GetProductSourceFilePath = pathText
+    candidate = FindSourcePathInObjectChain(prod.Parent)
+    If candidate <> "" Then
+        GetProductSourceFilePath = candidate
+        Exit Function
+    End If
+    candidate = TryGetMasterShapePath(prod)
+    If candidate <> "" Then
+        GetProductSourceFilePath = candidate
+        Exit Function
+    End If
+    If Not refProd Is Nothing Then
+        candidate = TryGetMasterShapePath(refProd)
+        If candidate <> "" Then
+            GetProductSourceFilePath = candidate
+            Exit Function
+        End If
+    End If
+    candidate = FindSourcePathInObjectChain(prod)
+    If candidate <> "" Then GetProductSourceFilePath = candidate
     Err.Clear
 End Function
 
@@ -1194,16 +1646,6 @@ Function FindSourcePathInObjectChain(startObj)
     Err.Clear
 End Function
 
-Function LooksLikeFilePath(pathText)
-    LooksLikeFilePath = (CStr(pathText) <> "" And gFSO.GetExtensionName(CStr(pathText)) <> "")
-End Function
-
-Function IsSupportedCatiaSourceFile(sourcePath)
-    Dim ext
-    ext = LCase(gFSO.GetExtensionName(CStr(sourcePath)))
-    IsSupportedCatiaSourceFile = (ext = "catpart" Or ext = "catproduct")
-End Function
-
 Function FindOpenDocumentByFullName(sourcePath, foundDoc)
     On Error Resume Next
     FindOpenDocumentByFullName = False
@@ -1230,6 +1672,10 @@ Function GetDocumentFullName(doc)
     Err.Clear
 End Function
 
+Function LooksLikeFilePath(pathText)
+    LooksLikeFilePath = (CStr(pathText) <> "" And gFSO.GetExtensionName(CStr(pathText)) <> "")
+End Function
+
 Function SamePath(pathA, pathB)
     SamePath = (UCase(Trim(CStr(pathA))) = UCase(Trim(CStr(pathB))) And Trim(CStr(pathA)) <> "")
 End Function
@@ -1243,16 +1689,13 @@ Function NormalizePartNumber(value)
     s = Replace(s, vbCr, " ")
     s = Replace(s, vbLf, " ")
     s = Trim(s)
-
     Do While Len(s) > 0 And IsTrailingPartNumberSeparator(Right(s, 1))
         s = Left(s, Len(s) - 1)
         s = Trim(s)
     Loop
-
     Do While InStr(1, s, "  ", vbTextCompare) > 0
         s = Replace(s, "  ", " ")
     Loop
-
     NormalizePartNumber = UCase(s)
 End Function
 
@@ -1281,27 +1724,25 @@ Function FindUniqueSourceIndexCandidate(normalizedPartNumber)
     Dim wantedNoRev
     Dim matchCount
     Dim matchKey
-
     normalizedPartNumber = NormalizePartNumber(normalizedPartNumber)
     wantedNoRev = PartNumberWithoutRevision(normalizedPartNumber)
     matchCount = 0
     matchKey = ""
-
+    If Len(normalizedPartNumber) < 5 Then Exit Function
     For Each key In gSourceIndex.Keys
         keyNoRev = PartNumberWithoutRevision(CStr(key))
-        If keyNoRev = wantedNoRev Then
+        If (keyNoRev = wantedNoRev Or IsSafePartialPartNumberMatch(normalizedPartNumber, CStr(key))) Then
+            If SelectBestSourceCandidate(CStr(gSourceIndex.Item(CStr(key))), "SAFE_UNIQUE_PARTIAL") <> "" Then
             matchCount = matchCount + 1
             matchKey = CStr(key)
-        ElseIf IsSafePartialPartNumberMatch(normalizedPartNumber, CStr(key)) Then
-            matchCount = matchCount + 1
-            matchKey = CStr(key)
+            End If
         End If
         If matchCount > 1 Then
             matchKey = ""
             Exit For
         End If
     Next
-
+    ResetLastSourceMatch
     FindUniqueSourceIndexCandidate = matchKey
     Err.Clear
 End Function
@@ -1310,8 +1751,7 @@ Function IsSafePartialPartNumberMatch(a, b)
     a = NormalizePartNumber(a)
     b = NormalizePartNumber(b)
     If a = "" Or b = "" Then Exit Function
-    If Len(a) < 6 Or Len(b) < 6 Then Exit Function
-
+    If Len(a) < 5 Or Len(b) < 5 Then Exit Function
     If Len(a) < Len(b) Then
         If Left(b, Len(a)) = a Then IsSafePartialPartNumberMatch = IsPartNumberBoundary(Mid(b, Len(a) + 1, 1))
     ElseIf Len(b) < Len(a) Then
@@ -1323,230 +1763,81 @@ Function IsPartNumberBoundary(ch)
     IsPartNumberBoundary = (ch = "" Or ch = " " Or ch = "_" Or ch = "-" Or ch = "." Or ch = "/" Or ch = "," Or ch = ";" Or ch = ":" Or ch = "|")
 End Function
 
-Function DetectDelimiter(lineText)
-    Dim delims
-    Dim bestDelim
-    Dim bestCount
-    Dim d
-    Dim cnt
-    delims = Array(vbTab, ";", "|", ",")
-    bestDelim = ""
-    bestCount = 0
-    For Each d In delims
-        cnt = CountSubstring(CStr(lineText), CStr(d))
-        If cnt > bestCount Then
-            bestCount = cnt
-            bestDelim = CStr(d)
-        End If
-    Next
-    If bestCount > 0 Then DetectDelimiter = bestDelim
-End Function
-
-Function ParseDelimitedLine(lineText, delim)
-    Dim result
-    Dim current
+Function NormalizeHeaderName(valueText)
+    Dim s
     Dim i
     Dim ch
-    Dim inQuotes
-    result = EmptyArray()
-    current = ""
-    inQuotes = False
-    For i = 1 To Len(lineText)
-        ch = Mid(lineText, i, 1)
-        If ch = """" Then
-            If inQuotes And i < Len(lineText) And Mid(lineText, i + 1, 1) = """" Then
-                current = current & """"
-                i = i + 1
-            Else
-                inQuotes = Not inQuotes
-            End If
-        ElseIf ch = delim And Not inQuotes Then
-            result = ArrayPush(result, current)
-            current = ""
-        Else
-            current = current & ch
-        End If
+    Dim code
+    Dim outText
+    s = UCase(Trim(CStr(valueText)))
+    s = Replace(s, ChrW(&H10C), "C")
+    s = Replace(s, ChrW(&H10D), "C")
+    s = Replace(s, ChrW(&H106), "C")
+    s = Replace(s, ChrW(&H107), "C")
+    s = Replace(s, ChrW(&H160), "S")
+    s = Replace(s, ChrW(&H161), "S")
+    s = Replace(s, ChrW(&H110), "D")
+    s = Replace(s, ChrW(&H111), "D")
+    s = Replace(s, ChrW(&H17D), "Z")
+    s = Replace(s, ChrW(&H17E), "Z")
+    outText = ""
+    For i = 1 To Len(s)
+        ch = Mid(s, i, 1)
+        code = Asc(ch)
+        If (code >= 48 And code <= 57) Or (code >= 65 And code <= 90) Then outText = outText & ch
     Next
-    result = ArrayPush(result, current)
-    ParseDelimitedLine = result
+    NormalizeHeaderName = outText
 End Function
 
-Function LooksLikeBomHeader(cells)
-    Dim text
-    Dim i
-    text = ""
-    For i = LBound(cells) To UBound(cells)
-        text = text & " " & NormalizeHeaderName(CStr(cells(i)))
-    Next
-    LooksLikeBomHeader = (CountUsefulCells(cells) >= 2 And _
-        (InStr(text, "partnumber") > 0 Or InStr(text, "number") > 0 Or InStr(text, "quantity") > 0 Or _
-         InStr(text, "qty") > 0 Or InStr(text, "nomenclature") > 0 Or InStr(text, "description") > 0 Or _
-         InStr(text, "brojdela") > 0 Or InStr(text, "kolicina") > 0))
-End Function
-
-Function CountUsefulCells(cells)
-    Dim i
-    CountUsefulCells = 0
+Function LastUsedRow(ws)
     On Error Resume Next
-    For i = LBound(cells) To UBound(cells)
-        If Trim(CStr(cells(i))) <> "" Then CountUsefulCells = CountUsefulCells + 1
-    Next
+    LastUsedRow = ws.Cells(ws.Rows.Count, 1).End(XL_UP).Row
+    Dim used
+    Set used = ws.UsedRange
+    If used.Row + used.Rows.Count - 1 > LastUsedRow Then LastUsedRow = used.Row + used.Rows.Count - 1
     Err.Clear
 End Function
 
-Function IsSeparatorRow(cells)
-    Dim i
-    Dim s
-    IsSeparatorRow = True
-    For i = LBound(cells) To UBound(cells)
-        s = Replace(Replace(Trim(CStr(cells(i))), "-", ""), "=", "")
-        If s <> "" Then
-            IsSeparatorRow = False
-            Exit Function
-        End If
-    Next
+Function LastUsedColumn(ws)
+    On Error Resume Next
+    LastUsedColumn = ws.Cells(gHeaderRow, ws.Columns.Count).End(XL_TO_LEFT).Column
+    Err.Clear
 End Function
 
-Function FindHeaderIndexInList(headers, possibleNames)
-    Dim names
-    Dim nm
-    Dim i
-    Dim h
-    names = Split(possibleNames, "|")
-    For i = 1 To ListCount(headers)
-        h = NormalizeHeaderName(CStr(ListValue(headers, i)))
-        For Each nm In names
-            If h = NormalizeHeaderName(CStr(nm)) Then
-                FindHeaderIndexInList = i
+Function RowHasAnyData(rowIndex)
+    On Error Resume Next
+    RowHasAnyData = False
+    Dim used
+    Dim maxCol
+    Dim c
+    Set used = gWsBom.UsedRange
+    maxCol = used.Column + used.Columns.Count - 1
+    For c = 1 To maxCol
+        If c <> gImageColumnIndex And c <> gImagePathColumnIndex And c <> gExportStatusColumnIndex And c <> gImageSkipReasonColumnIndex Then
+            If Trim(CStr(gWsBom.Cells(rowIndex, c).Value)) <> "" Then
+                RowHasAnyData = True
                 Exit Function
             End If
-        Next
+        End If
     Next
-End Function
-
-Function NormalizeHeaderName(valueText)
-    Dim s
-    s = LCase(Trim(CStr(valueText)))
-    s = Replace(s, ChrW(&H10D), "c")
-    s = Replace(s, ChrW(&H107), "c")
-    s = Replace(s, ChrW(&H161), "s")
-    s = Replace(s, ChrW(&H111), "d")
-    s = Replace(s, ChrW(&H17E), "z")
-    s = Replace(s, ".", "")
-    s = Replace(s, " ", "")
-    s = Replace(s, "_", "")
-    s = Replace(s, "-", "")
-    NormalizeHeaderName = s
-End Function
-
-Function HtmlToText(htmlText)
-    Dim re
-    Set re = CreateObject("VBScript.RegExp")
-    re.Global = True
-    re.IgnoreCase = True
-    re.Pattern = "<[^>]+>"
-    HtmlToText = re.Replace(CStr(htmlText), "")
-    HtmlToText = Replace(HtmlToText, "&nbsp;", " ")
-    HtmlToText = Replace(HtmlToText, "&amp;", "&")
-    HtmlToText = Replace(HtmlToText, "&lt;", "<")
-    HtmlToText = Replace(HtmlToText, "&gt;", ">")
-    HtmlToText = Replace(HtmlToText, "&quot;", """")
-    HtmlToText = Trim(HtmlToText)
-End Function
-
-Function JoinHeaderNames()
-    Dim i
-    Dim s
-    s = ""
-    For i = 1 To ListCount(gNativeHeaders)
-        If s <> "" Then s = s & " | "
-        s = s & CStr(ListValue(gNativeHeaders, i))
-    Next
-    JoinHeaderNames = s
+    Err.Clear
 End Function
 
 Sub ApplyBomBorders()
     On Error Resume Next
-    Dim lastRow
-    Dim lastCol
-    lastRow = ListCount(gBomRows) + 1
-    lastCol = gImageSkipReasonColumnIndex
-    gWsBom.Range(gWsBom.Cells(1, 1), gWsBom.Cells(lastRow, lastCol)).Borders.LineStyle = XL_CONTINUOUS
-    gWsBom.Range(gWsBom.Cells(1, 1), gWsBom.Cells(lastRow, lastCol)).Borders.Weight = XL_THIN
-    gWsBom.Range(gWsBom.Cells(1, 1), gWsBom.Cells(lastRow, lastCol)).VerticalAlignment = XL_TOP
+    Dim used
+    Set used = gWsBom.UsedRange
+    used.Borders.LineStyle = XL_CONTINUOUS
+    used.Borders.Weight = XL_THIN
+    used.VerticalAlignment = XL_TOP
     Err.Clear
 End Sub
 
-Function CountSubstring(textValue, token)
-    Dim p
-    Dim startAt
-    If token = "" Then Exit Function
-    startAt = 1
-    Do
-        p = InStr(startAt, textValue, token, vbBinaryCompare)
-        If p <= 0 Then Exit Do
-        CountSubstring = CountSubstring + 1
-        startAt = p + Len(token)
-    Loop
-End Function
-
-Function EmptyArray()
-    EmptyArray = Array()
-End Function
-
-Function ArrayPush(arr, value)
-    Dim n
-    Dim tmp()
-    Dim i
+Function GetDefaultOutputFolder()
     On Error Resume Next
-    n = UBound(arr) + 1
-    If Err.Number <> 0 Then
-        Err.Clear
-        ReDim tmp(0)
-        tmp(0) = value
-        ArrayPush = tmp
-        Exit Function
-    End If
-    ReDim tmp(n)
-    For i = 0 To n - 1
-        tmp(i) = arr(i)
-    Next
-    tmp(n) = value
-    ArrayPush = tmp
-End Function
-
-Function NewList()
-    Set NewList = CreateObject("Scripting.Dictionary")
-End Function
-
-Sub ListAddValue(listObj, valueText)
-    listObj.Item(CStr(listObj.Count + 1)) = valueText
-End Sub
-
-Sub ListAddObject(listObj, obj)
-    Set listObj.Item(CStr(listObj.Count + 1)) = obj
-End Sub
-
-Function ListCount(listObj)
-    ListCount = listObj.Count
-End Function
-
-Function ListValue(listObj, indexNumber)
-    ListValue = listObj.Item(CStr(indexNumber))
-End Function
-
-Function ListObject(listObj, indexNumber)
-    Set ListObject = listObj.Item(CStr(indexNumber))
-End Function
-
-Function FirstNonEmpty(a, b, c)
-    If Trim(CStr(a)) <> "" Then
-        FirstNonEmpty = CStr(a)
-    ElseIf Trim(CStr(b)) <> "" Then
-        FirstNonEmpty = CStr(b)
-    Else
-        FirstNonEmpty = CStr(c)
-    End If
+    GetDefaultOutputFolder = CStr(gProductDocument.Path)
+    If GetDefaultOutputFolder = "" Then GetDefaultOutputFolder = gShell.SpecialFolders("Desktop")
+    Err.Clear
 End Function
 
 Sub EnsureFolder(folderPath)
@@ -1558,6 +1849,14 @@ Function JoinPath(folderPath, fileName)
         JoinPath = CStr(folderPath) & CStr(fileName)
     Else
         JoinPath = CStr(folderPath) & "\" & CStr(fileName)
+    End If
+End Function
+
+Function AddTrailingSlash(folderPath)
+    If Right(CStr(folderPath), 1) = "\" Then
+        AddTrailingSlash = CStr(folderPath)
+    Else
+        AddTrailingSlash = CStr(folderPath) & "\"
     End If
 End Function
 

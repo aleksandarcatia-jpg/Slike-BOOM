@@ -259,14 +259,14 @@ Function TryWriteFromTreeReferenceProduct(prod, sourcePath, propertyName, proper
     Err.Clear
     Set refProd = prod.ReferenceProduct
     If Err.Number <> 0 Or refProd Is Nothing Then
-        LogMethodFailure "TREE_REFERENCE_PRODUCT_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, Err.Description
+        LogUserRefPropertiesFailure "TREE_REFERENCE_PRODUCT_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, Err.Description
         Err.Clear
         Exit Function
     End If
     Err.Clear
     Set props = refProd.UserRefProperties
     If Err.Number <> 0 Or props Is Nothing Then
-        LogMethodFailure "TREE_REFERENCE_PRODUCT_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, Err.Description
+        LogUserRefPropertiesFailure "TREE_REFERENCE_PRODUCT_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, Err.Description
         Err.Clear
         Exit Function
     End If
@@ -281,7 +281,7 @@ Function TryWriteFromTreeInstance(prod, sourcePath, propertyName, propertyValue,
     Err.Clear
     Set props = prod.UserRefProperties
     If Err.Number <> 0 Or props Is Nothing Then
-        LogMethodFailure "TREE_INSTANCE_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, Err.Description
+        LogUserRefPropertiesFailure "TREE_INSTANCE_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, Err.Description
         Err.Clear
         Exit Function
     End If
@@ -296,13 +296,13 @@ Function TryWriteFromRecorderDereference(prod, sourcePath, propertyName, propert
     Dim props
     Set refProd = GetRecorderStyleReferenceProduct(prod)
     If refProd Is Nothing Then
-        LogMethodFailure "RECORDER_DEREFERENCE_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, 0, "Recorder-style ReferenceProduct dereference returned Nothing."
+        LogUserRefPropertiesFailure "RECORDER_DEREFERENCE_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, 0, "Recorder-style ReferenceProduct dereference returned Nothing."
         Exit Function
     End If
     Err.Clear
     Set props = refProd.UserRefProperties
     If Err.Number <> 0 Or props Is Nothing Then
-        LogMethodFailure "RECORDER_DEREFERENCE_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, Err.Description
+        LogUserRefPropertiesFailure "RECORDER_DEREFERENCE_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, Err.Description
         Err.Clear
         Exit Function
     End If
@@ -461,13 +461,11 @@ Function TryCreateOrUpdateInProperties(props, methodName, productName, partNumbe
     On Error Resume Next
     TryCreateOrUpdateInProperties = False
     Dim param
-    Dim localStatus
     ResetLastWriteInfo
     gLastWriteMethod = methodName
 
-    Err.Clear
-    Set param = props.Item(CStr(propertyName))
-    If Err.Number = 0 And Not param Is Nothing Then
+    Set param = Nothing
+    If TryGetExistingProperty(props, propertyName, methodName, productName, partNumber, referenceKey, sourcePath, propertyValue, param) Then
         If SetExistingParameterValue(param, propertyValue, methodName, productName, partNumber, referenceKey, sourcePath, propertyName) Then
             gLastWriteStatus = "UPDATED"
             gLastReadbackOk = ReadbackFromProperties(props, methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue)
@@ -479,20 +477,14 @@ Function TryCreateOrUpdateInProperties(props, methodName, productName, partNumbe
 
     Err.Clear
     Set param = Nothing
-    Set param = props.CreateString(CStr(propertyName), CStr(propertyValue))
-    If Err.Number = 0 And Not param Is Nothing Then
-        SetParameterValueAfterCreate param, propertyValue, methodName, productName, partNumber, referenceKey, sourcePath, propertyName
-        gLastWriteStatus = "CREATED"
-        gLastReadbackOk = ReadbackFromProperties(props, methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue)
-        TryCreateOrUpdateInProperties = True
-        Exit Function
-    End If
-    LogMethodFailure methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, "CreateString(propertyName, propertyValue) failed. " & Err.Description
-
-    Err.Clear
-    Set param = Nothing
     Set param = props.CreateString(CStr(propertyName), "")
     If Err.Number = 0 And Not param Is Nothing Then
+        WritePatchEvent "CREATESTRING_EMPTY_OK", productName, partNumber, referenceKey, sourcePath, methodName, propertyName, propertyValue, "CREATESTRING_EMPTY_OK", 0, "CreateString(propertyName, empty) OK."
+        If InitializeCreatedStringParameter(param, methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue) Then
+            gLastReadbackOk = ReadbackFromProperties(props, methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue)
+        Else
+            gLastReadbackOk = False
+        End If
         If SetParameterValueAfterCreate(param, propertyValue, methodName, productName, partNumber, referenceKey, sourcePath, propertyName) Then
             gLastWriteStatus = "CREATED"
             gLastReadbackOk = ReadbackFromProperties(props, methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue)
@@ -500,7 +492,46 @@ Function TryCreateOrUpdateInProperties(props, methodName, productName, partNumbe
             Exit Function
         End If
     Else
-        LogMethodFailure methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, "CreateString(propertyName, empty) failed. " & Err.Description
+        LogMethodFailure methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, "CREATESTRING_EMPTY_FAILED. CreateString(propertyName, empty) failed. " & Err.Description
+    End If
+    Err.Clear
+End Function
+
+Function TryGetExistingProperty(props, propertyName, methodName, productName, partNumber, referenceKey, sourcePath, propertyValue, existingParam)
+    On Error Resume Next
+    TryGetExistingProperty = False
+    Set existingParam = Nothing
+
+    Err.Clear
+    Set existingParam = props.Item(CStr(propertyName))
+    If Err.Number <> 0 Or existingParam Is Nothing Then
+        WritePatchEvent "PROPERTY_NOT_FOUND_CREATE_NEEDED", productName, partNumber, referenceKey, sourcePath, methodName, propertyName, propertyValue, "PROPERTY_NOT_FOUND_CREATE_NEEDED", Err.Number, "Property does not exist or props.Item returned Nothing; create is needed. " & Err.Description
+        Err.Clear
+        Set existingParam = Nothing
+        Exit Function
+    End If
+
+    Err.Clear
+    existingParam.ValuateFromString CStr(propertyValue)
+    If Err.Number = 0 Then
+        TryGetExistingProperty = True
+        Exit Function
+    End If
+
+    If Err.Number = 424 Then
+        WritePatchEvent "PROPERTY_NOT_FOUND_CREATE_NEEDED", productName, partNumber, referenceKey, sourcePath, methodName, propertyName, propertyValue, "PROPERTY_NOT_FOUND_CREATE_NEEDED", Err.Number, "props.Item returned an invalid object; create is needed. " & Err.Description
+        Err.Clear
+        Set existingParam = Nothing
+        Exit Function
+    End If
+
+    Err.Clear
+    existingParam.Value = CStr(propertyValue)
+    If Err.Number = 0 Then
+        TryGetExistingProperty = True
+    Else
+        LogMethodFailure methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, "Existing parameter probe failed. " & Err.Description
+        Set existingParam = Nothing
     End If
     Err.Clear
 End Function
@@ -526,12 +557,27 @@ Function SetExistingParameterValue(param, propertyValue, methodName, productName
     Err.Clear
 End Function
 
+Function InitializeCreatedStringParameter(param, methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue)
+    On Error Resume Next
+    InitializeCreatedStringParameter = False
+    Err.Clear
+    param.ValuateFromString ""
+    If Err.Number = 0 Then
+        WritePatchEvent "INITIAL_EMPTY_VALUATE_OK", productName, partNumber, referenceKey, sourcePath, methodName, propertyName, propertyValue, "INITIAL_EMPTY_VALUATE_OK", 0, "Recorder-style ValuateFromString empty OK."
+        InitializeCreatedStringParameter = True
+        Exit Function
+    End If
+    LogMethodFailure methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, "Initial empty ValuateFromString failed. " & Err.Description
+    Err.Clear
+End Function
+
 Function SetParameterValueAfterCreate(param, propertyValue, methodName, productName, partNumber, referenceKey, sourcePath, propertyName)
     On Error Resume Next
     SetParameterValueAfterCreate = False
     Err.Clear
     param.ValuateFromString CStr(propertyValue)
     If Err.Number = 0 Then
+        WritePatchEvent "FINAL_VALUE_SET_OK", productName, partNumber, referenceKey, sourcePath, methodName, propertyName, propertyValue, "FINAL_VALUE_SET_OK", 0, "Created.ValuateFromString final value OK."
         SetParameterValueAfterCreate = True
         Exit Function
     End If
@@ -540,6 +586,7 @@ Function SetParameterValueAfterCreate(param, propertyValue, methodName, productN
     Err.Clear
     param.Value = CStr(propertyValue)
     If Err.Number = 0 Then
+        WritePatchEvent "FINAL_VALUE_SET_OK", productName, partNumber, referenceKey, sourcePath, methodName, propertyName, propertyValue, "FINAL_VALUE_SET_OK", 0, "Created.Value final value OK."
         SetParameterValueAfterCreate = True
     Else
         LogMethodFailure methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, Err.Number, "Created.Value failed. " & Err.Description
@@ -567,11 +614,14 @@ Sub LogMethodFailure(methodName, productName, partNumber, referenceKey, sourcePa
     gLastWriteMethod = methodName
     gLastWriteErrNumber = CLng(Val(errNumber))
     gLastWriteErrDescription = CStr(errDescription)
-    If methodName = "TREE_REFERENCE_PRODUCT_USERREFPROPERTIES" Or methodName = "TREE_INSTANCE_USERREFPROPERTIES" Or methodName = "RECORDER_DEREFERENCE_USERREFPROPERTIES" Then
-        WritePatchEvent "NO_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, methodName, propertyName, propertyValue, "NO_USERREFPROPERTIES", gLastWriteErrNumber, gLastWriteErrDescription
-    Else
-        WritePatchEvent "PROPERTY_WRITE_FAILED", productName, partNumber, referenceKey, sourcePath, methodName, propertyName, propertyValue, "PROPERTY_WRITE_FAILED", gLastWriteErrNumber, gLastWriteErrDescription
-    End If
+    WritePatchEvent "PROPERTY_WRITE_FAILED", productName, partNumber, referenceKey, sourcePath, methodName, propertyName, propertyValue, "PROPERTY_WRITE_FAILED", gLastWriteErrNumber, gLastWriteErrDescription
+End Sub
+
+Sub LogUserRefPropertiesFailure(methodName, productName, partNumber, referenceKey, sourcePath, propertyName, propertyValue, errNumber, errDescription)
+    gLastWriteMethod = methodName
+    gLastWriteErrNumber = CLng(Val(errNumber))
+    gLastWriteErrDescription = CStr(errDescription)
+    WritePatchEvent "NO_USERREFPROPERTIES", productName, partNumber, referenceKey, sourcePath, methodName, propertyName, propertyValue, "NO_USERREFPROPERTIES", gLastWriteErrNumber, gLastWriteErrDescription
 End Sub
 
 Sub ResetLastWriteInfo()

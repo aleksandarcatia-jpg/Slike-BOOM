@@ -1,0 +1,441 @@
+Language="VBSCRIPT"
+
+Sub CATMain()
+    CATIA_BOM_EXCEL_INSERT_IMAGES
+End Sub
+
+' ================================================================
+' CATIA_BOM_EXCEL_INSERT_IMAGES
+' Postprocesses a CATIA BOM Excel file: reads image paths from the
+' "Slika" column and embeds the actual images into those cells.
+' ================================================================
+
+Const IMAGE_COLUMN_WIDTH = 20
+Const IMAGE_ROW_HEIGHT = 90
+Const MAX_IMAGE_WIDTH = 140
+Const MAX_IMAGE_HEIGHT = 80
+Const XL_UP = -4162
+Const XL_TO_LEFT = -4159
+Const XL_OPENXML_WORKBOOK = 51
+Const MSO_TRUE = -1
+Const MSO_FALSE = 0
+Const MSO_CTRUE = -1
+Const MSO_FILEDIALOG_FILE_PICKER = 3
+Const MSO_PLACEMENT_MOVE_AND_SIZE = 1
+Const WORK_ROOT = "C:\Temp\CATIA_BOM_IMAGE_PATCH"
+Const LOG_FILE_NAME = "CATIA_BOM_EXCEL_INSERT_IMAGES_LOG.txt"
+
+Dim gFSO
+Dim gExcelApp
+Dim gWorkbook
+Dim gWs
+Dim gExcelPath
+Dim gFinalPath
+Dim gLogPath
+Dim gHeaderRow
+Dim gImageColumnIndex
+Dim gImagePathColumnIndex
+Dim gExportStatusColumnIndex
+Dim gImageSkipReasonColumnIndex
+Dim gInsertedCount
+Dim gSkippedCount
+Dim gErrorCount
+
+Sub CATIA_BOM_EXCEL_INSERT_IMAGES()
+    On Error Resume Next
+    InitializeExcelInsertRuntime
+    WriteInsertLog "START", 0, "", "", "CATIA_BOM_EXCEL_INSERT_IMAGES started."
+
+    gExcelPath = AskUserForExistingBomExcel()
+    If gExcelPath = "" Then
+        WriteInsertLog "ERROR", 0, "", "", "User cancelled Excel selection."
+        MsgBox "Export je otkazan od strane korisnika.", vbInformation, "CATIA_BOM_EXCEL_INSERT_IMAGES"
+        Exit Sub
+    End If
+
+    If Not OpenWorkbook(gExcelPath) Then
+        MsgBox "Excel BOM fajl nije mogao da se otvori:" & vbCrLf & gExcelPath, vbCritical, "CATIA_BOM_EXCEL_INSERT_IMAGES"
+        Exit Sub
+    End If
+
+    If Not FindImageHeaderColumn() Then
+        MsgBox "Kolona Slika nije pronadjena u Excel BOM-u.", vbCritical, "CATIA_BOM_EXCEL_INSERT_IMAGES"
+        WriteInsertLog "ERROR", 0, "", "", "Image column not found."
+        Exit Sub
+    End If
+
+    EnsureHelperColumns
+    InsertImagesFromSlikaColumn
+    SaveWorkbookWithImages
+
+    WriteInsertLog "FINISH", 0, "", gFinalPath, "Inserted=" & CStr(gInsertedCount) & "; Skipped=" & CStr(gSkippedCount) & "; Errors=" & CStr(gErrorCount)
+    MsgBox "Excel insert image postprocess je zavrsen." & vbCrLf & _
+           "Ubacene slike: " & CStr(gInsertedCount) & vbCrLf & _
+           "Preskoceno: " & CStr(gSkippedCount) & vbCrLf & _
+           "Greske: " & CStr(gErrorCount) & vbCrLf & vbCrLf & _
+           "Finalni Excel:" & vbCrLf & gFinalPath, _
+           vbInformation, "CATIA_BOM_EXCEL_INSERT_IMAGES"
+    Err.Clear
+End Sub
+
+Sub InitializeExcelInsertRuntime()
+    On Error Resume Next
+    Set gFSO = CreateObject("Scripting.FileSystemObject")
+    EnsureFolder "C:\Temp"
+    EnsureFolder WORK_ROOT
+    gLogPath = JoinPath(WORK_ROOT, LOG_FILE_NAME)
+    Set gExcelApp = Nothing
+    Set gWorkbook = Nothing
+    Set gWs = Nothing
+    gInsertedCount = 0
+    gSkippedCount = 0
+    gErrorCount = 0
+    Err.Clear
+End Sub
+
+Function AskUserForExistingBomExcel()
+    On Error Resume Next
+    AskUserForExistingBomExcel = ""
+    Dim xl
+    Dim fd
+    Dim selectedPath
+    Set xl = CreateObject("Excel.Application")
+    If Err.Number = 0 And Not xl Is Nothing Then
+        xl.Visible = False
+        Set fd = xl.FileDialog(MSO_FILEDIALOG_FILE_PICKER)
+        fd.Title = "Izaberite CATIA BOM Excel fajl sa kolonom Slika"
+        fd.AllowMultiSelect = False
+        fd.Filters.Clear
+        fd.Filters.Add "Excel files", "*.xls;*.xlsx;*.xlsm"
+        If fd.Show = -1 Then selectedPath = CStr(fd.SelectedItems.Item(1))
+        xl.Quit
+        Set xl = Nothing
+    End If
+    If selectedPath = "" Then
+        Err.Clear
+        selectedPath = InputBox("Unesite punu putanju do CATIA BOM Excel fajla:", "CATIA_BOM_EXCEL_INSERT_IMAGES", "")
+    End If
+    If selectedPath <> "" Then
+        If gFSO.FileExists(CStr(selectedPath)) Then AskUserForExistingBomExcel = CStr(selectedPath)
+    End If
+    Err.Clear
+End Function
+
+Function OpenWorkbook(excelPath)
+    On Error Resume Next
+    OpenWorkbook = False
+    Set gExcelApp = CreateObject("Excel.Application")
+    If Err.Number <> 0 Or gExcelApp Is Nothing Then
+        Err.Clear
+        Exit Function
+    End If
+    gExcelApp.Visible = True
+    gExcelApp.DisplayAlerts = False
+    Set gWorkbook = gExcelApp.Workbooks.Open(excelPath)
+    gExcelApp.DisplayAlerts = True
+    If Err.Number = 0 And Not gWorkbook Is Nothing Then
+        Set gWs = gWorkbook.Worksheets(1)
+        OpenWorkbook = True
+        WriteInsertLog "EXCEL_OPENED", 0, "", excelPath, "Workbook opened."
+    End If
+    Err.Clear
+End Function
+
+Function FindImageHeaderColumn()
+    On Error Resume Next
+    FindImageHeaderColumn = False
+    Dim used
+    Dim maxRow
+    Dim maxCol
+    Dim r
+    Dim c
+    Dim priority
+    Dim bestPriority
+    Set used = gWs.UsedRange
+    maxRow = used.Row + used.Rows.Count - 1
+    maxCol = used.Column + used.Columns.Count - 1
+    If maxRow > 30 Then maxRow = 30
+    If maxCol > 120 Then maxCol = 120
+    bestPriority = 999
+
+    For r = 1 To maxRow
+        For c = 1 To maxCol
+            priority = ImageHeaderPriority(CStr(gWs.Cells(r, c).Value))
+            If priority > 0 And priority < bestPriority Then
+                bestPriority = priority
+                gHeaderRow = r
+                gImageColumnIndex = c
+            End If
+        Next
+    Next
+
+    If gImageColumnIndex > 0 Then
+        FindImageHeaderColumn = True
+        WriteInsertLog "IMAGE_COLUMN_FOUND", gHeaderRow, CStr(gImageColumnIndex), CStr(gWs.Cells(gHeaderRow, gImageColumnIndex).Value), "Image column found."
+    End If
+    Err.Clear
+End Function
+
+Function ImageHeaderPriority(headerText)
+    Dim h
+    h = NormalizeHeaderName(headerText)
+    ImageHeaderPriority = 0
+    Select Case h
+        Case "SLIKA"
+            ImageHeaderPriority = 1
+        Case "IMAGE"
+            ImageHeaderPriority = 2
+        Case "PICTURE"
+            ImageHeaderPriority = 3
+        Case "THUMBNAIL"
+            ImageHeaderPriority = 4
+        Case "FOTO"
+            ImageHeaderPriority = 5
+        Case "PREVIEW"
+            ImageHeaderPriority = 6
+    End Select
+End Function
+
+Sub EnsureHelperColumns()
+    On Error Resume Next
+    gImagePathColumnIndex = EnsureEndHelperColumn("Image Path")
+    gExportStatusColumnIndex = EnsureEndHelperColumn("Export Status")
+    gImageSkipReasonColumnIndex = EnsureEndHelperColumn("Image Skip Reason")
+    gWs.Columns(gImageColumnIndex).ColumnWidth = IMAGE_COLUMN_WIDTH
+    gWs.Columns(gImagePathColumnIndex).ColumnWidth = 45
+    gWs.Columns(gExportStatusColumnIndex).ColumnWidth = 24
+    gWs.Columns(gImageSkipReasonColumnIndex).ColumnWidth = 45
+    WriteInsertLog "HELPER_COLUMNS_ADDED", gHeaderRow, "", "", "Helper columns ready."
+    Err.Clear
+End Sub
+
+Function EnsureEndHelperColumn(headerText)
+    On Error Resume Next
+    Dim c
+    Dim lastCol
+    c = FindHeaderColumn(headerText)
+    If c > 0 Then
+        EnsureEndHelperColumn = c
+        Exit Function
+    End If
+    lastCol = LastUsedColumn(gWs) + 1
+    gWs.Cells(gHeaderRow, lastCol).Value = headerText
+    EnsureEndHelperColumn = lastCol
+    Err.Clear
+End Function
+
+Function FindHeaderColumn(headerText)
+    On Error Resume Next
+    FindHeaderColumn = 0
+    Dim maxCol
+    Dim c
+    maxCol = LastUsedColumn(gWs)
+    For c = 1 To maxCol
+        If NormalizeHeaderName(CStr(gWs.Cells(gHeaderRow, c).Value)) = NormalizeHeaderName(headerText) Then
+            FindHeaderColumn = c
+            Exit Function
+        End If
+    Next
+    Err.Clear
+End Function
+
+Sub InsertImagesFromSlikaColumn()
+    On Error Resume Next
+    Dim lastRow
+    Dim rowIndex
+    Dim rawValue
+    lastRow = LastUsedRow(gWs)
+    For rowIndex = gHeaderRow + 1 To lastRow
+        rawValue = Trim(CStr(gWs.Cells(rowIndex, gImageColumnIndex).Value))
+        If rawValue = "" Then
+            SetStatus rowIndex, "NO_IMAGE_PATH", "No image path"
+            gSkippedCount = gSkippedCount + 1
+        ElseIf UCase(rawValue) = "SKIP_FASTENER" Then
+            SetStatus rowIndex, "SKIPPED_FASTENER", "Fastener image skipped"
+            gWs.Cells(rowIndex, gImagePathColumnIndex).Value = rawValue
+            gWs.Cells(rowIndex, gImageColumnIndex).Value = ""
+            gSkippedCount = gSkippedCount + 1
+        ElseIf UCase(rawValue) = "IMAGE_CAPTURE_FAILED" Then
+            SetStatus rowIndex, "IMAGE_CAPTURE_FAILED", "Image capture failed in CATIA prepare macro"
+            gSkippedCount = gSkippedCount + 1
+        ElseIf UCase(rawValue) = "SOURCE_PATH_NOT_FOUND" Then
+            SetStatus rowIndex, "SOURCE_PATH_NOT_FOUND", "Source path was not found in CATIA prepare macro"
+            gSkippedCount = gSkippedCount + 1
+        ElseIf IsImageFilePath(rawValue) And gFSO.FileExists(rawValue) Then
+            If InsertImageIntoCell(rowIndex, rawValue) Then
+                gWs.Cells(rowIndex, gImagePathColumnIndex).Value = rawValue
+                gWs.Cells(rowIndex, gImageColumnIndex).Value = ""
+                SetStatus rowIndex, "OK", ""
+                gInsertedCount = gInsertedCount + 1
+                WriteInsertLog "IMAGE_INSERTED_IN_EXCEL", rowIndex, rawValue, "", "Image embedded."
+            Else
+                SetStatus rowIndex, "ERROR", "Excel Shapes.AddPicture failed"
+                gErrorCount = gErrorCount + 1
+            End If
+        Else
+            SetStatus rowIndex, "IMAGE_FILE_NOT_FOUND", "Image path does not exist"
+            gWs.Cells(rowIndex, gImagePathColumnIndex).Value = rawValue
+            gSkippedCount = gSkippedCount + 1
+        End If
+        If (rowIndex Mod 25) = 0 Then
+            gWorkbook.Save
+            DoEvents
+            WriteInsertLog "SAVE_CHECKPOINT", rowIndex, "", "", "Workbook saved."
+        End If
+    Next
+    Err.Clear
+End Sub
+
+Function InsertImageIntoCell(rowIndex, imagePath)
+    On Error Resume Next
+    InsertImageIntoCell = False
+    Dim cell
+    Dim pic
+    Set cell = gWs.Cells(rowIndex, gImageColumnIndex)
+    gWs.Rows(rowIndex).RowHeight = IMAGE_ROW_HEIGHT
+    gWs.Columns(gImageColumnIndex).ColumnWidth = IMAGE_COLUMN_WIDTH
+    RemovePicturesInCell cell
+    Err.Clear
+    Set pic = gWs.Shapes.AddPicture(imagePath, False, True, cell.Left + 2, cell.Top + 2, -1, -1)
+    If Err.Number <> 0 Or pic Is Nothing Then
+        Err.Clear
+        Exit Function
+    End If
+    pic.LockAspectRatio = MSO_TRUE
+    If pic.Width > MAX_IMAGE_WIDTH Then pic.Width = MAX_IMAGE_WIDTH
+    If pic.Height > MAX_IMAGE_HEIGHT Then pic.Height = MAX_IMAGE_HEIGHT
+    pic.Left = cell.Left + ((cell.Width - pic.Width) / 2)
+    pic.Top = cell.Top + ((cell.Height - pic.Height) / 2)
+    pic.Placement = MSO_PLACEMENT_MOVE_AND_SIZE
+    InsertImageIntoCell = True
+    Err.Clear
+End Function
+
+Sub RemovePicturesInCell(cell)
+    On Error Resume Next
+    Dim i
+    Dim shp
+    For i = gWs.Shapes.Count To 1 Step -1
+        Set shp = gWs.Shapes.Item(i)
+        If Not shp.TopLeftCell Is Nothing Then
+            If shp.TopLeftCell.Row = cell.Row And shp.TopLeftCell.Column = cell.Column Then shp.Delete
+        End If
+    Next
+    Err.Clear
+End Sub
+
+Sub SetStatus(rowIndex, statusText, reasonText)
+    On Error Resume Next
+    gWs.Cells(rowIndex, gExportStatusColumnIndex).Value = statusText
+    gWs.Cells(rowIndex, gImageSkipReasonColumnIndex).Value = reasonText
+    WriteInsertLog statusText, rowIndex, CStr(gWs.Cells(rowIndex, gImageColumnIndex).Value), "", reasonText
+    Err.Clear
+End Sub
+
+Sub SaveWorkbookWithImages()
+    On Error Resume Next
+    gFinalPath = BuildFinalWorkbookPath(gExcelPath)
+    gExcelApp.DisplayAlerts = False
+    gWorkbook.SaveAs gFinalPath, XL_OPENXML_WORKBOOK
+    If Err.Number <> 0 Then
+        WriteInsertLog "ERROR", 0, "", gFinalPath, "SaveAs failed. Err=" & Err.Description
+        Err.Clear
+        gWorkbook.Save
+    Else
+        WriteInsertLog "FINAL_SAVE_DONE", 0, "", gFinalPath, "Workbook saved as _WITH_IMAGES.xlsx."
+    End If
+    gExcelApp.DisplayAlerts = True
+    Err.Clear
+End Sub
+
+Function BuildFinalWorkbookPath(sourceExcelPath)
+    Dim folderPath
+    Dim baseName
+    Dim finalPath
+    folderPath = gFSO.GetParentFolderName(sourceExcelPath)
+    baseName = gFSO.GetBaseName(sourceExcelPath) & "_WITH_IMAGES"
+    finalPath = JoinPath(folderPath, baseName & ".xlsx")
+    If Not gFSO.FileExists(finalPath) Then
+        BuildFinalWorkbookPath = finalPath
+    Else
+        BuildFinalWorkbookPath = JoinPath(folderPath, baseName & "_" & TimestampForFile() & ".xlsx")
+    End If
+End Function
+
+Function IsImageFilePath(pathText)
+    Dim ext
+    ext = UCase(gFSO.GetExtensionName(CStr(pathText)))
+    IsImageFilePath = (ext = "JPG" Or ext = "JPEG" Or ext = "PNG" Or ext = "BMP" Or ext = "GIF")
+End Function
+
+Function LastUsedRow(ws)
+    On Error Resume Next
+    LastUsedRow = ws.Cells(ws.Rows.Count, 1).End(XL_UP).Row
+    Dim used
+    Set used = ws.UsedRange
+    If used.Row + used.Rows.Count - 1 > LastUsedRow Then LastUsedRow = used.Row + used.Rows.Count - 1
+    Err.Clear
+End Function
+
+Function LastUsedColumn(ws)
+    On Error Resume Next
+    LastUsedColumn = ws.Cells(gHeaderRow, ws.Columns.Count).End(XL_TO_LEFT).Column
+    Err.Clear
+End Function
+
+Function NormalizeHeaderName(valueText)
+    Dim s
+    Dim i
+    Dim ch
+    Dim code
+    Dim outText
+    s = UCase(Trim(CStr(valueText)))
+    s = Replace(s, ChrW(&H10C), "C")
+    s = Replace(s, ChrW(&H10D), "C")
+    s = Replace(s, ChrW(&H106), "C")
+    s = Replace(s, ChrW(&H107), "C")
+    s = Replace(s, ChrW(&H160), "S")
+    s = Replace(s, ChrW(&H161), "S")
+    s = Replace(s, ChrW(&H110), "D")
+    s = Replace(s, ChrW(&H111), "D")
+    s = Replace(s, ChrW(&H17D), "Z")
+    s = Replace(s, ChrW(&H17E), "Z")
+    outText = ""
+    For i = 1 To Len(s)
+        ch = Mid(s, i, 1)
+        code = Asc(ch)
+        If (code >= 48 And code <= 57) Or (code >= 65 And code <= 90) Then outText = outText & ch
+    Next
+    NormalizeHeaderName = outText
+End Function
+
+Function TimestampForFile()
+    Dim d
+    d = Now
+    TimestampForFile = Year(d) & Right("0" & Month(d), 2) & Right("0" & Day(d), 2) & "_" & Right("0" & Hour(d), 2) & Right("0" & Minute(d), 2) & Right("0" & Second(d), 2)
+End Function
+
+Sub WriteInsertLog(phase, rowIndex, valueText, pathText, message)
+    On Error Resume Next
+    Dim ts
+    Set ts = gFSO.OpenTextFile(gLogPath, 8, True)
+    ts.WriteLine Now & vbTab & phase & vbTab & CStr(rowIndex) & vbTab & valueText & vbTab & pathText & vbTab & message
+    ts.Close
+    Err.Clear
+End Sub
+
+Sub EnsureFolder(pathText)
+    On Error Resume Next
+    If Trim(CStr(pathText)) <> "" Then
+        If Not gFSO.FolderExists(pathText) Then gFSO.CreateFolder pathText
+    End If
+    Err.Clear
+End Sub
+
+Function JoinPath(folderPath, fileName)
+    If Right(CStr(folderPath), 1) = "\" Then
+        JoinPath = CStr(folderPath) & CStr(fileName)
+    Else
+        JoinPath = CStr(folderPath) & "\" & CStr(fileName)
+    End If
+End Function

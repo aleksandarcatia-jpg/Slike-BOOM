@@ -1,0 +1,446 @@
+Language="VBSCRIPT"
+
+Sub CATMain()
+    CATIA_BOM_IMAGE_PROPERTY_PATCH
+End Sub
+
+' ================================================================
+' CATIA_BOM_IMAGE_PROPERTY_PATCH
+' Adds/updates the "Slika" user property so it can be selected in
+' CATIA Analyze > Bill of Material > Define Bill of Material.
+' ================================================================
+
+Const IMAGE_PROPERTY_NAME = "Slika"
+Const INITIAL_IMAGE_PROPERTY_VALUE = "PENDING_IMAGE"
+Const FASTENER_IMAGE_PROPERTY_VALUE = "SKIP_FASTENER"
+Const WRITE_CATPART_IMAGE_PROPERTY = True
+Const WRITE_CATPRODUCT_IMAGE_PROPERTY = True
+Const WRITE_ROOT_ASSEMBLY_IMAGE_PROPERTY = False
+Const MARK_FASTENERS_FOR_SKIP = True
+Const ASK_BEFORE_SAVING_CATIA_DOCUMENTS = True
+Const AUTO_SAVE_CATIA_DOCUMENTS = False
+Const WORK_ROOT = "C:\Temp\CATIA_BOM_IMAGE_PATCH"
+Const LOG_FILE_NAME = "CATIA_BOM_IMAGE_PROPERTY_PATCH_LOG.txt"
+Const FASTENER_KEYWORDS = "vijak|vijci|zavrtanj|zavrtnji|screw|bolt|hex bolt|hexagon bolt|imbus|allen screw|navrtka|matica|nut|hex nut|podloska|podloska|washer|plain washer|spring washer|lock washer|DIN 125|DIN125|DIN 127|DIN127|DIN 933|DIN933|DIN 931|DIN931|DIN 934|DIN934|ISO 4014|ISO 4017|ISO 4032|ISO 7089|ISO 7090"
+
+Dim gFSO
+Dim gProductDocument
+Dim gRootProduct
+Dim gRootFullName
+Dim gLogPath
+Dim gPatchedKeys
+Dim gUpdatedCount
+Dim gFastenerCount
+Dim gRootSkippedCount
+Dim gErrorCount
+Dim gVisitedCount
+
+Sub CATIA_BOM_IMAGE_PROPERTY_PATCH()
+    On Error Resume Next
+    InitializePatchRuntime
+    WritePatchLog "START", "", "", "", "CATIA_BOM_IMAGE_PROPERTY_PATCH started."
+
+    If Not ValidateActiveProduct() Then Exit Sub
+    WritePatchLog "ACTIVE_PRODUCT_VALIDATED", gRootProduct.Name, GetProductPartNumber(gRootProduct), "", "Active CATProduct OK."
+    WritePatchLog "ROOT_PRODUCT", gRootProduct.Name, GetProductPartNumber(gRootProduct), gRootFullName, "Root product."
+
+    TraversePatchProduct gRootProduct, True
+
+    If AUTO_SAVE_CATIA_DOCUMENTS Then
+        SaveOpenCatiaDocuments
+    ElseIf ASK_BEFORE_SAVING_CATIA_DOCUMENTS Then
+        AskToSaveOpenCatiaDocuments
+    End If
+
+    CATIA.StatusBar = ""
+    WritePatchLog "FINISH", "", "", "", "Updated=" & CStr(gUpdatedCount) & "; Fasteners=" & CStr(gFastenerCount) & "; RootSkipped=" & CStr(gRootSkippedCount) & "; Errors=" & CStr(gErrorCount)
+
+    MsgBox "Patch zavrsen." & vbCrLf & _
+           "Dodato/azurirano Slika property: " & CStr(gUpdatedCount) & vbCrLf & _
+           "Preskoceno fastenera: " & CStr(gFastenerCount) & vbCrLf & _
+           "Preskocen root assembly: " & CStr(gRootSkippedCount) & vbCrLf & _
+           "Greske: " & CStr(gErrorCount) & vbCrLf & vbCrLf & _
+           "Sada otvorite Analyze -> Bill of Material -> Define Bill of Material i dodajte kolonu Slika.", _
+           vbInformation, "CATIA_BOM_IMAGE_PROPERTY_PATCH"
+    Err.Clear
+End Sub
+
+Sub InitializePatchRuntime()
+    On Error Resume Next
+    Set gFSO = CreateObject("Scripting.FileSystemObject")
+    EnsureFolder "C:\Temp"
+    EnsureFolder WORK_ROOT
+    gLogPath = JoinPath(WORK_ROOT, LOG_FILE_NAME)
+    Set gPatchedKeys = CreateObject("Scripting.Dictionary")
+    gPatchedKeys.CompareMode = 1
+    gUpdatedCount = 0
+    gFastenerCount = 0
+    gRootSkippedCount = 0
+    gErrorCount = 0
+    gVisitedCount = 0
+    Err.Clear
+End Sub
+
+Function ValidateActiveProduct()
+    On Error Resume Next
+    ValidateActiveProduct = False
+    If CATIA.Documents.Count = 0 Then
+        MsgBox "Nema otvorenog CATIA dokumenta. Otvorite glavni CATProduct.", vbExclamation, "CATIA_BOM_IMAGE_PROPERTY_PATCH"
+        WritePatchLog "ERROR", "", "", "", "No open CATIA document."
+        Exit Function
+    End If
+    Set gProductDocument = CATIA.ActiveDocument
+    Set gRootProduct = gProductDocument.Product
+    If Err.Number <> 0 Or gRootProduct Is Nothing Then
+        WritePatchLog "ERROR", "", "", "", "Active document is not CATProduct. Err=" & Err.Description
+        MsgBox "Aktivni dokument mora biti CATProduct.", vbExclamation, "CATIA_BOM_IMAGE_PROPERTY_PATCH"
+        Err.Clear
+        Exit Function
+    End If
+    gRootFullName = GetDocumentFullName(gProductDocument)
+    ValidateActiveProduct = True
+    Err.Clear
+End Function
+
+Sub TraversePatchProduct(prod, isRoot)
+    On Error Resume Next
+    Dim rawPn
+    Dim sourcePath
+    Dim propertyValue
+    Dim status
+    Dim key
+    gVisitedCount = gVisitedCount + 1
+    rawPn = GetProductPartNumber(prod)
+    sourcePath = GetProductSourceFilePath(prod)
+    CATIA.StatusBar = "Patching Slika property: " & CStr(gVisitedCount) & " - " & rawPn
+    WritePatchLog "PRODUCT_VISITED", prod.Name, rawPn, sourcePath, "IsRoot=" & CStr(isRoot)
+
+    If isRoot And Not WRITE_ROOT_ASSEMBLY_IMAGE_PROPERTY Then
+        gRootSkippedCount = gRootSkippedCount + 1
+        WritePatchLog "ROOT_ASSEMBLY_SKIPPED", prod.Name, rawPn, sourcePath, "Root assembly skipped by configuration."
+    ElseIf ShouldPatchProduct(prod, isRoot, sourcePath) Then
+        key = ProductPatchKey(prod, sourcePath)
+        If Not gPatchedKeys.Exists(key) Then
+            gPatchedKeys.Item(key) = True
+            propertyValue = INITIAL_IMAGE_PROPERTY_VALUE
+            If MARK_FASTENERS_FOR_SKIP And IsFastenerProduct(prod) Then
+                propertyValue = FASTENER_IMAGE_PROPERTY_VALUE
+                gFastenerCount = gFastenerCount + 1
+                WritePatchLog "FASTENER_MARKED_SKIP", prod.Name, rawPn, sourcePath, propertyValue
+            End If
+
+            status = SetOrCreateStringUserProperty(prod, IMAGE_PROPERTY_NAME, propertyValue)
+            If status = "CREATED" Or status = "UPDATED" Then
+                gUpdatedCount = gUpdatedCount + 1
+                WritePatchLog "PROPERTY_" & status, prod.Name, rawPn, propertyValue, "Property " & IMAGE_PROPERTY_NAME & "=" & propertyValue
+            Else
+                gErrorCount = gErrorCount + 1
+                WritePatchLog "PROPERTY_WRITE_FAILED", prod.Name, rawPn, propertyValue, "Could not write property."
+            End If
+        End If
+    End If
+
+    Dim children
+    Dim i
+    Set children = prod.Products
+    If Err.Number = 0 And Not children Is Nothing Then
+        For i = 1 To children.Count
+            TraversePatchProduct children.Item(i), False
+            If (i Mod 100) = 0 Then DoEvents
+        Next
+    End If
+    Err.Clear
+End Sub
+
+Function ShouldPatchProduct(prod, isRoot, sourcePath)
+    On Error Resume Next
+    Dim ext
+    Dim hasChildren
+    ShouldPatchProduct = False
+    ext = UCase(gFSO.GetExtensionName(CStr(sourcePath)))
+    hasChildren = ProductHasChildren(prod)
+    If ext = "CATPART" Then ShouldPatchProduct = WRITE_CATPART_IMAGE_PROPERTY
+    If ext = "CATPRODUCT" Then ShouldPatchProduct = WRITE_CATPRODUCT_IMAGE_PROPERTY
+    If ext = "" And hasChildren Then ShouldPatchProduct = WRITE_CATPRODUCT_IMAGE_PROPERTY
+    If ext = "" And Not hasChildren Then ShouldPatchProduct = WRITE_CATPART_IMAGE_PROPERTY
+    Err.Clear
+End Function
+
+Function SetOrCreateStringUserProperty(prod, propertyName, propertyValue)
+    On Error Resume Next
+    SetOrCreateStringUserProperty = "FAILED"
+    Dim props
+    Dim param
+    Set props = GetUserRefPropertiesForProduct(prod)
+    If props Is Nothing Then Exit Function
+
+    Err.Clear
+    Set param = props.Item(CStr(propertyName))
+    If Err.Number = 0 And Not param Is Nothing Then
+        If TrySetParameterStringValue(param, propertyValue) Then
+            SetOrCreateStringUserProperty = "UPDATED"
+        End If
+        Err.Clear
+        Exit Function
+    End If
+
+    Err.Clear
+    Set param = props.CreateString(CStr(propertyName), CStr(propertyValue))
+    If Err.Number = 0 And Not param Is Nothing Then
+        SetOrCreateStringUserProperty = "CREATED"
+    End If
+    Err.Clear
+End Function
+
+Function GetUserRefPropertiesForProduct(prod)
+    On Error Resume Next
+    Dim refProd
+    Dim props
+    Set props = Nothing
+    Set refProd = prod.ReferenceProduct
+    If Err.Number = 0 And Not refProd Is Nothing Then
+        Err.Clear
+        Set props = refProd.UserRefProperties
+    End If
+    If props Is Nothing Then
+        Err.Clear
+        Set props = prod.UserRefProperties
+    End If
+    Set GetUserRefPropertiesForProduct = props
+    Err.Clear
+End Function
+
+Function TrySetParameterStringValue(param, valueText)
+    On Error Resume Next
+    TrySetParameterStringValue = False
+    Err.Clear
+    param.Value = CStr(valueText)
+    If Err.Number = 0 Then
+        TrySetParameterStringValue = True
+        Exit Function
+    End If
+    Err.Clear
+    param.ValuateFromString CStr(valueText)
+    If Err.Number = 0 Then TrySetParameterStringValue = True
+    Err.Clear
+End Function
+
+Sub AskToSaveOpenCatiaDocuments()
+    On Error Resume Next
+    Dim answer
+    answer = MsgBox("Patch je dodao/azurirao property 'Slika'. Da li zelite da sacuvate otvorene CATIA dokumente?" & vbCrLf & vbCrLf & _
+                    "YES = sacuvaj otvorene dokumente" & vbCrLf & _
+                    "NO = ne snimaj" & vbCrLf & _
+                    "CANCEL = ne snimaj i zavrsi", _
+                    vbYesNoCancel + vbQuestion, "CATIA_BOM_IMAGE_PROPERTY_PATCH")
+    If answer = vbYes Then SaveOpenCatiaDocuments
+    Err.Clear
+End Sub
+
+Sub SaveOpenCatiaDocuments()
+    On Error Resume Next
+    Dim i
+    Dim doc
+    For i = 1 To CATIA.Documents.Count
+        Err.Clear
+        Set doc = CATIA.Documents.Item(i)
+        doc.Save
+        If Err.Number <> 0 Then
+            gErrorCount = gErrorCount + 1
+            WritePatchLog "ERROR", doc.Name, "", GetDocumentFullName(doc), "Save failed. Err=" & Err.Description
+            Err.Clear
+        End If
+    Next
+End Sub
+
+Function ProductPatchKey(prod, sourcePath)
+    If CStr(sourcePath) <> "" Then
+        ProductPatchKey = UCase(CStr(sourcePath))
+    Else
+        ProductPatchKey = NormalizePartNumber(GetProductPartNumber(prod)) & "|" & UCase(CStr(prod.Name))
+    End If
+End Function
+
+Function IsFastenerProduct(prod)
+    Dim scanText
+    scanText = GetProductPartNumber(prod) & " " & CStr(prod.Name) & " " & GetProductNomenclature(prod)
+    IsFastenerProduct = ContainsFastenerKeyword(scanText)
+End Function
+
+Function ContainsFastenerKeyword(valueText)
+    Dim scanText
+    Dim keywords
+    Dim kw
+    ContainsFastenerKeyword = False
+    scanText = NormalizeFastenerText(valueText)
+    keywords = Split(FASTENER_KEYWORDS, "|")
+    For Each kw In keywords
+        If NormalizeFastenerText(CStr(kw)) <> "" Then
+            If InStr(1, scanText, NormalizeFastenerText(CStr(kw)), vbTextCompare) > 0 Then
+                ContainsFastenerKeyword = True
+                Exit Function
+            End If
+        End If
+    Next
+End Function
+
+Function NormalizeFastenerText(valueText)
+    Dim s
+    s = LCase(CStr(valueText))
+    s = Replace(s, ChrW(&H10D), "c")
+    s = Replace(s, ChrW(&H107), "c")
+    s = Replace(s, ChrW(&H161), "s")
+    s = Replace(s, ChrW(&H111), "d")
+    s = Replace(s, ChrW(&H17E), "z")
+    s = Replace(s, ".", " ")
+    s = Replace(s, "-", " ")
+    s = Replace(s, "_", " ")
+    s = Replace(s, "/", " ")
+    s = Replace(s, "\", " ")
+    s = Replace(s, vbTab, " ")
+    s = Replace(s, vbCr, " ")
+    s = Replace(s, vbLf, " ")
+    Do While InStr(1, s, "  ", vbTextCompare) > 0
+        s = Replace(s, "  ", " ")
+    Loop
+    NormalizeFastenerText = Trim(s)
+End Function
+
+Function GetProductPartNumber(prod)
+    On Error Resume Next
+    GetProductPartNumber = Trim(CStr(prod.PartNumber))
+    If GetProductPartNumber = "" Then
+        Dim refProd
+        Set refProd = prod.ReferenceProduct
+        If Not refProd Is Nothing Then GetProductPartNumber = Trim(CStr(refProd.PartNumber))
+    End If
+    Err.Clear
+End Function
+
+Function GetProductNomenclature(prod)
+    On Error Resume Next
+    GetProductNomenclature = CStr(prod.Nomenclature)
+    Err.Clear
+End Function
+
+Function ProductHasChildren(prod)
+    On Error Resume Next
+    ProductHasChildren = False
+    Dim children
+    Set children = prod.Products
+    If Err.Number = 0 And Not children Is Nothing Then ProductHasChildren = (children.Count > 0)
+    Err.Clear
+End Function
+
+Function GetProductSourceFilePath(prod)
+    On Error Resume Next
+    Dim refProd
+    Dim candidate
+    Set refProd = prod.ReferenceProduct
+    If Not refProd Is Nothing Then
+        candidate = FindSourcePathInObjectChain(refProd.Parent)
+        If IsValidCatiaSourcePath(candidate) Then
+            GetProductSourceFilePath = candidate
+            Exit Function
+        End If
+        Err.Clear
+        candidate = CStr(refProd.GetMasterShapeRepresentationPathName)
+        If IsValidCatiaSourcePath(candidate) Then
+            GetProductSourceFilePath = candidate
+            Exit Function
+        End If
+    End If
+    candidate = FindSourcePathInObjectChain(prod.Parent)
+    If IsValidCatiaSourcePath(candidate) Then
+        GetProductSourceFilePath = candidate
+        Exit Function
+    End If
+    Err.Clear
+    candidate = CStr(prod.GetMasterShapeRepresentationPathName)
+    If IsValidCatiaSourcePath(candidate) Then GetProductSourceFilePath = candidate
+    Err.Clear
+End Function
+
+Function FindSourcePathInObjectChain(obj)
+    On Error Resume Next
+    Dim current
+    Dim i
+    Dim candidate
+    Set current = obj
+    For i = 1 To 20
+        If current Is Nothing Then Exit For
+        Err.Clear
+        candidate = CStr(current.FullName)
+        If IsValidCatiaSourcePath(candidate) Then
+            FindSourcePathInObjectChain = candidate
+            Exit Function
+        End If
+        Err.Clear
+        Set current = current.Parent
+    Next
+    Err.Clear
+End Function
+
+Function IsValidCatiaSourcePath(pathText)
+    Dim ext
+    IsValidCatiaSourcePath = False
+    If Trim(CStr(pathText)) = "" Then Exit Function
+    ext = UCase(gFSO.GetExtensionName(CStr(pathText)))
+    If (ext = "CATPART" Or ext = "CATPRODUCT") Then IsValidCatiaSourcePath = gFSO.FileExists(CStr(pathText))
+End Function
+
+Function GetDocumentFullName(doc)
+    On Error Resume Next
+    GetDocumentFullName = CStr(doc.FullName)
+    If Err.Number <> 0 Then
+        GetDocumentFullName = ""
+        Err.Clear
+    End If
+End Function
+
+Function NormalizePartNumber(valueText)
+    Dim s
+    s = Trim(CStr(valueText))
+    s = Replace(s, """", "")
+    s = Replace(s, "'", "")
+    s = Replace(s, vbTab, " ")
+    s = Replace(s, vbCr, " ")
+    s = Replace(s, vbLf, " ")
+    Do While Len(s) > 0 And IsTrailingPartNumberSeparator(Right(s, 1))
+        s = Left(s, Len(s) - 1)
+        s = Trim(s)
+    Loop
+    Do While InStr(1, s, "  ", vbTextCompare) > 0
+        s = Replace(s, "  ", " ")
+    Loop
+    NormalizePartNumber = UCase(s)
+End Function
+
+Function IsTrailingPartNumberSeparator(ch)
+    IsTrailingPartNumberSeparator = (ch = "," Or ch = ";" Or ch = ":" Or ch = "|")
+End Function
+
+Sub WritePatchLog(phase, productName, partNumber, valueText, message)
+    On Error Resume Next
+    Dim ts
+    Set ts = gFSO.OpenTextFile(gLogPath, 8, True)
+    ts.WriteLine Now & vbTab & phase & vbTab & productName & vbTab & partNumber & vbTab & valueText & vbTab & message
+    ts.Close
+    Err.Clear
+End Sub
+
+Sub EnsureFolder(pathText)
+    On Error Resume Next
+    If Trim(CStr(pathText)) <> "" Then
+        If Not gFSO.FolderExists(pathText) Then gFSO.CreateFolder pathText
+    End If
+    Err.Clear
+End Sub
+
+Function JoinPath(folderPath, fileName)
+    If Right(CStr(folderPath), 1) = "\" Then
+        JoinPath = CStr(folderPath) & CStr(fileName)
+    Else
+        JoinPath = CStr(folderPath) & "\" & CStr(fileName)
+    End If
+End Function

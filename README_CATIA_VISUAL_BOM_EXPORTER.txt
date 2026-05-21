@@ -1,5 +1,145 @@
-CATIA_VISUAL_BOM_EXPORTER
-=========================
+CATIA_VISUAL_BOM_EXPORTER / SLIKA BOM IMAGE WORKFLOW
+====================================================
+
+PREPORUCENI FINALNI WORKFLOW:
+CATIA CATProduct -> property Slika -> CATIA native BOM Excel -> Excel Insert Image postprocess.
+
+CATIA native Bill of Material Save as Excel ne ume sama da ubaci embedded slike u Excel celije.
+Zato se koristi postprocess:
+kolona Slika sadrzi tekstualnu putanju do JPG slike -> Excel makro ubacuje stvarnu sliku u celiju.
+
+Novi fajlovi:
+- CATIA_BOM_IMAGE_PROPERTY_PATCH.CATScript
+- CATIA_BOM_IMAGE_PREPARE_FOR_BOM.CATScript
+- CATIA_BOM_EXCEL_INSERT_IMAGES.CATScript
+
+Postojeci fajlovi ostaju u repo-u:
+- CATIA_VISUAL_BOM_EXPORTER.CATScript
+- CATIA_VISUAL_BOM_EXPORTER.bas
+
+Novi workflow ne koristi:
+- CATDrawing
+- DrawingTable
+- hide/show
+- Product Tree kao BOM izvor
+- Excel Part No. za odluku sta treba slikati
+- rucno menjanje Quantity ili BOM podataka
+
+KORAK 1
+-------
+
+Otvorite glavni CATProduct.
+
+KORAK 2
+-------
+
+Pokrenite:
+
+CATIA_BOM_IMAGE_PROPERTY_PATCH.CATScript
+
+Ovaj makro:
+- prolazi kroz otvoreni CATProduct
+- dodaje/azurira custom String property tacnog naziva Slika
+- za normalne delove upisuje PENDING_IMAGE
+- za fastenere upisuje SKIP_FASTENER
+- pravi log:
+  C:\Temp\CATIA_BOM_IMAGE_PATCH\CATIA_BOM_IMAGE_PROPERTY_PATCH_LOG.txt
+
+Na kraju pita da li zelite da sacuvate otvorene CATIA dokumente.
+
+VAZNO:
+Patch menja CATIA properties. Ako ne sacuvate dokumente, property Slika moze ostati samo u trenutnoj CATIA sesiji i mozda nece biti trajno dostupan pri sledecem otvaranju.
+
+KORAK 3
+-------
+
+U CATIA otvorite:
+
+Analyze -> Bill of Material -> Define Bill of Material / Define formats
+
+U listu BOM kolona dodajte:
+
+Slika
+
+KORAK 4
+-------
+
+Pokrenite:
+
+CATIA_BOM_IMAGE_PREPARE_FOR_BOM.CATScript
+
+Ovaj makro:
+- prolazi kroz otvoreni CATProduct
+- za svaki relevantan CATPart/CATProduct pronalazi source fajl
+- source otvara standalone preko CATIA.Documents.Open(sourcePath)
+- pravi JPG sliku
+- zatvara otvoreni source dokument bez snimanja
+- u property Slika upisuje punu putanju do JPG slike
+- za fastenere upisuje SKIP_FASTENER
+- za greske upisuje SOURCE_PATH_NOT_FOUND ili IMAGE_CAPTURE_FAILED
+- koristi cache po sourcePath da isti deo ne slika vise puta
+- pravi slike u:
+  C:\Temp\CATIA_BOM_IMAGE_PATCH\IMAGES
+- pravi log:
+  C:\Temp\CATIA_BOM_IMAGE_PATCH\CATIA_BOM_IMAGE_PREPARE_LOG.txt
+
+Default je TEST_MODE=True i TEST_MAX_ITEMS=20.
+Za pun export podesite TEST_MODE=False u CATIA_BOM_IMAGE_PREPARE_FOR_BOM.CATScript.
+
+Na kraju pita da li zelite da sacuvate otvorene CATIA dokumente.
+
+VAZNO:
+Prepare makro menja property Slika jer u njega upisuje image path. Ako ne sacuvate dokumente, putanje mogu ostati samo u trenutnoj CATIA sesiji.
+
+KORAK 5
+-------
+
+U CATIA uradite:
+
+Analyze -> Bill of Material -> Save as Excel
+
+CATIA ce izvesti BOM gde kolona Slika sadrzi:
+- punu putanju do JPG slike
+- SKIP_FASTENER
+- SOURCE_PATH_NOT_FOUND
+- IMAGE_CAPTURE_FAILED
+- PENDING_IMAGE / TEST_MODE_NOT_PROCESSED ako red nije obradjen
+
+KORAK 6
+-------
+
+Pokrenite:
+
+CATIA_BOM_EXCEL_INSERT_IMAGES.CATScript
+
+Ovaj makro:
+- pita da izaberete Excel BOM fajl
+- otvara Excel
+- pronalazi kolonu Slika / Image / Picture / Thumbnail / Foto / Preview
+- cita tekstualnu putanju iz kolone Slika
+- putanju premesta u helper kolonu Image Path
+- cisti tekst iz Slika celije
+- koristi Excel Shapes.AddPicture da ubaci stvarnu embedded sliku u celiju
+- dodaje helper kolone Export Status i Image Skip Reason
+- ne otvara CATPart/CATProduct
+- ne radi capture
+- ne koristi Product Tree
+- snima novi fajl:
+  <OriginalExcelName>_WITH_IMAGES.xlsx
+- ostavlja Excel otvoren korisniku
+
+Status vrednosti u Excel postprocess-u:
+- OK
+- SKIPPED_FASTENER
+- IMAGE_CAPTURE_FAILED
+- SOURCE_PATH_NOT_FOUND
+- NO_IMAGE_PATH
+- IMAGE_FILE_NOT_FOUND
+- ERROR
+
+
+STARI DVOFAZNI CATIA_VISUAL_BOM_EXPORTER
+========================================
 
 Cilj:
 CATIA CATProduct model workflow -> korisnicki snimljen BOM Excel -> thumbnail slike u istom Excel fajlu.

@@ -246,7 +246,9 @@ Sub InsertImagesFromSlikaColumn()
     Dim rowIndex
     Dim rawValue
     lastRow = LastUsedRow(gWs)
+    RemovePicturesInImageColumn gHeaderRow + 1, lastRow
     For rowIndex = gHeaderRow + 1 To lastRow
+        CATIA.StatusBar = "Inserting BOM images: row " & CStr(rowIndex) & " / " & CStr(lastRow)
         rawValue = Trim(CStr(gWs.Cells(rowIndex, gImageColumnIndex).Value))
         If rawValue = "" Then
             SetStatus rowIndex, "NO_IMAGE_PATH", "No image path"
@@ -284,6 +286,7 @@ Sub InsertImagesFromSlikaColumn()
             WriteInsertLog "SAVE_CHECKPOINT", rowIndex, "", "", "Workbook saved."
         End If
     Next
+    CATIA.StatusBar = ""
     Err.Clear
 End Sub
 
@@ -299,7 +302,6 @@ Function InsertImageIntoCell(rowIndex, imagePath)
     Set cell = gWs.Cells(rowIndex, gImageColumnIndex)
     gWs.Rows(rowIndex).RowHeight = IMAGE_ROW_HEIGHT
     gWs.Columns(gImageColumnIndex).ColumnWidth = IMAGE_COLUMN_WIDTH
-    RemovePicturesInCell cell
     Err.Clear
     Set pic = gWs.Shapes.AddPicture(imagePath, False, True, cell.Left + 2, cell.Top + 2, -1, -1)
     If Err.Number <> 0 Or pic Is Nothing Then
@@ -332,16 +334,22 @@ Function InsertImageIntoCell(rowIndex, imagePath)
     Err.Clear
 End Function
 
-Sub RemovePicturesInCell(cell)
+Sub RemovePicturesInImageColumn(firstDataRow, lastDataRow)
     On Error Resume Next
     Dim i
     Dim shp
+    Dim topLeft
+    If lastDataRow < firstDataRow Then Exit Sub
     For i = gWs.Shapes.Count To 1 Step -1
+        Err.Clear
         Set shp = gWs.Shapes.Item(i)
-        If Not shp.TopLeftCell Is Nothing Then
-            If shp.TopLeftCell.Row = cell.Row And shp.TopLeftCell.Column = cell.Column Then shp.Delete
+        Set topLeft = Nothing
+        Set topLeft = shp.TopLeftCell
+        If Err.Number = 0 And Not topLeft Is Nothing Then
+            If topLeft.Column = gImageColumnIndex And topLeft.Row >= firstDataRow And topLeft.Row <= lastDataRow Then shp.Delete
         End If
     Next
+    WriteInsertLog "EXISTING_IMAGES_CLEARED", 0, "", "", "Existing pictures in image column removed before bulk insert."
     Err.Clear
 End Sub
 

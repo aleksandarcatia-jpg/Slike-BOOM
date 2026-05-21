@@ -18,7 +18,7 @@ Const WRITE_CATPART_IMAGE_PROPERTY = True
 Const WRITE_CATPRODUCT_IMAGE_PROPERTY = True
 Const WRITE_ROOT_ASSEMBLY_IMAGE_PROPERTY = False
 Const MARK_FASTENERS_FOR_SKIP = True
-Const TEST_MODE = True
+Const TEST_MODE = False
 Const TEST_MAX_ITEMS = 20
 Const SKIP_EXISTING_IMAGES = True
 Const ASK_BEFORE_SAVING_CATIA_DOCUMENTS = True
@@ -37,6 +37,7 @@ Dim gImageFolder
 Dim gLogPath
 Dim gSourceImageCache
 Dim gProcessedKeys
+Dim gSourcePropertyCache
 Dim gCurrentStandaloneDoc
 Dim gCurrentStandaloneWindow
 Dim gCurrentStandaloneOpened
@@ -51,6 +52,7 @@ Dim gCaptureFailedCount
 Dim gPropertyErrorCount
 Dim gTestSkippedCount
 Dim gImageItemCount
+Dim gDuplicateSourceReusedCount
 
 Sub CATIA_BOM_IMAGE_PREPARE_FOR_BOM()
     On Error Resume Next
@@ -73,11 +75,12 @@ Sub CATIA_BOM_IMAGE_PREPARE_FOR_BOM()
     End If
 
     CATIA.StatusBar = ""
-    WritePrepareLog "FINISH", "", "", "", "", "ImagesCreated=" & CStr(gImagesCreated) & "; Reused=" & CStr(gImagesReused) & "; Fasteners=" & CStr(gFastenerCount) & "; Errors=" & CStr(gPropertyErrorCount + gCaptureFailedCount)
+    WritePrepareLog "FINISH", "", "", "", "", "ImagesCreated=" & CStr(gImagesCreated) & "; Reused=" & CStr(gImagesReused) & "; DuplicateSourceReused=" & CStr(gDuplicateSourceReusedCount) & "; Fasteners=" & CStr(gFastenerCount) & "; Errors=" & CStr(gPropertyErrorCount + gCaptureFailedCount)
 
     MsgBox "Pre-save image priprema zavrsena." & vbCrLf & _
            "Slike napravljene: " & CStr(gImagesCreated) & vbCrLf & _
            "Postojece slike koriscene: " & CStr(gImagesReused) & vbCrLf & _
+           "Duplikati source fajla preskoceni: " & CStr(gDuplicateSourceReusedCount) & vbCrLf & _
            "Fasteneri preskoceni: " & CStr(gFastenerCount) & vbCrLf & _
            "Greske: " & CStr(gPropertyErrorCount + gCaptureFailedCount) & vbCrLf & vbCrLf & _
            "Sada idite u Analyze -> Bill of Material i uradite Save as Excel." & vbCrLf & _
@@ -96,8 +99,10 @@ Sub InitializePrepareRuntime()
     gLogPath = JoinPath(WORK_ROOT, LOG_FILE_NAME)
     Set gSourceImageCache = CreateObject("Scripting.Dictionary")
     Set gProcessedKeys = CreateObject("Scripting.Dictionary")
+    Set gSourcePropertyCache = CreateObject("Scripting.Dictionary")
     gSourceImageCache.CompareMode = 1
     gProcessedKeys.CompareMode = 1
+    gSourcePropertyCache.CompareMode = 1
     Set gCurrentStandaloneDoc = Nothing
     Set gCurrentStandaloneWindow = Nothing
     Set gMainWindow = Nothing
@@ -112,6 +117,7 @@ Sub InitializePrepareRuntime()
     gPropertyErrorCount = 0
     gTestSkippedCount = 0
     gImageItemCount = 0
+    gDuplicateSourceReusedCount = 0
     Err.Clear
 End Sub
 
@@ -148,8 +154,12 @@ Sub TraversePrepareProduct(prod, isRoot)
     gVisitedCount = gVisitedCount + 1
     rawPn = GetProductPartNumber(prod)
     sourcePath = GetProductSourceFilePath(prod)
-    CATIA.StatusBar = "Preparing BOM images: " & CStr(gVisitedCount) & " - " & rawPn
+    UpdatePrepareProgress rawPn
     WritePrepareLog "PRODUCT_VISITED", prod.Name, rawPn, sourcePath, "", "IsRoot=" & CStr(isRoot)
+    If (gVisitedCount Mod 50) = 0 Then
+        WritePrepareLog "PROGRESS_CHECKPOINT", prod.Name, rawPn, sourcePath, "", ProgressText("")
+        DoEvents
+    End If
 
     If isRoot And Not WRITE_ROOT_ASSEMBLY_IMAGE_PROPERTY Then
         gRootSkippedCount = gRootSkippedCount + 1
@@ -157,7 +167,13 @@ Sub TraversePrepareProduct(prod, isRoot)
     ElseIf ShouldPrepareProduct(prod, isRoot, sourcePath) Then
         If MARK_FASTENERS_FOR_SKIP And IsFastenerProduct(prod) Then
             gFastenerCount = gFastenerCount + 1
-            WritePropertyValue prod, "SKIP_FASTENER", "FASTENER_MARKED_SKIP", sourcePath, ""
+            key = UCase(sourcePath)
+            If IsValidCatiaSourcePath(sourcePath) And gSourcePropertyCache.Exists(key) Then
+                gDuplicateSourceReusedCount = gDuplicateSourceReusedCount + 1
+                WritePrepareLog "DUPLICATE_SOURCE_REUSED", prod.Name, rawPn, sourcePath, CStr(gSourcePropertyCache.Item(key)), "Fastener source already processed; property write skipped."
+            ElseIf WritePropertyValue(prod, "SKIP_FASTENER", "FASTENER_MARKED_SKIP", sourcePath, "") Then
+                If IsValidCatiaSourcePath(sourcePath) Then gSourcePropertyCache.Item(key) = "SKIP_FASTENER"
+            End If
         ElseIf Not IsValidCatiaSourcePath(sourcePath) Or SamePath(sourcePath, gRootFullName) Then
             gSourceNotFoundCount = gSourceNotFoundCount + 1
             WritePropertyValue prod, "SOURCE_PATH_NOT_FOUND", "SOURCE_PATH_NOT_FOUND", sourcePath, ""
@@ -172,20 +188,24 @@ Sub TraversePrepareProduct(prod, isRoot)
                 gProcessedKeys.Item(key) = True
                 gImageItemCount = gImageItemCount + 1
             End If
-            If gSourceImageCache.Exists(key) Then
+            If gSourcePropertyCache.Exists(key) Then
+                gDuplicateSourceReusedCount = gDuplicateSourceReusedCount + 1
+                imagePath = CStr(gSourcePropertyCache.Item(key))
+                WritePrepareLog "DUPLICATE_SOURCE_REUSED", prod.Name, rawPn, sourcePath, imagePath, "Source already processed; property write skipped."
+            ElseIf gSourceImageCache.Exists(key) Then
                 imagePath = CStr(gSourceImageCache.Item(key))
                 gImagesReused = gImagesReused + 1
-                WritePropertyValue prod, imagePath, "EXISTING_IMAGE_REUSED", sourcePath, imagePath
+                If WritePropertyValue(prod, imagePath, "EXISTING_IMAGE_REUSED", sourcePath, imagePath) Then gSourcePropertyCache.Item(key) = imagePath
             Else
                 imagePath = BuildImagePath(prod, sourcePath)
                 If SKIP_EXISTING_IMAGES And gFSO.FileExists(imagePath) Then
                     gSourceImageCache.Item(key) = imagePath
                     gImagesReused = gImagesReused + 1
-                    WritePropertyValue prod, imagePath, "EXISTING_IMAGE_REUSED", sourcePath, imagePath
+                    If WritePropertyValue(prod, imagePath, "EXISTING_IMAGE_REUSED", sourcePath, imagePath) Then gSourcePropertyCache.Item(key) = imagePath
                 ElseIf CaptureStandaloneImage(sourcePath, imagePath, prod) Then
                     gSourceImageCache.Item(key) = imagePath
                     gImagesCreated = gImagesCreated + 1
-                    WritePropertyValue prod, imagePath, "IMAGE_PATH_WRITTEN_TO_SLIKA", sourcePath, imagePath
+                    If WritePropertyValue(prod, imagePath, "IMAGE_PATH_WRITTEN_TO_SLIKA", sourcePath, imagePath) Then gSourcePropertyCache.Item(key) = imagePath
                 Else
                     gCaptureFailedCount = gCaptureFailedCount + 1
                     WritePropertyValue prod, "IMAGE_CAPTURE_FAILED", "IMAGE_CAPTURE_FAILED", sourcePath, imagePath
@@ -206,12 +226,14 @@ Sub TraversePrepareProduct(prod, isRoot)
     Err.Clear
 End Sub
 
-Sub WritePropertyValue(prod, propertyValue, phase, sourcePath, imagePath)
+Function WritePropertyValue(prod, propertyValue, phase, sourcePath, imagePath)
     On Error Resume Next
     Dim status
+    WritePropertyValue = False
     CATIA.StatusBar = "Updating Slika property: " & GetProductPartNumber(prod)
     status = SetOrCreateStringUserProperty(prod, IMAGE_PROPERTY_NAME, propertyValue)
     If status = "CREATED" Or status = "UPDATED" Then
+        WritePropertyValue = True
         If phase = "IMAGE_PATH_WRITTEN_TO_SLIKA" Then
             WritePrepareLog "PROPERTY_" & status, prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, IMAGE_PROPERTY_NAME & "=" & propertyValue
             WritePrepareLog "IMAGE_PATH_WRITTEN_TO_SLIKA", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, propertyValue
@@ -224,7 +246,7 @@ Sub WritePropertyValue(prod, propertyValue, phase, sourcePath, imagePath)
         WritePrepareLog "PROPERTY_WRITE_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "Could not write " & IMAGE_PROPERTY_NAME & "=" & propertyValue
     End If
     Err.Clear
-End Sub
+End Function
 
 Function CaptureStandaloneImage(sourcePath, imagePath, prod)
     On Error Resume Next
@@ -526,29 +548,44 @@ End Function
 
 Function BuildImagePath(prod, sourcePath)
     Dim baseName
-    baseName = SafeFileName(GetProductPartNumber(prod) & "_" & CStr(prod.Name))
-    If baseName = "" Then baseName = SafeFileName(gFSO.GetBaseName(sourcePath))
+    Dim sourceName
+    Dim hashText
+    sourceName = gFSO.GetBaseName(sourcePath)
+    hashText = StablePathHash(sourcePath)
+    baseName = SafeFileName(GetProductPartNumber(prod) & "_" & sourceName & "_" & hashText)
+    If baseName = "" Then baseName = SafeFileName(sourceName & "_" & hashText)
     If baseName = "" Then baseName = "CATIA_IMAGE"
-    If Len(baseName) > 140 Then baseName = Left(baseName, 140)
-    BuildImagePath = UniqueFilePath(gImageFolder, baseName, ".jpg")
+    If Len(baseName) > 140 Then baseName = Left(baseName, 131) & "_" & hashText
+    BuildImagePath = JoinPath(gImageFolder, baseName & ".jpg")
 End Function
 
-Function UniqueFilePath(folderPath, baseName, extensionText)
-    Dim pathText
+Function StablePathHash(pathText)
     Dim i
-    pathText = JoinPath(folderPath, baseName & extensionText)
-    If Not gFSO.FileExists(pathText) Then
-        UniqueFilePath = pathText
-        Exit Function
-    End If
-    For i = 1 To 9999
-        pathText = JoinPath(folderPath, baseName & "_" & Right("000" & CStr(i), 3) & extensionText)
-        If Not gFSO.FileExists(pathText) Then
-            UniqueFilePath = pathText
-            Exit Function
-        End If
+    Dim code
+    Dim hashValue
+    hashValue = 0
+    For i = 1 To Len(CStr(pathText))
+        code = AscW(Mid(CStr(pathText), i, 1))
+        If code < 0 Then code = code + 65536
+        hashValue = (hashValue * 131 + code) Mod 2147483647
     Next
-    UniqueFilePath = JoinPath(folderPath, baseName & "_" & CStr(Timer * 1000) & extensionText)
+    StablePathHash = Right("00000000" & Hex(CLng(hashValue)), 8)
+End Function
+
+Sub UpdatePrepareProgress(currentPartNumber)
+    On Error Resume Next
+    CATIA.StatusBar = ProgressText(currentPartNumber)
+    Err.Clear
+End Sub
+
+Function ProgressText(currentPartNumber)
+    Dim errorsCount
+    errorsCount = gPropertyErrorCount + gCaptureFailedCount + gSourceNotFoundCount
+    ProgressText = "Preparing BOM images: visited " & CStr(gVisitedCount) & _
+                   ", created " & CStr(gImagesCreated) & _
+                   ", reused " & CStr(gImagesReused + gDuplicateSourceReusedCount) & _
+                   ", errors " & CStr(errorsCount)
+    If Trim(CStr(currentPartNumber)) <> "" Then ProgressText = ProgressText & " - " & CStr(currentPartNumber)
 End Function
 
 Function IsFastenerProduct(prod)

@@ -37,7 +37,9 @@ Dim gLogPath
 Dim gSourceImageCache
 Dim gProcessedKeys
 Dim gCurrentStandaloneDoc
+Dim gCurrentStandaloneWindow
 Dim gCurrentStandaloneOpened
+Dim gMainWindow
 Dim gVisitedCount
 Dim gImagesCreated
 Dim gImagesReused
@@ -96,6 +98,8 @@ Sub InitializePrepareRuntime()
     gSourceImageCache.CompareMode = 1
     gProcessedKeys.CompareMode = 1
     Set gCurrentStandaloneDoc = Nothing
+    Set gCurrentStandaloneWindow = Nothing
+    Set gMainWindow = Nothing
     gCurrentStandaloneOpened = False
     gVisitedCount = 0
     gImagesCreated = 0
@@ -127,6 +131,7 @@ Function ValidateActiveProduct()
         Exit Function
     End If
     gRootFullName = GetDocumentFullName(gProductDocument)
+    Set gMainWindow = CATIA.ActiveWindow
     ValidateActiveProduct = True
     Err.Clear
 End Function
@@ -225,7 +230,7 @@ Function CaptureStandaloneImage(sourcePath, imagePath, prod)
     CaptureStandaloneImage = False
     CATIA.StatusBar = "Opening source: " & GetProductPartNumber(prod)
     WritePrepareLog "STANDALONE_OPEN_START", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, sourcePath
-    If Not OpenStandaloneDocument(sourcePath) Then
+    If Not OpenStandaloneDocument(sourcePath, prod, imagePath) Then
         WritePrepareLog "IMAGE_CAPTURE_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "Standalone open failed."
         CloseCurrentStandaloneDocument
         ActivateMainDocument
@@ -233,7 +238,7 @@ Function CaptureStandaloneImage(sourcePath, imagePath, prod)
     End If
 
     CATIA.StatusBar = "Capturing image: " & GetProductPartNumber(prod)
-    If CaptureActiveStandaloneViewer(imagePath) Then
+    If CaptureActiveStandaloneViewer(imagePath, sourcePath, prod) Then
         WritePrepareLog "STANDALONE_CAPTURE_DONE", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, imagePath
         CaptureStandaloneImage = True
     Else
@@ -245,41 +250,105 @@ Function CaptureStandaloneImage(sourcePath, imagePath, prod)
     Err.Clear
 End Function
 
-Function OpenStandaloneDocument(sourcePath)
+Function OpenStandaloneDocument(sourcePath, prod, imagePath)
     On Error Resume Next
     OpenStandaloneDocument = False
     Set gCurrentStandaloneDoc = Nothing
+    Set gCurrentStandaloneWindow = Nothing
     gCurrentStandaloneOpened = False
-
-    If FindOpenDocumentByFullName(sourcePath, gCurrentStandaloneDoc) Then
-        gCurrentStandaloneDoc.Activate
-        OpenStandaloneDocument = True
-        Exit Function
-    End If
 
     CATIA.DisplayFileAlerts = False
     Set gCurrentStandaloneDoc = CATIA.Documents.Open(sourcePath)
     CATIA.DisplayFileAlerts = True
     If Err.Number = 0 And Not gCurrentStandaloneDoc Is Nothing Then
         gCurrentStandaloneOpened = True
-        gCurrentStandaloneDoc.Activate
-        OpenStandaloneDocument = True
+        If ActivateStandaloneDocumentWindow(sourcePath, prod, imagePath) Then
+            OpenStandaloneDocument = True
+        Else
+            WritePrepareLog "ACTIVE_WINDOW_NOT_STANDALONE", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, "Open succeeded, but active window/document did not switch to standalone source. " & ActiveCaptureContextText()
+        End If
     End If
     Err.Clear
 End Function
 
-Function CaptureActiveStandaloneViewer(imagePath)
+Function ActivateStandaloneDocumentWindow(sourcePath, prod, imagePath)
+    On Error Resume Next
+    ActivateStandaloneDocumentWindow = False
+    Dim i
+
+    For i = 1 To 3
+        Err.Clear
+        gCurrentStandaloneDoc.Activate
+        WaitSeconds 0.15
+        Set gCurrentStandaloneWindow = CATIA.ActiveWindow
+        If ActiveDocumentMatchesSource(sourcePath) Then
+            WritePrepareLog "STANDALONE_WINDOW_ACTIVE", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, ActiveCaptureContextText()
+            ActivateStandaloneDocumentWindow = True
+            Exit Function
+        End If
+    Next
+    Err.Clear
+End Function
+
+Function CaptureActiveStandaloneViewer(imagePath, sourcePath, prod)
     On Error Resume Next
     CaptureActiveStandaloneViewer = False
     Dim viewer
-    Set viewer = CATIA.ActiveWindow.ActiveViewer
+    If gCurrentStandaloneWindow Is Nothing Then Set gCurrentStandaloneWindow = CATIA.ActiveWindow
+    If Not ActiveDocumentMatchesSource(sourcePath) Then
+        WritePrepareLog "ACTIVE_WINDOW_NOT_STANDALONE", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, ActiveCaptureContextText()
+        Exit Function
+    End If
+
+    Set viewer = gCurrentStandaloneWindow.ActiveViewer
     If viewer Is Nothing Then Exit Function
     viewer.Activate
+    WritePrepareLog "CAPTURE_VIEWER_CONTEXT", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, ActiveCaptureContextText()
     ApplyIsoView viewer
     WaitSeconds IMAGE_CAPTURE_DELAY_SECONDS
     Err.Clear
     viewer.CaptureToFile CAT_CAPTURE_FORMAT_JPEG, imagePath
     If Err.Number = 0 And gFSO.FileExists(imagePath) Then CaptureActiveStandaloneViewer = True
+    Err.Clear
+End Function
+
+Function ActiveDocumentMatchesSource(sourcePath)
+    On Error Resume Next
+    ActiveDocumentMatchesSource = False
+    Dim activeDoc
+    Set activeDoc = CATIA.ActiveDocument
+    If Err.Number = 0 And Not activeDoc Is Nothing Then
+        ActiveDocumentMatchesSource = SamePath(GetDocumentFullName(activeDoc), sourcePath)
+    End If
+    Err.Clear
+End Function
+
+Function ActiveCaptureContextText()
+    On Error Resume Next
+    Dim activeDoc
+    Dim activeWindow
+    Dim docText
+    Dim winText
+    docText = ""
+    winText = ""
+    Set activeDoc = CATIA.ActiveDocument
+    If Err.Number = 0 And Not activeDoc Is Nothing Then docText = CStr(activeDoc.Name) & " | " & GetDocumentFullName(activeDoc)
+    Err.Clear
+    Set activeWindow = CATIA.ActiveWindow
+    If Err.Number = 0 And Not activeWindow Is Nothing Then winText = GetWindowLabel(activeWindow)
+    ActiveCaptureContextText = "ActiveDocument=" & docText & "; ActiveWindow=" & winText
+    Err.Clear
+End Function
+
+Function GetWindowLabel(windowObj)
+    On Error Resume Next
+    GetWindowLabel = ""
+    Err.Clear
+    GetWindowLabel = CStr(windowObj.Caption)
+    If Err.Number <> 0 Or Trim(GetWindowLabel) = "" Then
+        Err.Clear
+        GetWindowLabel = CStr(windowObj.Name)
+    End If
     Err.Clear
 End Function
 
@@ -309,14 +378,26 @@ Sub CloseCurrentStandaloneDocument()
     If Not gCurrentStandaloneDoc Is Nothing Then
         If gCurrentStandaloneOpened Then
             CATIA.DisplayFileAlerts = False
+            If Not gCurrentStandaloneWindow Is Nothing Then
+                If Not IsMainWindow(gCurrentStandaloneWindow) Then gCurrentStandaloneWindow.Close
+            End If
             gCurrentStandaloneDoc.Close
             CATIA.DisplayFileAlerts = True
         End If
     End If
     Set gCurrentStandaloneDoc = Nothing
+    Set gCurrentStandaloneWindow = Nothing
     gCurrentStandaloneOpened = False
     Err.Clear
 End Sub
+
+Function IsMainWindow(windowObj)
+    On Error Resume Next
+    IsMainWindow = False
+    If gMainWindow Is Nothing Or windowObj Is Nothing Then Exit Function
+    If GetWindowLabel(windowObj) = GetWindowLabel(gMainWindow) Then IsMainWindow = True
+    Err.Clear
+End Function
 
 Sub ActivateMainDocument()
     On Error Resume Next
@@ -363,17 +444,32 @@ Function SetOrCreateStringUserProperty(prod, propertyName, propertyValue)
     Set props = GetUserRefPropertiesForProduct(prod)
     If props Is Nothing Then Exit Function
 
+    Set param = Nothing
     Err.Clear
     Set param = props.Item(CStr(propertyName))
     If Err.Number = 0 And Not param Is Nothing Then
-        If TrySetParameterStringValue(param, propertyValue) Then SetOrCreateStringUserProperty = "UPDATED"
+        If TrySetParameterStringValue(param, propertyValue) Then
+            SetOrCreateStringUserProperty = "UPDATED"
+            Err.Clear
+            Exit Function
+        End If
+        Set param = Nothing
         Err.Clear
-        Exit Function
     End If
 
     Err.Clear
-    Set param = props.CreateString(CStr(propertyName), CStr(propertyValue))
-    If Err.Number = 0 And Not param Is Nothing Then SetOrCreateStringUserProperty = "CREATED"
+    Set param = Nothing
+    Set param = props.CreateString(CStr(propertyName), "")
+    If Err.Number = 0 And Not param Is Nothing Then
+        Err.Clear
+        param.ValuateFromString ""
+        If Err.Number = 0 Then
+            If TrySetParameterStringValue(param, propertyValue) Then SetOrCreateStringUserProperty = "CREATED"
+        Else
+            Err.Clear
+            If TrySetParameterStringValue(param, propertyValue) Then SetOrCreateStringUserProperty = "CREATED"
+        End If
+    End If
     Err.Clear
 End Function
 

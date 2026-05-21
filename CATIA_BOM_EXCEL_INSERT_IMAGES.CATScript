@@ -25,6 +25,11 @@ Const MSO_FILEDIALOG_FILE_PICKER = 3
 Const MSO_PLACEMENT_MOVE_AND_SIZE = 1
 Const WORK_ROOT = "C:\Temp\CATIA_BOM_IMAGE_PATCH"
 Const LOG_FILE_NAME = "CATIA_BOM_EXCEL_INSERT_IMAGES_LOG.txt"
+Const CREATE_ORGANIZED_TREE_SHEET = True
+Const ORGANIZED_TREE_SHEET_NAME = "BOM_TREE_WITH_IMAGES"
+Const KEEP_ORIGINAL_BOM_SHEET = True
+Const GROUP_TREE_ROWS = True
+Const INDENT_TREE_NOMENCLATURE = True
 
 Dim gFSO
 Dim gExcelApp
@@ -38,6 +43,9 @@ Dim gImageColumnIndex
 Dim gImagePathColumnIndex
 Dim gExportStatusColumnIndex
 Dim gImageSkipReasonColumnIndex
+Dim gPartNumberColumnIndex
+Dim gNomenclatureColumnIndex
+Dim gTreeWs
 Dim gInsertedCount
 Dim gSkippedCount
 Dim gErrorCount
@@ -67,6 +75,7 @@ Sub CATIA_BOM_EXCEL_INSERT_IMAGES()
 
     EnsureHelperColumns
     InsertImagesFromSlikaColumn
+    If CREATE_ORGANIZED_TREE_SHEET Then BuildOrganizedTreeSheet
     SaveWorkbookWithImages
 
     WriteInsertLog "FINISH", 0, "", gFinalPath, "Inserted=" & CStr(gInsertedCount) & "; Skipped=" & CStr(gSkippedCount) & "; Errors=" & CStr(gErrorCount)
@@ -88,6 +97,7 @@ Sub InitializeExcelInsertRuntime()
     Set gExcelApp = Nothing
     Set gWorkbook = Nothing
     Set gWs = Nothing
+    Set gTreeWs = Nothing
     gInsertedCount = 0
     gSkippedCount = 0
     gErrorCount = 0
@@ -202,6 +212,8 @@ Sub EnsureHelperColumns()
     gImagePathColumnIndex = EnsureEndHelperColumn("Image Path")
     gExportStatusColumnIndex = EnsureEndHelperColumn("Export Status")
     gImageSkipReasonColumnIndex = EnsureEndHelperColumn("Image Skip Reason")
+    gPartNumberColumnIndex = FindHeaderColumnByNames("Part Number|PartNumber|Part No|Part No.|PN|P/N|Number|Broj dela|Br. dela|Oznaka")
+    gNomenclatureColumnIndex = FindHeaderColumnByNames("Nomenclature|Naziv|Description|Opis")
     gWs.Columns(gImageColumnIndex).ColumnWidth = IMAGE_COLUMN_WIDTH
     gWs.Columns(gImagePathColumnIndex).ColumnWidth = 45
     gWs.Columns(gExportStatusColumnIndex).ColumnWidth = 24
@@ -236,6 +248,19 @@ Function FindHeaderColumn(headerText)
             FindHeaderColumn = c
             Exit Function
         End If
+    Next
+    Err.Clear
+End Function
+
+Function FindHeaderColumnByNames(headerNames)
+    On Error Resume Next
+    FindHeaderColumnByNames = 0
+    Dim names
+    Dim item
+    names = Split(headerNames, "|")
+    For Each item In names
+        FindHeaderColumnByNames = FindHeaderColumn(CStr(item))
+        If FindHeaderColumnByNames > 0 Then Exit Function
     Next
     Err.Clear
 End Function
@@ -291,19 +316,23 @@ Sub InsertImagesFromSlikaColumn()
 End Sub
 
 Function InsertImageIntoCell(rowIndex, imagePath)
+    InsertImageIntoCell = InsertImageIntoWorksheetCell(gWs, rowIndex, gImageColumnIndex, imagePath)
+End Function
+
+Function InsertImageIntoWorksheetCell(ws, rowIndex, imageColumnIndex, imagePath)
     On Error Resume Next
-    InsertImageIntoCell = False
+    InsertImageIntoWorksheetCell = False
     Dim cell
     Dim pic
     Dim availableWidth
     Dim availableHeight
     Dim scaleByWidth
     Dim scaleByHeight
-    Set cell = gWs.Cells(rowIndex, gImageColumnIndex)
-    gWs.Rows(rowIndex).RowHeight = IMAGE_ROW_HEIGHT
-    gWs.Columns(gImageColumnIndex).ColumnWidth = IMAGE_COLUMN_WIDTH
+    Set cell = ws.Cells(rowIndex, imageColumnIndex)
+    ws.Rows(rowIndex).RowHeight = IMAGE_ROW_HEIGHT
+    ws.Columns(imageColumnIndex).ColumnWidth = IMAGE_COLUMN_WIDTH
     Err.Clear
-    Set pic = gWs.Shapes.AddPicture(imagePath, False, True, cell.Left + 2, cell.Top + 2, -1, -1)
+    Set pic = ws.Shapes.AddPicture(imagePath, False, True, cell.Left + 2, cell.Top + 2, -1, -1)
     If Err.Number <> 0 Or pic Is Nothing Then
         Err.Clear
         Exit Function
@@ -330,7 +359,7 @@ Function InsertImageIntoCell(rowIndex, imagePath)
     pic.Left = cell.Left + ((cell.Width - pic.Width) / 2)
     pic.Top = cell.Top + ((cell.Height - pic.Height) / 2)
     pic.Placement = MSO_PLACEMENT_MOVE_AND_SIZE
-    InsertImageIntoCell = True
+    InsertImageIntoWorksheetCell = True
     Err.Clear
 End Function
 
@@ -358,6 +387,272 @@ Sub SetStatus(rowIndex, statusText, reasonText)
     gWs.Cells(rowIndex, gExportStatusColumnIndex).Value = statusText
     gWs.Cells(rowIndex, gImageSkipReasonColumnIndex).Value = reasonText
     WriteInsertLog statusText, rowIndex, CStr(gWs.Cells(rowIndex, gImageColumnIndex).Value), "", reasonText
+    Err.Clear
+End Sub
+
+Sub BuildOrganizedTreeSheet()
+    On Error Resume Next
+    Dim sectionStartRows
+    Dim sectionEndRows
+    Dim sectionHeaderRows
+    Dim rootKey
+    Dim outputRow
+    Dim lastCol
+    Dim visitedPath
+
+    WriteInsertLog "TREE_SHEET_BUILD_START", 0, "", "", "Building organized BOM tree sheet."
+    If gPartNumberColumnIndex <= 0 Then
+        WriteInsertLog "ERROR", 0, "", "", "Cannot build tree sheet: Part Number column not found."
+        Exit Sub
+    End If
+
+    Set sectionStartRows = CreateObject("Scripting.Dictionary")
+    Set sectionEndRows = CreateObject("Scripting.Dictionary")
+    Set sectionHeaderRows = CreateObject("Scripting.Dictionary")
+    sectionStartRows.CompareMode = 1
+    sectionEndRows.CompareMode = 1
+    sectionHeaderRows.CompareMode = 1
+
+    If Not ParseBomSections(sectionStartRows, sectionEndRows, sectionHeaderRows, rootKey) Then
+        WriteInsertLog "ERROR", 0, "", "", "Cannot build tree sheet: no CATIA BOM sections found."
+        Exit Sub
+    End If
+
+    DeleteWorksheetIfExists ORGANIZED_TREE_SHEET_NAME
+    Set gTreeWs = gWorkbook.Worksheets.Add
+    gTreeWs.Name = ORGANIZED_TREE_SHEET_NAME
+
+    lastCol = LastUsedColumn(gWs)
+    CopyTreeHeader lastCol
+    outputRow = 2
+    visitedPath = "|"
+    WriteSectionToTree rootKey, 0, outputRow, lastCol, sectionStartRows, sectionEndRows, visitedPath
+
+    FormatTreeSheet outputRow - 1, lastCol
+    gTreeWs.Activate
+    WriteInsertLog "TREE_SHEET_BUILD_DONE", outputRow - 1, rootKey, "", "Organized tree sheet created."
+    Err.Clear
+End Sub
+
+Function ParseBomSections(sectionStartRows, sectionEndRows, sectionHeaderRows, ByRef rootKey)
+    On Error Resume Next
+    ParseBomSections = False
+    rootKey = ""
+    Dim lastRow
+    Dim rowIndex
+    Dim sectionKey
+    Dim currentKey
+    lastRow = LastUsedRow(gWs)
+    currentKey = ""
+
+    For rowIndex = 1 To lastRow
+        If IsBomSectionRow(rowIndex) Then
+            If currentKey <> "" Then sectionEndRows.Item(currentKey) = rowIndex - 1
+            sectionKey = ExtractBomSectionKey(rowIndex)
+            If sectionKey <> "" And Not sectionStartRows.Exists(sectionKey) Then
+                sectionStartRows.Item(sectionKey) = rowIndex + 2
+                sectionHeaderRows.Item(sectionKey) = rowIndex + 1
+                sectionEndRows.Item(sectionKey) = lastRow
+                currentKey = sectionKey
+                If rootKey = "" Then rootKey = sectionKey
+                WriteInsertLog "TREE_SECTION_FOUND", rowIndex, sectionKey, "", "Section data starts at row " & CStr(rowIndex + 2)
+            Else
+                currentKey = ""
+            End If
+        End If
+    Next
+    If currentKey <> "" Then sectionEndRows.Item(currentKey) = lastRow
+    ParseBomSections = (rootKey <> "")
+    Err.Clear
+End Function
+
+Sub CopyTreeHeader(lastCol)
+    On Error Resume Next
+    Dim c
+    gTreeWs.Cells(1, 1).Value = "Tree Level"
+    For c = 1 To lastCol
+        gTreeWs.Cells(1, c + 1).Value = gWs.Cells(gHeaderRow, c).Value
+    Next
+    gTreeWs.Rows(1).Font.Bold = True
+    gTreeWs.Rows(1).Interior.ColorIndex = 15
+    Err.Clear
+End Sub
+
+Sub WriteSectionToTree(sectionKey, level, ByRef outputRow, lastCol, sectionStartRows, sectionEndRows, visitedPath)
+    On Error Resume Next
+    Dim startRow
+    Dim endRow
+    Dim rowIndex
+    Dim childKey
+    Dim childStartOutput
+    Dim childEndOutput
+    Dim nextVisitedPath
+
+    If sectionKey = "" Or Not sectionStartRows.Exists(sectionKey) Then Exit Sub
+    If InStr(1, visitedPath, "|" & sectionKey & "|", vbTextCompare) > 0 Then
+        WriteInsertLog "TREE_SECTION_RECURSION_SKIPPED", 0, sectionKey, "", "Section already exists in current tree path."
+        Exit Sub
+    End If
+    nextVisitedPath = visitedPath & sectionKey & "|"
+    startRow = CLng(sectionStartRows.Item(sectionKey))
+    endRow = CLng(sectionEndRows.Item(sectionKey))
+
+    For rowIndex = startRow To endRow
+        If IsTreeDataRow(rowIndex) Then
+            childKey = NormalizeTreeKey(CStr(gWs.Cells(rowIndex, gPartNumberColumnIndex).Value))
+            WriteTreeRowFromSource rowIndex, level, sectionStartRows.Exists(childKey), outputRow, lastCol
+            If sectionStartRows.Exists(childKey) Then
+                childStartOutput = outputRow
+                outputRow = outputRow + 1
+                WriteSectionToTree childKey, level + 1, outputRow, lastCol, sectionStartRows, sectionEndRows, nextVisitedPath
+                childEndOutput = outputRow - 1
+                If GROUP_TREE_ROWS And childEndOutput > childStartOutput Then
+                    Err.Clear
+                    gTreeWs.Rows(CStr(childStartOutput + 1) & ":" & CStr(childEndOutput)).Group
+                    Err.Clear
+                End If
+            Else
+                outputRow = outputRow + 1
+            End If
+        End If
+    Next
+    Err.Clear
+End Sub
+
+Sub WriteTreeRowFromSource(sourceRow, level, isAssemblyRow, ByRef outputRow, lastCol)
+    On Error Resume Next
+    Dim c
+    Dim treeImageColumn
+    Dim treeImagePathColumn
+    Dim imagePath
+    Dim partNumber
+
+    gTreeWs.Cells(outputRow, 1).Value = level
+    For c = 1 To lastCol
+        gTreeWs.Cells(outputRow, c + 1).Value = gWs.Cells(sourceRow, c).Value
+    Next
+
+    If INDENT_TREE_NOMENCLATURE And gNomenclatureColumnIndex > 0 Then gTreeWs.Cells(outputRow, gNomenclatureColumnIndex + 1).IndentLevel = MinLong(level, 15)
+    If isAssemblyRow Then
+        gTreeWs.Rows(outputRow).Font.Bold = True
+        gTreeWs.Rows(outputRow).Interior.ColorIndex = 36
+        WriteInsertLog "TREE_PARENT_ROW_WRITTEN", outputRow, CStr(gWs.Cells(sourceRow, gPartNumberColumnIndex).Value), "", "SourceRow=" & CStr(sourceRow)
+    Else
+        WriteInsertLog "TREE_CHILD_ROW_WRITTEN", outputRow, CStr(gWs.Cells(sourceRow, gPartNumberColumnIndex).Value), "", "SourceRow=" & CStr(sourceRow)
+    End If
+
+    treeImageColumn = gImageColumnIndex + 1
+    treeImagePathColumn = gImagePathColumnIndex + 1
+    imagePath = Trim(CStr(gTreeWs.Cells(outputRow, treeImagePathColumn).Value))
+    If IsImageFilePath(imagePath) And gFSO.FileExists(imagePath) Then
+        gTreeWs.Cells(outputRow, treeImageColumn).Value = ""
+        If InsertImageIntoWorksheetCell(gTreeWs, outputRow, treeImageColumn, imagePath) Then
+            WriteInsertLog "TREE_IMAGE_INSERTED", outputRow, imagePath, "", "Tree image embedded."
+        Else
+            WriteInsertLog "ERROR", outputRow, imagePath, "", "Tree sheet AddPicture failed."
+        End If
+    End If
+    Err.Clear
+End Sub
+
+Function IsTreeDataRow(rowIndex)
+    On Error Resume Next
+    IsTreeDataRow = False
+    Dim partNumber
+    partNumber = Trim(CStr(gWs.Cells(rowIndex, gPartNumberColumnIndex).Value))
+    If partNumber = "" Then Exit Function
+    If IsBomSectionRow(rowIndex) Then Exit Function
+    If IsRepeatedBomHeaderRow(rowIndex) Then Exit Function
+    If UCase(partNumber) = "PART NUMBER" Or UCase(partNumber) = "PARTNUMBER" Then Exit Function
+    IsTreeDataRow = True
+    Err.Clear
+End Function
+
+Function IsBomSectionRow(rowIndex)
+    Dim firstCellText
+    firstCellText = Trim(CStr(gWs.Cells(rowIndex, 1).Value))
+    IsBomSectionRow = (LCase(Left(firstCellText, 17)) = "bill of material:")
+End Function
+
+Function ExtractBomSectionKey(rowIndex)
+    Dim textValue
+    Dim p
+    textValue = Trim(CStr(gWs.Cells(rowIndex, 1).Value))
+    p = InStr(1, textValue, ":", vbTextCompare)
+    If p > 0 Then
+        ExtractBomSectionKey = NormalizeTreeKey(Mid(textValue, p + 1))
+    Else
+        ExtractBomSectionKey = ""
+    End If
+End Function
+
+Function IsRepeatedBomHeaderRow(rowIndex)
+    IsRepeatedBomHeaderRow = False
+    If gNomenclatureColumnIndex > 0 Then
+        If NormalizeHeaderName(CStr(gWs.Cells(rowIndex, gNomenclatureColumnIndex).Value)) = "NOMENCLATURE" Then IsRepeatedBomHeaderRow = True
+    End If
+    If gPartNumberColumnIndex > 0 Then
+        If NormalizeHeaderName(CStr(gWs.Cells(rowIndex, gPartNumberColumnIndex).Value)) = "PARTNUMBER" Then IsRepeatedBomHeaderRow = True
+    End If
+End Function
+
+Function NormalizeTreeKey(valueText)
+    Dim s
+    s = UCase(Trim(CStr(valueText)))
+    s = Replace(s, """", "")
+    s = Replace(s, vbTab, " ")
+    s = Replace(s, vbCr, " ")
+    s = Replace(s, vbLf, " ")
+    Do While InStr(1, s, "  ", vbTextCompare) > 0
+        s = Replace(s, "  ", " ")
+    Loop
+    NormalizeTreeKey = Trim(s)
+End Function
+
+Sub DeleteWorksheetIfExists(sheetName)
+    On Error Resume Next
+    Dim ws
+    Set ws = WorksheetByName(sheetName)
+    If Not ws Is Nothing Then
+        gExcelApp.DisplayAlerts = False
+        ws.Delete
+        gExcelApp.DisplayAlerts = True
+        WriteInsertLog "TREE_EXISTING_SHEET_DELETED", 0, sheetName, "", "Old organized sheet removed."
+    End If
+    Err.Clear
+End Sub
+
+Function WorksheetByName(sheetName)
+    On Error Resume Next
+    Set WorksheetByName = Nothing
+    Dim ws
+    For Each ws In gWorkbook.Worksheets
+        If UCase(CStr(ws.Name)) = UCase(CStr(sheetName)) Then
+            Set WorksheetByName = ws
+            Exit Function
+        End If
+    Next
+    Err.Clear
+End Function
+
+Sub FormatTreeSheet(lastTreeRow, sourceLastCol)
+    On Error Resume Next
+    Dim treeImageColumn
+    Dim c
+    Dim finalLastCol
+    treeImageColumn = gImageColumnIndex + 1
+    finalLastCol = sourceLastCol + 1
+    gTreeWs.Columns(1).ColumnWidth = 10
+    gTreeWs.Columns(treeImageColumn).ColumnWidth = IMAGE_COLUMN_WIDTH
+    For c = 1 To finalLastCol
+        If c <> treeImageColumn Then gTreeWs.Columns(c).AutoFit
+    Next
+    gTreeWs.Columns(treeImageColumn).ColumnWidth = IMAGE_COLUMN_WIDTH
+    gTreeWs.Rows(1).AutoFilter
+    gTreeWs.Activate
+    gTreeWs.Cells(2, 1).Select
+    gExcelApp.ActiveWindow.FreezePanes = True
+    gTreeWs.Outline.SummaryRow = 0
     Err.Clear
 End Sub
 
@@ -410,6 +705,14 @@ Function LastUsedColumn(ws)
     On Error Resume Next
     LastUsedColumn = ws.Cells(gHeaderRow, ws.Columns.Count).End(XL_TO_LEFT).Column
     Err.Clear
+End Function
+
+Function MinLong(a, b)
+    If CLng(a) < CLng(b) Then
+        MinLong = CLng(a)
+    Else
+        MinLong = CLng(b)
+    End If
 End Function
 
 Function NormalizeHeaderName(valueText)

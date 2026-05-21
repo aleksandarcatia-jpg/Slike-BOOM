@@ -144,7 +144,7 @@ Sub TraversePatchProduct(prod, isRoot)
             gProcessedReferences.Item(referenceKey) = True
             gUniqueReferenceCount = gUniqueReferenceCount + 1
             propertyValue = INITIAL_IMAGE_PROPERTY_VALUE
-            If MARK_FASTENERS_FOR_SKIP And IsFastenerProduct(prod) Then propertyValue = FASTENER_IMAGE_PROPERTY_VALUE
+            If MARK_FASTENERS_FOR_SKIP And (IsFastenerProduct(prod) Or IsFastenerAssemblyProduct(prod)) Then propertyValue = FASTENER_IMAGE_PROPERTY_VALUE
 
             resultStatus = WriteSlikaPropertyForProduct(prod, sourcePath, IMAGE_PROPERTY_NAME, propertyValue, productName, rawPn, referenceKey)
             If resultStatus = "CREATED" Then
@@ -167,7 +167,7 @@ Sub TraversePatchProduct(prod, isRoot)
                 End If
                 If propertyValue = FASTENER_IMAGE_PROPERTY_VALUE Then
                     gFastenerCount = gFastenerCount + 1
-                    WritePatchEvent "FASTENER_MARKED_SKIP", productName, rawPn, referenceKey, sourcePath, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, "FASTENER_MARKED_SKIP", 0, ""
+                    WritePatchEvent FastenerSkipPhase(prod), productName, rawPn, referenceKey, sourcePath, gLastWriteMethod, IMAGE_PROPERTY_NAME, propertyValue, FastenerSkipPhase(prod), 0, ""
                 End If
             End If
         End If
@@ -692,6 +692,46 @@ Function IsFastenerProduct(prod)
     Dim scanText
     scanText = GetProductPartNumber(prod) & " " & CStr(prod.Name) & " " & GetProductNomenclature(prod)
     IsFastenerProduct = ContainsFastenerKeyword(scanText)
+End Function
+
+Function IsFastenerAssemblyProduct(prod)
+    Dim partNumberText
+    Dim nameText
+    Dim nomenclatureText
+    Dim scanText
+    IsFastenerAssemblyProduct = False
+    If Not ProductHasChildren(prod) Then Exit Function
+    partNumberText = NormalizeFastenerText(GetProductPartNumber(prod))
+    nameText = NormalizeFastenerText(CStr(prod.Name))
+    nomenclatureText = NormalizeFastenerText(GetProductNomenclature(prod))
+    scanText = " " & partNumberText & " " & nameText & " " & nomenclatureText & " "
+    If IsVvFastenerAssemblyText(partNumberText) Or IsVvFastenerAssemblyText(nameText) Or IsVvFastenerAssemblyText(nomenclatureText) Then
+        IsFastenerAssemblyProduct = True
+        Exit Function
+    End If
+    If InStr(1, scanText, " vijcana veza ", vbTextCompare) > 0 Then
+        IsFastenerAssemblyProduct = True
+        Exit Function
+    End If
+    If InStr(1, scanText, " bolt assembly ", vbTextCompare) > 0 Then
+        IsFastenerAssemblyProduct = True
+        Exit Function
+    End If
+    If InStr(1, scanText, " fastener assembly ", vbTextCompare) > 0 Then IsFastenerAssemblyProduct = True
+End Function
+
+Function IsVvFastenerAssemblyText(valueText)
+    IsVvFastenerAssemblyText = False
+    If Left(CStr(valueText), 3) = "vv " Then IsVvFastenerAssemblyText = True
+    If Left(CStr(valueText), 4) = "vv m" Then IsVvFastenerAssemblyText = True
+End Function
+
+Function FastenerSkipPhase(prod)
+    If IsFastenerAssemblyProduct(prod) Then
+        FastenerSkipPhase = "FASTENER_ASSEMBLY_MARKED_SKIP"
+    Else
+        FastenerSkipPhase = "FASTENER_MARKED_SKIP"
+    End If
 End Function
 
 Function ContainsFastenerKeyword(valueText)

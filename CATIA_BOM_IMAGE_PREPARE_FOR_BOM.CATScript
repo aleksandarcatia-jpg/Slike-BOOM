@@ -29,6 +29,12 @@ Const USE_WHITE_BACKGROUND = True
 Const USE_RECORDER_STYLE_CAPTURE = True
 Const USE_CAPTURE_TARGET_SELECTION = True
 Const USE_CENTER_POSITION_CROP = True
+Const USE_AUTO_OBJECT_CROP = True
+Const AUTO_CROP_IGNORE_LEFT_PERCENT = 0.2
+Const AUTO_CROP_WHITE_THRESHOLD = 245
+Const AUTO_CROP_PADDING_PERCENT = 0.08
+Const AUTO_CROP_MIN_PADDING_PIXELS = 25
+Const AUTO_CROP_SCAN_STEP = 3
 Const CROP_LEFT_PERCENT = 0.18
 Const CROP_RIGHT_PERCENT = 0.02
 Const CROP_TOP_PERCENT = 0.02
@@ -358,6 +364,7 @@ Function CaptureActiveStandaloneViewer(imagePath, sourcePath, prod)
     If USE_CAPTURE_TARGET_SELECTION Then SelectStandaloneCaptureTarget prod, sourcePath, imagePath
     If USE_WHITE_BACKGROUND Then ApplyWhiteBackground viewer, prod, sourcePath, imagePath
     ApplyIsoView viewer
+    ClearStandaloneSelection prod, sourcePath, imagePath
     WaitSeconds IMAGE_CAPTURE_DELAY_SECONDS
     Err.Clear
     viewer.CaptureToFile CAT_CAPTURE_FORMAT_JPEG, imagePath
@@ -739,23 +746,16 @@ Function CropCapturedImageIfPossible(originalImagePath, prod, sourcePath)
     CropCapturedImageIfPossible = originalImagePath
     Dim croppedPath
     Dim img
-    Dim proc
-    Dim filter
-    Dim cropped
     Dim width
     Dim height
     Dim cropLeft
     Dim cropRight
     Dim cropTop
     Dim cropBottom
+    Dim boundsMessage
     croppedPath = BuildCroppedImagePath(originalImagePath)
     If Trim(CStr(croppedPath)) = "" Then
         WritePrepareLog "CENTER_POSITION_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Could not build cropped image path."
-        Exit Function
-    End If
-    If SKIP_EXISTING_IMAGES And gFSO.FileExists(croppedPath) Then
-        CropCapturedImageIfPossible = croppedPath
-        WritePrepareLog "CENTER_POSITION_CROP_DONE", prod.Name, GetProductPartNumber(prod), sourcePath, croppedPath, "Existing cropped image reused."
         Exit Function
     End If
 
@@ -775,28 +775,236 @@ Function CropCapturedImageIfPossible(originalImagePath, prod, sourcePath)
         Exit Function
     End If
 
+    If USE_AUTO_OBJECT_CROP Then
+        WritePrepareLog "AUTO_OBJECT_CROP_START", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Width=" & CStr(width) & "; Height=" & CStr(height) & "; IgnoreLeftPercent=" & CStr(AUTO_CROP_IGNORE_LEFT_PERCENT)
+        If FindAutoObjectCropMargins(img, cropLeft, cropRight, cropTop, cropBottom, boundsMessage) Then
+            WritePrepareLog "AUTO_OBJECT_CROP_BOUNDS_FOUND", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, boundsMessage & "; CropLeft=" & CStr(cropLeft) & "; CropRight=" & CStr(cropRight) & "; CropTop=" & CStr(cropTop) & "; CropBottom=" & CStr(cropBottom)
+            If SaveWiaCrop(img, croppedPath, cropLeft, cropRight, cropTop, cropBottom) Then
+                CropCapturedImageIfPossible = croppedPath
+                WritePrepareLog "AUTO_OBJECT_CROP_DONE", prod.Name, GetProductPartNumber(prod), sourcePath, croppedPath, "Original=" & originalImagePath & "; " & boundsMessage
+                Exit Function
+            Else
+                WritePrepareLog "AUTO_OBJECT_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "SaveWiaCrop failed. Err=" & Err.Description
+                Err.Clear
+            End If
+        Else
+            WritePrepareLog "AUTO_OBJECT_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, boundsMessage
+        End If
+    End If
+
+    cropLeft = CLng(width * CROP_LEFT_PERCENT)
+    cropRight = CLng(width * CROP_RIGHT_PERCENT)
+    cropTop = CLng(height * CROP_TOP_PERCENT)
+    cropBottom = CLng(height * CROP_BOTTOM_PERCENT)
+
     If (width - cropLeft - cropRight) < 80 Or (height - cropTop - cropBottom) < 80 Then
-        WritePrepareLog "CENTER_POSITION_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Crop would be too aggressive. Width=" & CStr(width) & "; Height=" & CStr(height)
+        WritePrepareLog "CENTER_POSITION_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Fallback crop would be too aggressive. Width=" & CStr(width) & "; Height=" & CStr(height)
         Exit Function
     End If
 
-    Set proc = CreateObject("WIA.ImageProcess")
-    proc.Filters.Add proc.FilterInfos("Crop").FilterID
-    Set filter = proc.Filters(1)
-    filter.Properties("Left") = cropLeft
-    filter.Properties("Right") = cropRight
-    filter.Properties("Top") = cropTop
-    filter.Properties("Bottom") = cropBottom
-    Set cropped = proc.Apply(img)
-    If gFSO.FileExists(croppedPath) Then gFSO.DeleteFile croppedPath, True
-    cropped.SaveFile croppedPath
-
-    If Err.Number = 0 And gFSO.FileExists(croppedPath) Then
+    WritePrepareLog "FIXED_LEFT_CROP_FALLBACK_USED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Left=" & CStr(cropLeft) & "; Right=" & CStr(cropRight) & "; Top=" & CStr(cropTop) & "; Bottom=" & CStr(cropBottom)
+    If SaveWiaCrop(img, croppedPath, cropLeft, cropRight, cropTop, cropBottom) Then
         CropCapturedImageIfPossible = croppedPath
         WritePrepareLog "CENTER_POSITION_CROP_DONE", prod.Name, GetProductPartNumber(prod), sourcePath, croppedPath, "Original=" & originalImagePath & "; Left=" & CStr(cropLeft) & "; Right=" & CStr(cropRight) & "; Top=" & CStr(cropTop) & "; Bottom=" & CStr(cropBottom)
     Else
         WritePrepareLog "CENTER_POSITION_CROP_FAILED_OR_SKIPPED", prod.Name, GetProductPartNumber(prod), sourcePath, originalImagePath, "Crop failed. Err=" & Err.Description
         Err.Clear
+    End If
+End Function
+
+Function FindAutoObjectCropMargins(img, ByRef cropLeft, ByRef cropRight, ByRef cropTop, ByRef cropBottom, ByRef boundsMessage)
+    On Error Resume Next
+    FindAutoObjectCropMargins = False
+    boundsMessage = ""
+
+    Dim width
+    Dim height
+    Dim pixels
+    Dim pixelBase
+    Dim scanStep
+    Dim ignoreLeft
+    Dim x
+    Dim y
+    Dim pixel
+    Dim minX
+    Dim maxX
+    Dim minY
+    Dim maxY
+    Dim foundCount
+    Dim padX
+    Dim padY
+    Dim keepLeft
+    Dim keepRight
+    Dim keepTop
+    Dim keepBottom
+    Dim boundsArea
+    Dim scanArea
+    Dim boundsRatio
+
+    width = CLng(img.Width)
+    height = CLng(img.Height)
+    scanStep = CLng(AUTO_CROP_SCAN_STEP)
+    If scanStep < 1 Then scanStep = 1
+    ignoreLeft = CLng(width * AUTO_CROP_IGNORE_LEFT_PERCENT)
+    If ignoreLeft < 0 Then ignoreLeft = 0
+    If ignoreLeft > width - 1 Then ignoreLeft = 0
+
+    Err.Clear
+    Set pixels = img.ARGBData
+    If Err.Number <> 0 Or pixels Is Nothing Then
+        boundsMessage = "ARGBData not available. Err=" & Err.Description
+        Err.Clear
+        Exit Function
+    End If
+
+    pixelBase = WiaVectorPixelBase(pixels)
+    If pixelBase < 0 Then
+        boundsMessage = "Could not determine WIA pixel index base."
+        Exit Function
+    End If
+
+    minX = width
+    minY = height
+    maxX = -1
+    maxY = -1
+    foundCount = 0
+
+    For y = 0 To height - 1 Step scanStep
+        For x = ignoreLeft To width - 1 Step scanStep
+            Err.Clear
+            pixel = pixels.Item((CLng(y) * CLng(width)) + CLng(x) + pixelBase)
+            If Err.Number <> 0 Then
+                boundsMessage = "Pixel read failed. X=" & CStr(x) & "; Y=" & CStr(y) & "; Err=" & Err.Description
+                Err.Clear
+                Exit Function
+            End If
+            If IsObjectPixelOnWhiteBackground(pixel) Then
+                If x < minX Then minX = x
+                If x > maxX Then maxX = x
+                If y < minY Then minY = y
+                If y > maxY Then maxY = y
+                foundCount = foundCount + 1
+            End If
+        Next
+    Next
+
+    If foundCount < 10 Or maxX < minX Or maxY < minY Then
+        boundsMessage = "No object pixels found. FoundCount=" & CStr(foundCount) & "; IgnoreLeft=" & CStr(ignoreLeft)
+        Exit Function
+    End If
+
+    minX = MaxLong(ignoreLeft, minX - scanStep)
+    minY = MaxLong(0, minY - scanStep)
+    maxX = MinLong(width - 1, maxX + scanStep)
+    maxY = MinLong(height - 1, maxY + scanStep)
+
+    boundsArea = CDbl((maxX - minX + 1)) * CDbl((maxY - minY + 1))
+    scanArea = CDbl(width - ignoreLeft) * CDbl(height)
+    If scanArea > 0 Then
+        boundsRatio = boundsArea / scanArea
+        If boundsRatio > 0.92 Then
+            boundsMessage = "Bounds cover almost entire scanned area; background probably not white. Ratio=" & CStr(boundsRatio)
+            Exit Function
+        End If
+    End If
+
+    padX = MaxLong(AUTO_CROP_MIN_PADDING_PIXELS, CLng((maxX - minX + 1) * AUTO_CROP_PADDING_PERCENT))
+    padY = MaxLong(AUTO_CROP_MIN_PADDING_PIXELS, CLng((maxY - minY + 1) * AUTO_CROP_PADDING_PERCENT))
+
+    keepLeft = MaxLong(ignoreLeft, minX - padX)
+    keepRight = MinLong(width - 1, maxX + padX)
+    keepTop = MaxLong(0, minY - padY)
+    keepBottom = MinLong(height - 1, maxY + padY)
+
+    If (keepRight - keepLeft) < 60 Or (keepBottom - keepTop) < 60 Then
+        boundsMessage = "Auto crop bounds too small after padding."
+        Exit Function
+    End If
+
+    cropLeft = keepLeft
+    cropRight = width - 1 - keepRight
+    cropTop = keepTop
+    cropBottom = height - 1 - keepBottom
+
+    boundsMessage = "BoundsMinX=" & CStr(minX) & "; BoundsMaxX=" & CStr(maxX) & _
+                    "; BoundsMinY=" & CStr(minY) & "; BoundsMaxY=" & CStr(maxY) & _
+                    "; FoundCount=" & CStr(foundCount) & "; IgnoreLeft=" & CStr(ignoreLeft) & _
+                    "; PadX=" & CStr(padX) & "; PadY=" & CStr(padY)
+    FindAutoObjectCropMargins = True
+    Err.Clear
+End Function
+
+Function WiaVectorPixelBase(pixels)
+    On Error Resume Next
+    Dim testPixel
+    WiaVectorPixelBase = -1
+    Err.Clear
+    testPixel = pixels.Item(1)
+    If Err.Number = 0 Then
+        WiaVectorPixelBase = 1
+        Exit Function
+    End If
+    Err.Clear
+    testPixel = pixels.Item(0)
+    If Err.Number = 0 Then WiaVectorPixelBase = 0
+    Err.Clear
+End Function
+
+Function IsObjectPixelOnWhiteBackground(argbValue)
+    Dim redValue
+    Dim greenValue
+    Dim blueValue
+    redValue = ColorByteFromArgb(argbValue, 65536)
+    greenValue = ColorByteFromArgb(argbValue, 256)
+    blueValue = ColorByteFromArgb(argbValue, 1)
+    IsObjectPixelOnWhiteBackground = Not (redValue >= AUTO_CROP_WHITE_THRESHOLD And greenValue >= AUTO_CROP_WHITE_THRESHOLD And blueValue >= AUTO_CROP_WHITE_THRESHOLD)
+End Function
+
+Function ColorByteFromArgb(argbValue, divisor)
+    Dim valueAsDouble
+    Dim lowValue
+    Dim highValue
+    valueAsDouble = CDbl(argbValue)
+    If valueAsDouble < 0 Then valueAsDouble = valueAsDouble + CDbl("4294967296")
+    lowValue = Int(valueAsDouble / CDbl(divisor))
+    highValue = Int(valueAsDouble / (CDbl(divisor) * 256))
+    ColorByteFromArgb = CLng(lowValue - (highValue * 256))
+End Function
+
+Function SaveWiaCrop(img, croppedPath, cropLeft, cropRight, cropTop, cropBottom)
+    On Error Resume Next
+    SaveWiaCrop = False
+    Dim proc
+    Dim filter
+    Dim cropped
+    Err.Clear
+    Set proc = CreateObject("WIA.ImageProcess")
+    proc.Filters.Add proc.FilterInfos("Crop").FilterID
+    Set filter = proc.Filters(1)
+    filter.Properties("Left") = CLng(cropLeft)
+    filter.Properties("Right") = CLng(cropRight)
+    filter.Properties("Top") = CLng(cropTop)
+    filter.Properties("Bottom") = CLng(cropBottom)
+    Set cropped = proc.Apply(img)
+    If gFSO.FileExists(croppedPath) Then gFSO.DeleteFile croppedPath, True
+    cropped.SaveFile croppedPath
+    If Err.Number = 0 And gFSO.FileExists(croppedPath) Then SaveWiaCrop = True
+    Err.Clear
+End Function
+
+Function MaxLong(firstValue, secondValue)
+    If CLng(firstValue) >= CLng(secondValue) Then
+        MaxLong = CLng(firstValue)
+    Else
+        MaxLong = CLng(secondValue)
+    End If
+End Function
+
+Function MinLong(firstValue, secondValue)
+    If CLng(firstValue) <= CLng(secondValue) Then
+        MinLong = CLng(firstValue)
+    Else
+        MinLong = CLng(secondValue)
     End If
 End Function
 

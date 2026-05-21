@@ -198,7 +198,11 @@ Sub TraversePrepareProduct(prod, isRoot)
                 If WritePropertyValue(prod, imagePath, "EXISTING_IMAGE_REUSED", sourcePath, imagePath) Then gSourcePropertyCache.Item(key) = imagePath
             Else
                 imagePath = BuildImagePath(prod, sourcePath)
-                If SKIP_EXISTING_IMAGES And gFSO.FileExists(imagePath) Then
+                If Trim(CStr(imagePath)) = "" Then
+                    gCaptureFailedCount = gCaptureFailedCount + 1
+                    WritePrepareLog "IMAGE_PATH_BUILD_FAILED", prod.Name, rawPn, sourcePath, "", "BuildImagePath returned empty path; capture skipped."
+                    WritePropertyValue prod, "IMAGE_CAPTURE_FAILED", "IMAGE_CAPTURE_FAILED", sourcePath, ""
+                ElseIf SKIP_EXISTING_IMAGES And gFSO.FileExists(imagePath) Then
                     gSourceImageCache.Item(key) = imagePath
                     gImagesReused = gImagesReused + 1
                     If WritePropertyValue(prod, imagePath, "EXISTING_IMAGE_REUSED", sourcePath, imagePath) Then gSourcePropertyCache.Item(key) = imagePath
@@ -251,6 +255,10 @@ End Function
 Function CaptureStandaloneImage(sourcePath, imagePath, prod)
     On Error Resume Next
     CaptureStandaloneImage = False
+    If Trim(CStr(imagePath)) = "" Then
+        WritePrepareLog "IMAGE_PATH_BUILD_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, "", "Empty image path before standalone open; CaptureToFile not called."
+        Exit Function
+    End If
     CATIA.StatusBar = "Opening source: " & GetProductPartNumber(prod)
     WritePrepareLog "STANDALONE_OPEN_START", prod.Name, GetProductPartNumber(prod), sourcePath, imagePath, sourcePath
     If Not OpenStandaloneDocument(sourcePath, prod, imagePath) Then
@@ -547,19 +555,56 @@ Function TrySetParameterStringValue(param, valueText)
 End Function
 
 Function BuildImagePath(prod, sourcePath)
+    On Error Resume Next
     Dim baseName
     Dim sourceName
     Dim hashText
+    Dim finalPath
+    Dim errNumber
+    Dim errDescription
+
+    Err.Clear
     sourceName = gFSO.GetBaseName(sourcePath)
+    If Err.Number <> 0 Or Trim(CStr(sourceName)) = "" Then
+        errNumber = Err.Number
+        errDescription = Err.Description
+        sourceName = "SOURCE"
+        Err.Clear
+    End If
+
     hashText = StablePathHash(sourcePath)
+    If Err.Number <> 0 Or Trim(CStr(hashText)) = "" Then
+        errNumber = Err.Number
+        errDescription = Err.Description
+        hashText = "NOHASH"
+        Err.Clear
+    End If
+
     baseName = SafeFileName(GetProductPartNumber(prod) & "_" & sourceName & "_" & hashText)
     If baseName = "" Then baseName = SafeFileName(sourceName & "_" & hashText)
     If baseName = "" Then baseName = "CATIA_IMAGE"
     If Len(baseName) > 140 Then baseName = Left(baseName, 131) & "_" & hashText
-    BuildImagePath = JoinPath(gImageFolder, baseName & ".jpg")
+
+    finalPath = JoinPath(gImageFolder, baseName & ".jpg")
+    If Err.Number <> 0 Or Trim(CStr(finalPath)) = "" Then
+        errNumber = Err.Number
+        errDescription = Err.Description
+        Err.Clear
+        finalPath = JoinPath(gImageFolder, "CATIA_IMAGE_" & TimestampForFile() & ".jpg")
+    End If
+
+    If Trim(CStr(finalPath)) <> "" Then
+        BuildImagePath = finalPath
+        WritePrepareLog "IMAGE_PATH_BUILT", prod.Name, GetProductPartNumber(prod), sourcePath, finalPath, "Hash=" & hashText & "; Err.Number=" & CStr(errNumber) & "; Err.Description=" & errDescription
+    Else
+        BuildImagePath = ""
+        WritePrepareLog "IMAGE_PATH_BUILD_FAILED", prod.Name, GetProductPartNumber(prod), sourcePath, "", "Hash=" & hashText & "; Err.Number=" & CStr(errNumber) & "; Err.Description=" & errDescription
+    End If
+    Err.Clear
 End Function
 
 Function StablePathHash(pathText)
+    On Error Resume Next
     Dim i
     Dim code
     Dim hashValue
@@ -567,9 +612,17 @@ Function StablePathHash(pathText)
     For i = 1 To Len(CStr(pathText))
         code = AscW(Mid(CStr(pathText), i, 1))
         If code < 0 Then code = code + 65536
-        hashValue = (hashValue * 131 + code) Mod 2147483647
+        hashValue = (hashValue + ((code Mod 251) * (i Mod 251))) Mod 16777215
     Next
     StablePathHash = Right("00000000" & Hex(CLng(hashValue)), 8)
+    If Err.Number <> 0 Or Trim(CStr(StablePathHash)) = "" Then StablePathHash = "NOHASH"
+    Err.Clear
+End Function
+
+Function TimestampForFile()
+    Dim d
+    d = Now
+    TimestampForFile = Year(d) & Right("0" & Month(d), 2) & Right("0" & Day(d), 2) & "_" & Right("0" & Hour(d), 2) & Right("0" & Minute(d), 2) & Right("0" & Second(d), 2)
 End Function
 
 Sub UpdatePrepareProgress(currentPartNumber)
